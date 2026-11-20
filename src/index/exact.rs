@@ -151,6 +151,8 @@ pub(crate) fn rank_unique_ids<T: VectorType>(
     let mut heap = BinaryHeap::with_capacity(k);
     let control = crate::request::control().unwrap_or_default();
     for &id in ids {
+        #[cfg(feature = "test-hooks")]
+        crate::test_hooks::hit(crate::test_hooks::ConcurrencyPoint::ExactScanStep);
         control.check()?;
         if let Some(slot) = db.internal_slot_of(id)
             && let Some((_, vector)) = db.active_vector_at_slot(slot)?

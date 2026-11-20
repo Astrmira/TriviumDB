@@ -924,22 +924,57 @@ pub fn node_similarity(
             if similarity < cutoff {
                 continue;
             }
-            pairs.push(NodeSimilarityPair {
+            let pair = NodeSimilarityPair {
                 left,
                 right,
                 similarity,
+            };
+            let slot = pairs.partition_point(|other: &NodeSimilarityPair| {
+                other.similarity > similarity
+                    || (other.similarity == similarity
+                        && (other.left, other.right) <= (left, right))
             });
-            pairs.sort_by(|left, right| {
-                right
-                    .similarity
-                    .total_cmp(&left.similarity)
-                    .then_with(|| left.left.cmp(&right.left))
-                    .then_with(|| left.right.cmp(&right.right))
-            });
-            if pairs.len() > top_k {
-                pairs.pop();
+            if slot < capacity {
+                if pairs.len() == capacity {
+                    pairs.pop();
+                }
+                pairs.insert(slot, pair);
             }
         }
     }
     Ok(PairSet { pairs })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 相似节点对替换首位时保持获准容量() {
+        let mut mt = MemTable::<f32>::new(1);
+        for id in 1..=4 {
+            mt.insert_with_id(id, &[1.], Default::default()).unwrap();
+        }
+        for (from, to) in [(1, 2), (2, 3), (2, 4)] {
+            mt.link(from, to, "e".into(), 1.).unwrap();
+        }
+        let graph = build_workspace(&mt, &BTreeSet::from([1, 2, 3, 4]), None, 3, 4096).unwrap();
+        let result = node_similarity(
+            &graph,
+            1,
+            0.,
+            100,
+            std::mem::size_of::<NodeSimilarityPair>(),
+        )
+        .unwrap();
+        assert_eq!(
+            result.pairs(),
+            &[NodeSimilarityPair {
+                left: 1,
+                right: 3,
+                similarity: 1.
+            }]
+        );
+        assert_eq!(result.pairs.capacity(), 1);
+    }
 }

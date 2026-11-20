@@ -28,7 +28,8 @@ pub(super) struct ReadBudget<'a> {
 }
 
 impl ReadBudget<'_> {
-    pub fn payload<T: VectorType>(
+    /// 将归档解码工作区保留到本次快照消费完毕，后续节点和结果复制在此基础上计量。
+    pub fn retain_archive<T: VectorType>(
         &mut self,
         mt: &MemTable<T>,
         bytes: usize,
@@ -36,9 +37,9 @@ impl ReadBudget<'_> {
     ) -> Result<()> {
         self.cost.payload_bytes = self.cost.payload_bytes.saturating_add(bytes);
         self.cost.check(self.limits)?;
-        let peak = self.base.saturating_add(workspace);
-        mt.ensure_additional_memory(self.memory_limit, peak)?;
-        self.workspace.resize(peak)
+        self.base = self.base.saturating_add(workspace);
+        mt.ensure_additional_memory(self.memory_limit, self.base)?;
+        self.workspace.resize(self.base)
     }
     pub fn node<T: VectorType>(&mut self, mt: &MemTable<T>, id: NodeId) -> Result<()> {
         let raw = mt
@@ -159,6 +160,7 @@ fn build_index<T: VectorType>(
         };
         let snapshot = read_snapshot_checked(mt, id, Some(&mut read))?
             .ok_or(TriviumError::NodeNotFound(id))?;
+        let base = read.base;
         index.insert_header(
             id,
             DocumentHeader {
@@ -1108,6 +1110,7 @@ pub(crate) fn search_locked<T: VectorType>(
         };
         let snapshot = read_snapshot_checked(mt, row.document_id, Some(&mut read))?
             .ok_or(TriviumError::NodeNotFound(row.document_id))?;
+        let base = read.base;
         let mut by_node = BTreeMap::new();
         for block in &snapshot.blocks {
             if let Some(id) = &block.node_id {

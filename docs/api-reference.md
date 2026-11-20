@@ -125,7 +125,11 @@ with triviumdb.TriviumDB("my_data.tdb", dim=1536) as db:
 | `access_mode` | `str` | `"read_write"` | `read_write` 使用排他锁；`read_only` 使用共享锁；`immutable` 验证 manifest 后无锁打开 |
 | `runtime` | `ResourceRuntime \| None` | `None` | 所属共享资源运行时；默认使用进程共享运行时 |
 
-`search_with_context` / `searchWithContext` 返回的上下文除阶段耗时和候选数外，还包含 `observations`：`estimated_heap_bytes`、`mmap_vector_bytes`、`node_count`、查询路由与 QuIVer `ef_search`；Linux 额外提供进程 RSS、累计主缺页和次缺页。缺页计数是进程累计值，调用方应计算相邻采样差值。
+`search_with_context` / `searchWithContext` 的 `observations` 包含堆内存估算、mmap 向量字节数、节点数、查询路由与 QuIVer `ef_search`。在 Windows 和 Linux 上，`process_rss_bytes` 记录进程驻留内存，`process_total_faults` 记录进程累计缺页次数。Linux 还提供 `process_minor_faults` 和 `process_major_faults`。比较两次采样时，使用同一进程、同一字段的差值。
+
+Rust 的 `ProcessMemorySnapshot` 用 `Option<u64>` 表示 `total_faults`、`minor_faults` 和 `major_faults`。读取分类计数的 Rust 调用方需处理 `None`。基准 JSON 将平台缺失的计数及其差值记为 `null`。
+
+Rust 的 `storage_write_stats()` 按数据库实例累计写入量。`checkpoint_bytes` 覆盖主文件、实际追加或重写的向量、分代 Payload 和 Mmap 发布标记。`sidecar_bytes` 统计统一索引容器的目录和组件写入，`wal_bytes` 包含 WAL 帧及重置日志头。重复发布的内容逐次计入，重开后从新实例开始计量。写放大是这些逻辑文件写入与 WAL 业务记录字节数之比。操作系统回写、发布撤销副本及临时组件的 I/O 不在此指标范围内。
 
 > **维度提醒**：QuIVer 支持 1–3072 维。3073–65536 维数据库使用精确 BruteForce 检索，显式构建 QuIVer 返回错误。依赖 ANN 性能时，请选择最多 3072 维的 embedding 模型或先降维。
 

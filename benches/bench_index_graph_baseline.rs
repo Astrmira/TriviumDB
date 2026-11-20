@@ -48,8 +48,9 @@ struct ScenarioReport {
     max_ms: f64,
     rss_bytes_before: u64,
     rss_bytes_after: u64,
-    minor_faults_delta: u64,
-    major_faults_delta: u64,
+    total_faults_delta: Option<u64>,
+    minor_faults_delta: Option<u64>,
+    major_faults_delta: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -164,8 +165,18 @@ where
         max_ms: latencies.last().copied().unwrap_or_default(),
         rss_bytes_before: before.rss_bytes,
         rss_bytes_after: after.rss_bytes,
-        minor_faults_delta: after.minor_faults.saturating_sub(before.minor_faults),
-        major_faults_delta: after.major_faults.saturating_sub(before.major_faults),
+        total_faults_delta: after
+            .total_faults
+            .zip(before.total_faults)
+            .and_then(|(after, before)| after.checked_sub(before)),
+        minor_faults_delta: after
+            .minor_faults
+            .zip(before.minor_faults)
+            .and_then(|(after, before)| after.checked_sub(before)),
+        major_faults_delta: after
+            .major_faults
+            .zip(before.major_faults)
+            .and_then(|(after, before)| after.checked_sub(before)),
     }
 }
 
@@ -300,8 +311,9 @@ fn run_track_a(
         max_ms: index_elapsed.as_secs_f64() * 1000.0,
         rss_bytes_before: 0,
         rss_bytes_after: 0,
-        minor_faults_delta: 0,
-        major_faults_delta: 0,
+        total_faults_delta: None,
+        minor_faults_delta: None,
+        major_faults_delta: None,
     });
 
     for (name, query) in query_cases {
@@ -368,8 +380,9 @@ fn run_track_a2(
         max_ms: elapsed * 1000.0,
         rss_bytes_before: 0,
         rss_bytes_after: 0,
-        minor_faults_delta: 0,
-        major_faults_delta: 0,
+        total_faults_delta: None,
+        minor_faults_delta: None,
+        major_faults_delta: None,
     });
     for (name, query) in &queries {
         scenarios.push(measure(

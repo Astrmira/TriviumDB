@@ -1074,6 +1074,52 @@ fn 归档文档上下文服从候选预算并能只读重开() {
 }
 
 #[test]
+fn 有限共享工作区可展开单个归档的短证据() {
+    let dir = TestDir::new("archived-context-quota");
+    let path = dir.file("data.tdb");
+    let cfg = config(StorageMode::Mmap);
+    let mut db = Database::<f32>::open_with_config(&path, cfg).unwrap();
+    let parsed = parse(
+        &mut db,
+        "archive.txt",
+        &format!("alpha{}", "x".repeat(64 * 1024)),
+    );
+    let snapshot = request(
+        &mut db,
+        json!({"operation":"put_parsed","document":{
+            "parsed":parsed,"root":{"id":"10","vector":[1,0],"payload":{}}
+        }}),
+    );
+    db.close().unwrap();
+    // 为库保留 16 MiB，维护保留 1 MiB，读请求独享其余 1.5 MiB。
+    let runtime = triviumdb::ResourceRuntime::new(triviumdb::ResourceLimits {
+        memory_limit: 18 * 1024 * 1024 + 512 * 1024,
+        maintenance_memory_limit: 1024 * 1024,
+        ..Default::default()
+    })
+    .unwrap();
+    let db = Database::<f32>::open_with_runtime(
+        &path,
+        Config {
+            access_mode: AccessMode::ReadOnly,
+            memory_limit: 16 * 1024 * 1024,
+            ..cfg
+        },
+        runtime.clone(),
+    )
+    .unwrap();
+    let query: DocumentContextQuery = serde_json::from_value(json!({"seeds":[{"reference":{
+        "document_id":"10","revision":snapshot["revision"],"start_byte":0,"end_byte":5
+    }}]}))
+    .unwrap();
+    let context = db.document_context(&query).unwrap();
+    assert_eq!(context.len(), 1);
+    assert_eq!(context[0].windows.len(), 1);
+    assert_eq!(context[0].windows[0].text, "alpha");
+    assert_eq!(runtime.stats().reserved_workspace_bytes, 0);
+}
+
+#[test]
 fn 单次接入块ID冲突重试不写WAL且保留已有节点() {
     let dir = TestDir::new("one-shot-conflict");
     let path = dir.file("data.tdb");

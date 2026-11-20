@@ -130,6 +130,7 @@ fn parse_record<T: VectorType>(
         );
     }
     let payload = obj.get("payload").cloned().unwrap_or(Value::Null);
+    triviumdb::document::validate_node_import_payload(&payload, lineno)?;
     let edges = match obj.get("edges") {
         Some(value) => {
             let arr = value.as_array().ok_or_else(|| {

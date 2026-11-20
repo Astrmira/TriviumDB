@@ -266,6 +266,7 @@ Content-Type: application/vnd.triviumdb.vector+f32
 - 单请求最多 10,000 条；
 - 空请求、未知字段、非法 JSON、非法维度和非有限数值均 fail-closed；
 - 当前模式为**整请求原子提交**：任意记录失败时整批不写入；
+- 节点导入遇到 Payload 顶层保留字段 `_tdb_document` 时，返回 HTTP 400 和 `TDB_INVALID_INPUT`。跨库传输受管理文档请使用快照，或在目标库重新接入原文。
 - 导入通过 Writer Actor 和 Core transaction/WAL 完成原子提交与持久化。
 
 ---
@@ -315,7 +316,7 @@ Writer Actor 由 supervisor 监管。异常退出会设置失败状态、关闭�
 - NDJSON 导入按请求预算接收数据，并以整请求为单位原子提交；
 - TQL mutation 当前保守失效此前签发的全部细粒度节点/边 ETag；
 - 幂等缓存与 Server generation 不持久化；
-- QuIVer 手工构建仍遵守 Core 的自动构建资格，数据量不足、已就绪或配置禁用时返回 `published: false`；
+- 启动预热和手工构建共享一个 QuIVer 任务。已有任务运行时，重复构建请求返回 `published: false`。等待请求超时后，可通过 `GET /v1/indexes/quiver` 查看任务的实际结果。数据量不足、索引已就绪或配置禁用时也返回 `published: false`；
 - JSON 响应受 16 MiB 上限约束；NDJSON 只流式编码 HTTP 输出，Core 算子仍受自己的内存与查询预算约束；
 - 安装方式和跨平台二进制以 GitHub Release 的 nightly 说明为准。
 

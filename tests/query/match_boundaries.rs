@@ -63,6 +63,13 @@ fn 属性索引与反转计划保持平行边的完整行重数() {
                     "{mode:?}/{phase}/{case}"
                 );
             }
+            let case = &contract["distinct"];
+            let rows = db.tql(case["query"].as_str().unwrap()).unwrap();
+            let values: Vec<_> = rows
+                .iter()
+                .map(|row| json!({"x":number(&row["x"]), "y":number(&row["y"])}))
+                .collect();
+            assert_eq!(json!(values), case["rows"]);
         }
         db.close().unwrap();
     }
@@ -158,6 +165,85 @@ fn chain(length: u64, branches: bool) -> MemTable<f32> {
         }
     }
     mt
+}
+
+#[test]
+fn 轻量计数在重开后保持行重数且不读取正文() {
+    let root = TestDir::new("cold_count");
+    let path = root.file("data.tdb");
+    let config = Config {
+        dim: 1,
+        storage_mode: StorageMode::Mmap,
+        payload_cache_bytes: 0,
+        auto_build_quiver: false,
+        ..Default::default()
+    };
+    let mut db = Database::<f32>::open_with_config(&path, config).unwrap();
+    for id in 1..=8 {
+        db.insert_with_id(id, &[1.], json!("x".repeat(32768)))
+            .unwrap();
+    }
+    db.link(1, 2, "red", 1.).unwrap();
+    db.link(1, 2, "blue", 1.).unwrap();
+    db.close().unwrap();
+    let db = Database::<f32>::open_with_config(
+        &path,
+        Config {
+            memory_limit: 2400 * 1024,
+            ..config
+        },
+    )
+    .unwrap();
+    let before = db.payload_memory_stats();
+    for (query, expected) in [
+        ("MATCH (n) RETURN COUNT(*) AS total", 8),
+        (
+            "MATCH (a)-[e]->(b) RETURN COUNT(*) AS total ORDER BY total",
+            2,
+        ),
+        ("OPTIONAL MATCH (a)-[e]->(b) RETURN COUNT(*) AS total", 9),
+    ] {
+        let rows = db.tql(query).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(number(&rows[0]["total"]), expected);
+    }
+    let after = db.payload_memory_stats();
+    assert_eq!(
+        (after.payload_lookups, after.payload_parsed_bytes),
+        (before.payload_lookups, before.payload_parsed_bytes)
+    );
+}
+
+#[test]
+fn 兼容节点接口区分同函数的多个聚合列() {
+    let root = TestDir::new("aggregate_columns");
+    let mut db = Database::<f32>::open(&root.file("data.tdb"), 1).unwrap();
+    db.insert_with_id(1, &[1.], json!({})).unwrap();
+    let rows = db
+        .tql_nodes("MATCH (n) RETURN COUNT(*), COUNT(n.missing)")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].len(), 2);
+    for (key, value) in [("Count(*)", 1), ("Count(n.missing)", 0)] {
+        assert_eq!(rows[0][key].payload[key], value);
+    }
+}
+
+#[test]
+fn 数值减法与行注释支持不同空白形式() {
+    let root = TestDir::new("expression_spacing");
+    let mut db = Database::<f32>::open(&root.file("data.tdb"), 1).unwrap();
+    db.insert_with_id(1, &[1.], json!({"rank":3})).unwrap();
+    for newline in ["\r", "\r\n", "\n"] {
+        for expr in ["3-1", "3 -1", "3- 1", "n.rank-1", "3+-1"] {
+            let query = format!("MATCH (n) -- 注释{newline}RETURN {expr} AS result");
+            assert_eq!(number(&db.tql(&query).unwrap()[0]["result"]), 2);
+        }
+    }
+    let rows = db
+        .tql("MATCH (n) RETURN -9223372036854775808 AS result")
+        .unwrap();
+    assert!(matches!(rows[0]["result"], TqlValue::Int(i64::MIN)));
 }
 
 #[test]

@@ -551,12 +551,7 @@ impl TqlParser {
     }
 
     fn parse_finite_f32(&mut self) -> Result<f32, String> {
-        let value = match self.advance() {
-            TqlToken::FloatLit(value) => value,
-            TqlToken::IntLit(value) => value as f64,
-            TqlToken::UIntLit(value) => value as f64,
-            other => return Err(format!("Expected finite number, got {other:?}")),
-        };
+        let value = self.parse_json_number()?;
         if !value.is_finite() || value < f32::MIN as f64 || value > f32::MAX as f64 {
             return Err("参数必须是有限 f32 数值 (Parameter must be finite f32)".into());
         }
@@ -2269,12 +2264,21 @@ impl TqlParser {
     }
 
     fn parse_json_number(&mut self) -> Result<f64, String> {
-        match self.advance() {
-            TqlToken::IntLit(n) => Ok(n as f64),
-            TqlToken::UIntLit(n) => Ok(n as f64),
-            TqlToken::FloatLit(f) => Ok(f),
-            other => Err(self.error_previous(format!("Expected number, got {:?}", other))),
+        // 具名数值选项的前一个词也可作变量，词法层会保留独立的负号。
+        let negative = self.at(&TqlToken::Dash);
+        if negative {
+            self.advance();
         }
+        let value = match self.advance() {
+            TqlToken::IntLit(n) => n as f64,
+            TqlToken::UIntLit(n) => n as f64,
+            TqlToken::FloatLit(f) => f,
+            other => return Err(self.error_previous(format!("Expected number, got {:?}", other))),
+        };
+        if negative && value.is_sign_negative() {
+            return Err(self.error_previous("重复的数值负号 (Repeated numeric sign)"));
+        }
+        Ok(if negative { -value } else { value })
     }
 
     fn parse_json_array(&mut self) -> Result<Vec<serde_json::Value>, String> {

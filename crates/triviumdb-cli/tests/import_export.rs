@@ -114,6 +114,77 @@ fn u64_jsonl往返保留全部整数位模式与边元数据() {
 }
 
 #[test]
+fn 跨库导入归档指针整批拒绝并保留原文档检索() {
+    use triviumdb::document::{
+        DocumentNode, DocumentSearchLevel, DocumentSearchQuery, parsing::DocumentParseInput,
+    };
+    let root = TempDir::new().unwrap();
+    let path = |name| root.path().join(name).to_str().unwrap().to_owned();
+    let (source, target, dump) = (path("source.tdb"), path("target.tdb"), path("data.jsonl"));
+    for (file, id, content) in [
+        (&source, 3, "exported archive"),
+        (&target, 2, "independent original"),
+    ] {
+        let mut db = Database::<f32>::open(file, 1).unwrap();
+        if id == 3 {
+            db.insert_with_id(1, &[1.], json!({"ordinary":true}))
+                .unwrap();
+        }
+        let input = DocumentParseInput {
+            source_id: "source.txt".into(),
+            source_revision: "1".into(),
+            content: content.into(),
+            format: Default::default(),
+            media_type: None,
+            config: Default::default(),
+        };
+        db.ingest_document(
+            &input,
+            DocumentNode {
+                id,
+                vector: vec![1.],
+                payload: Default::default(),
+            },
+            vec![],
+            None,
+        )
+        .unwrap();
+        db.close().unwrap();
+    }
+    tdb().args(["export", &source, &dump]).assert().success();
+    let before = files(Path::new(&target));
+    let output = tdb()
+        .args(["--format=json", "import", &target, &dump])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["code"], "TDB_INVALID_INPUT");
+    assert_eq!(files(Path::new(&target)), before);
+    let db = Database::<f32>::open_read_only(&target, 1).unwrap();
+    assert_eq!(db.all_node_ids().unwrap(), [2]);
+    assert_eq!(
+        db.get_document(2).unwrap().unwrap().content,
+        "independent original"
+    );
+    let query = DocumentSearchQuery {
+        text: "independent".into(),
+        level: DocumentSearchLevel::Document,
+        document_ids: vec![2],
+        ..Default::default()
+    };
+    let result = db.search_documents(&query).unwrap();
+    assert_eq!(
+        result
+            .groups
+            .iter()
+            .map(|group| group.document_id)
+            .collect::<Vec<_>>(),
+        [2]
+    );
+}
+
+#[test]
 fn 浮点jsonl往返保留向量payload与边元数据() {
     roundtrip(
         "f32",

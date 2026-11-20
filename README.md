@@ -439,6 +439,8 @@ ORDER BY score DESC, id
 
 构建步骤、精确检索选项和 Hot／Mmap／SSD 驻留配置见 [Pelorus 使用说明](docs/pelorus.md)。
 
+[Pelorus 论文（arXiv）](https://arxiv.org/abs/2611.22159) · [Pelorus 源码仓库（GitHub）](https://github.com/Astrmira/Pelorus)
+
 ---
 
 ## 混合检索与研究边界
@@ -625,11 +627,23 @@ TriviumDB 的认知检索管线借鉴并实现了以下学术成果（均为本�
 
 ```bibtex
 @article{quiver2026,
-  title   = {QuIVer: Rethinking ANN Graph Topology via Training-Free Binary Quantization},
-  author  = {Xiao, Wenxuan and Wang, Zhiyou and Li, Chengcheng},
+  title   = {{QuIVer}: Efficient Graph Indexing with Two-Bit Construction and Navigation},
+  author  = {Xiao, Wenxuan and Zhu, Peidong and Li, Chengcheng and Cao, Xu},
   journal = {arXiv preprint arXiv:2605.02171},
   year    = {2026},
   url     = {https://arxiv.org/abs/2605.02171}
+}
+```
+
+### 📝 引用 Pelorus
+
+```bibtex
+@article{pelorus2026,
+  title   = {{Pelorus}: Warped-Product Graph Indexing for Hyperbolic Vector Search},
+  author  = {Xiao, Wenxuan and Cao, Xu},
+  journal = {arXiv preprint arXiv:2611.22159},
+  year    = {2026},
+  url     = {https://arxiv.org/abs/2611.22159}
 }
 ```
 

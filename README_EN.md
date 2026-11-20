@@ -203,6 +203,8 @@ ORDER BY score DESC, id
 
 For build instructions, exact search options and Hot, Mmap or SSD residency settings, see the [Pelorus guide](docs/pelorus.md).
 
+[Pelorus paper (arXiv)](https://arxiv.org/abs/2611.22159) · [Pelorus source repository (GitHub)](https://github.com/Astrmira/Pelorus)
+
 ---
 
 ## Hybrid retrieval and research boundaries
@@ -624,11 +626,23 @@ QuIVer research reference:
 
 ```bibtex
 @article{quiver2026,
-  title   = {QuIVer: Rethinking ANN Graph Topology via Training-Free Binary Quantization},
-  author  = {Xiao, Wenxuan and Wang, Zhiyou and Li, Chengcheng},
+  title   = {{QuIVer}: Efficient Graph Indexing with Two-Bit Construction and Navigation},
+  author  = {Xiao, Wenxuan and Zhu, Peidong and Li, Chengcheng and Cao, Xu},
   journal = {arXiv preprint arXiv:2605.02171},
   year    = {2026},
   url     = {https://arxiv.org/abs/2605.02171}
+}
+```
+
+### 📝 Citing Pelorus
+
+```bibtex
+@article{pelorus2026,
+  title   = {{Pelorus}: Warped-Product Graph Indexing for Hyperbolic Vector Search},
+  author  = {Xiao, Wenxuan and Cao, Xu},
+  journal = {arXiv preprint arXiv:2611.22159},
+  year    = {2026},
+  url     = {https://arxiv.org/abs/2611.22159}
 }
 ```
 

@@ -920,80 +920,10 @@ impl EngineHandle {
                 Ok(db.quiver_build_handle())
             })
             .await?;
-        self.inner
-            .metrics
-            .warmup_state
-            .store(WarmupState::Preparing as usize, Ordering::Release);
-        self.inner
-            .metrics
-            .active_blocking_tasks
-            .fetch_add(1, Ordering::AcqRel);
-        let inner = self.inner.clone();
-        let task = tokio::task::spawn_blocking(move || {
-            let _operation = operation;
-            let _blocking_guard =
-                AtomicGaugeGuard::enter_existing(&inner.metrics.active_blocking_tasks);
-            let build = match handle.prepare_auto_build() {
-                Ok(Some(build)) => build,
-                Ok(None) => {
-                    inner
-                        .metrics
-                        .warmup_state
-                        .store(WarmupState::Skipped as usize, Ordering::Release);
-                    return Ok(false);
-                }
-                Err(error) => {
-                    inner
-                        .metrics
-                        .warmup_state
-                        .store(WarmupState::Failed as usize, Ordering::Release);
-                    return Err(ApiError::from(error));
-                }
-            };
-            inner
-                .metrics
-                .warmup_state
-                .store(WarmupState::Building as usize, Ordering::Release);
-            match build.execute() {
-                Ok(published) => {
-                    let state = if published {
-                        WarmupState::Ready
-                    } else {
-                        WarmupState::Skipped
-                    };
-                    inner
-                        .metrics
-                        .warmup_state
-                        .store(state as usize, Ordering::Release);
-                    Ok(published)
-                }
-                Err(error) => {
-                    inner
-                        .metrics
-                        .warmup_state
-                        .store(WarmupState::Failed as usize, Ordering::Release);
-                    Err(ApiError::from(error))
-                }
-            }
-        });
-        tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), task)
-            .await
-            .map_err(|_| {
-                self.inner
-                    .metrics
-                    .warmup_state
-                    .store(WarmupState::Failed as usize, Ordering::Release);
-                ApiError::timeout()
-            })?
-            .map_err(|error| {
-                self.inner
-                    .metrics
-                    .warmup_state
-                    .store(WarmupState::Failed as usize, Ordering::Release);
-                ApiError::internal(format!(
-                    "QuIVer 构建任务失败 (QuIVer build task failed): {error}"
-                ))
-            })?
+        let Some(task) = spawn_quiver_build(self.inner.clone(), operation, Some(handle)) else {
+            return Ok(false);
+        };
+        wait_for_quiver_build(task, deadline).await
     }
 
     pub async fn conditional_mutation(
@@ -1275,76 +1205,97 @@ fn start_writer_supervisor(inner: Arc<EngineInner>, receiver: mpsc::Receiver<Wri
     });
 }
 
-fn start_quiver_warmup(inner: Arc<EngineInner>) {
-    let Ok(operation) = inner.enter_operation() else {
-        return;
-    };
+/// 构建任务持有状态发布权，等待者超时或重复请求均不改变任务状态。
+struct QuiverJob {
+    inner: Arc<EngineInner>,
+    terminal: WarmupState,
+}
+
+async fn wait_for_quiver_build(
+    task: tokio::task::JoinHandle<triviumdb::Result<bool>>,
+    deadline: Instant,
+) -> Result<bool, ApiError> {
+    tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), task)
+        .await
+        .map_err(|_| ApiError::timeout())?
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "QuIVer 构建任务失败 (QuIVer build task failed): {error}"
+            ))
+        })?
+        .map_err(ApiError::from)
+}
+
+impl Drop for QuiverJob {
+    fn drop(&mut self) {
+        self.inner
+            .metrics
+            .warmup_state
+            .store(self.terminal as usize, Ordering::Release);
+        self.inner
+            .metrics
+            .active_blocking_tasks
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn spawn_quiver_build(
+    inner: Arc<EngineInner>,
+    operation: OwnedRwLockReadGuard<()>,
+    handle: Option<triviumdb::database::QuiverBuildHandle<f32>>,
+) -> Option<tokio::task::JoinHandle<triviumdb::Result<bool>>> {
     inner
         .metrics
         .warmup_state
-        .store(WarmupState::Preparing as usize, Ordering::Release);
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+            (!matches!(
+                WarmupState::from_usize(old),
+                WarmupState::Preparing | WarmupState::Building
+            ))
+            .then_some(WarmupState::Preparing as usize)
+        })
+        .ok()?;
     inner
         .metrics
         .active_blocking_tasks
         .fetch_add(1, Ordering::AcqRel);
-    tokio::task::spawn_blocking(move || {
+    let job = QuiverJob {
+        inner,
+        terminal: WarmupState::Failed,
+    };
+    Some(tokio::task::spawn_blocking(move || {
         let _operation = operation;
-        let _blocking_guard =
-            AtomicGaugeGuard::enter_existing(&inner.metrics.active_blocking_tasks);
-        let handle = read_or_recover(&inner.database).quiver_build_handle();
-        let build = match handle.prepare_auto_build() {
-            Ok(Some(build)) => build,
-            Ok(None) => {
-                inner
-                    .metrics
-                    .warmup_state
-                    .store(WarmupState::Skipped as usize, Ordering::Release);
-                return;
-            }
-            Err(error) => {
-                inner
-                    .metrics
-                    .warmup_state
-                    .store(WarmupState::Failed as usize, Ordering::Release);
-                tracing::warn!(%error, "QuIVer 后台预热准备失败 (background QuIVer warmup preparation failed)");
-                return;
-            }
-        };
-        inner
-            .metrics
-            .warmup_state
-            .store(WarmupState::Building as usize, Ordering::Release);
+        let mut job = job;
+        let handle =
+            handle.unwrap_or_else(|| read_or_recover(&job.inner.database).quiver_build_handle());
         let started = Instant::now();
-        match build.execute() {
+        let result = handle.prepare_auto_build().and_then(|build| {
+            let Some(build) = build else { return Ok(false) };
+            job.inner
+                .metrics
+                .warmup_state
+                .store(WarmupState::Building as usize, Ordering::Release);
+            build.execute()
+        });
+        match &result {
             Ok(true) => {
-                inner
-                    .metrics
-                    .warmup_state
-                    .store(WarmupState::Ready as usize, Ordering::Release);
+                job.terminal = WarmupState::Ready;
                 tracing::info!(
                     elapsed_ms = started.elapsed().as_millis() as u64,
-                    "QuIVer 后台预热完成 (background QuIVer warmup finished)"
-                )
+                    "QuIVer 构建完成 (QuIVer build finished)"
+                );
             }
-            Ok(false) => {
-                inner
-                    .metrics
-                    .warmup_state
-                    .store(WarmupState::Skipped as usize, Ordering::Release);
-                tracing::info!(
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "QuIVer 后台预热因向量代际变化而放弃发布 (background QuIVer warmup skipped publishing after vector generation changed)"
-                )
-            }
-            Err(error) => {
-                inner
-                    .metrics
-                    .warmup_state
-                    .store(WarmupState::Failed as usize, Ordering::Release);
-                tracing::warn!(%error, "QuIVer 后台预热失败 (background QuIVer warmup failed)")
-            }
+            Ok(false) => job.terminal = WarmupState::Skipped,
+            Err(error) => tracing::warn!(%error, "QuIVer 构建失败 (QuIVer build failed)"),
         }
-    });
+        result
+    }))
+}
+
+fn start_quiver_warmup(inner: Arc<EngineInner>) {
+    if let Ok(operation) = inner.enter_operation() {
+        drop(spawn_quiver_build(inner, operation, None));
+    }
 }
 
 async fn run_writer(inner: Arc<EngineInner>, mut receiver: mpsc::Receiver<WriteCommand>) {
@@ -1647,15 +1598,25 @@ fn execute_write(
     control: QueryControl,
     request_id: &str,
 ) -> Result<StoredWriteResult, ApiError> {
+    let context = RequestContext::new(request_id, control, true).map_err(ApiError::from)?;
+    context.check_admission().map_err(ApiError::from)?;
+    context
+        .run(|| Ok(execute_write_inner(database, versions, operation)))
+        .map_err(ApiError::from)?
+}
+
+fn execute_write_inner(
+    database: &mut Database<f32>,
+    versions: &mut VersionState,
+    operation: WriteOperation,
+) -> Result<StoredWriteResult, ApiError> {
     match operation {
         WriteOperation::Tql {
             query,
             expected_generation,
         } => {
             validate_global_precondition(versions, expected_generation.as_deref())?;
-            let mutation = RequestContext::new(request_id, control, true)
-                .and_then(|context| context.run(|| database.tql_mut(&query)))
-                .map_err(ApiError::from)?;
+            let mutation = database.tql_mut(&query).map_err(ApiError::from)?;
             versions.generation = versions.generation.saturating_add(1);
             // TQL 暂不返回完整 write-set，因此保守失效此前签发的全部细粒度 ETag。
             versions.invalidate_entity_versions();
@@ -1686,15 +1647,19 @@ fn execute_write(
             }))
         }
         WriteOperation::DeleteMany(request) => {
-            let mut touched_edges = Vec::new();
-            for &id in &request.ids {
+            let ids = request
+                .ids
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>();
+            database.validate_delete_set(&ids).map_err(ApiError::from)?;
+            let mut touched_edges = HashSet::new();
+            for &id in &ids {
                 touched_edges.extend(incident_edge_keys(database, id)?);
             }
-            let affected = database
-                .delete_many_atomic(&request.ids)
-                .map_err(ApiError::from)?;
+            let ids = ids.into_iter().collect::<Vec<_>>();
+            let affected = database.delete_many_atomic(&ids).map_err(ApiError::from)?;
             versions.generation = versions.generation.saturating_add(1);
-            versions.update_entities(database, request.ids, touched_edges)?;
+            versions.update_entities(database, ids, touched_edges)?;
             Ok(StoredWriteResult::Mutation(WriteResult {
                 mutation: MutationResponse {
                     affected,
@@ -1717,8 +1682,7 @@ fn execute_write(
             }))
         }
         WriteOperation::BuildPelorus(config) => {
-            let result = RequestContext::new(request_id, control, true)
-                .and_then(|context| context.run(|| database.build_pelorus_index(config)));
+            let result = database.build_pelorus_index(config);
             if result.as_ref().err().is_none_or(|error| {
                 error
                     .info()
@@ -1752,7 +1716,7 @@ fn execute_write(
         WriteOperation::Transaction(request) => {
             validate_transaction_preconditions(database, versions, &request)?;
             // 在借用事务前读取实际边，覆盖已持久化且尚未登记进版本表的关联边。
-            let mut touched_edges = Vec::new();
+            let mut touched_edges = HashSet::new();
             for operation in &request.operations {
                 match operation {
                     TransactionOperation::Delete { id } => {
@@ -1807,7 +1771,7 @@ fn execute_write(
                     } => {
                         transaction.link(*source, *target, label, *weight);
                         touched_nodes.extend([*source, *target]);
-                        touched_edges.push(EdgeKey::new(*source, *target, label));
+                        touched_edges.insert(EdgeKey::new(*source, *target, label));
                     }
                     TransactionOperation::Unlink {
                         source,
@@ -1816,7 +1780,7 @@ fn execute_write(
                     } => {
                         if let Some(label) = label {
                             transaction.unlink_label(*source, *target, label);
-                            touched_edges.push(EdgeKey::new(*source, *target, label));
+                            touched_edges.insert(EdgeKey::new(*source, *target, label));
                         } else {
                             transaction.unlink(*source, *target);
                         }
@@ -2003,10 +1967,9 @@ impl VersionState {
         &mut self,
         database: &Database<f32>,
         nodes: Vec<u64>,
-        edges: Vec<EdgeKey>,
+        edges: HashSet<EdgeKey>,
     ) -> Result<(), ApiError> {
         let mut nodes: HashSet<_> = nodes.into_iter().collect();
-        let edges: HashSet<_> = edges.into_iter().collect();
         let result = (|| -> triviumdb::Result<()> {
             for edge in edges {
                 nodes.extend([edge.source, edge.target]);
@@ -2935,6 +2898,44 @@ mod tests {
             .await
             .unwrap();
         assert!(!published);
+        assert_eq!(engine.metrics().warmup_state, WarmupState::Skipped);
+    }
+
+    #[tokio::test]
+    async fn 构建等待者离开后仍由后台任务发布终态() {
+        let (engine, _directory) = test_engine("build_waiter", 4, 1).await;
+        while engine.metrics().warmup_state == WarmupState::Preparing {
+            tokio::task::yield_now().await;
+        }
+        let inner = engine.inner.clone();
+        let (held, acquired) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _guard = write_or_recover(&inner.database);
+            held.send(()).unwrap();
+            let _ = wait.blocking_recv();
+        });
+        acquired.await.unwrap();
+        let start = || {
+            spawn_quiver_build(
+                engine.inner.clone(),
+                engine.inner.enter_operation().unwrap(),
+                None,
+            )
+        };
+        let task = start().unwrap();
+        assert!(start().is_none());
+        let error = wait_for_quiver_build(task, Instant::now())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error_body(error).await["code"],
+            "TDB_QUERY_DEADLINE_EXCEEDED"
+        );
+        assert_eq!(engine.metrics().warmup_state, WarmupState::Preparing);
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        engine.shutdown().await.unwrap();
         assert_eq!(engine.metrics().warmup_state, WarmupState::Skipped);
     }
 

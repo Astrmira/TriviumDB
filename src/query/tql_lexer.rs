@@ -216,7 +216,7 @@ impl TqlLexer {
     /// 跳过单行注释 (-- 开头)
     fn skip_comment(&mut self) {
         while let Some(ch) = self.peek() {
-            if ch == '\n' {
+            if matches!(ch, '\n' | '\r') {
                 break;
             }
             self.advance();
@@ -376,9 +376,28 @@ impl TqlLexer {
                                 self.skip_comment();
                                 continue;
                             } else {
-                                // 检查是否是负数: - 后面紧跟数字
+                                // 操作数之后保留二元减号；表达式起始位置保留有符号字面量。
                                 if let Some(c) = self.peek() {
-                                    if c.is_ascii_digit() {
+                                    if c.is_ascii_digit()
+                                        && !matches!(
+                                            tokens.last(),
+                                            Some(
+                                                TqlToken::Ident(_)
+                                                    | TqlToken::Rank
+                                                    | TqlToken::Matches
+                                                    | TqlToken::IntLit(_)
+                                                    | TqlToken::UIntLit(_)
+                                                    | TqlToken::FloatLit(_)
+                                                    | TqlToken::StringLit(_)
+                                                    | TqlToken::BoolLit(_)
+                                                    | TqlToken::DollarOp(_)
+                                                    | TqlToken::Null
+                                                    | TqlToken::RParen
+                                                    | TqlToken::RBracket
+                                                    | TqlToken::RBrace
+                                            )
+                                        )
+                                    {
                                         let num_tok = self.read_number()?;
                                         match num_tok {
                                             TqlToken::IntLit(n) => TqlToken::IntLit(-n),

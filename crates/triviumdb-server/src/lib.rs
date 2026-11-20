@@ -550,7 +550,10 @@ async fn build_pelorus(
 const MAX_IMPORT_RECORDS: usize = 10_000;
 const MAX_IMPORT_LINE_BYTES: usize = 1024 * 1024;
 
-fn decode_ndjson<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<Vec<T>, ApiError> {
+fn decode_ndjson<T: serde::de::DeserializeOwned>(
+    body: &[u8],
+    operation: impl Fn(T, usize) -> Result<TransactionOperation, ApiError>,
+) -> Result<Vec<TransactionOperation>, ApiError> {
     let mut records = Vec::new();
     for (line_index, line) in body.split(|byte| *byte == b'\n').enumerate() {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -565,13 +568,14 @@ fn decode_ndjson<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<Vec<T>, 
                 "批量导入记录数超过上限 (Bulk import record count exceeds limit)",
             ));
         }
-        records.push(serde_json::from_slice(line).map_err(|error| {
+        let record = serde_json::from_slice(line).map_err(|error| {
             ApiError::invalid_request(format!(
                 "NDJSON 第 {} 行无效 (Invalid NDJSON line {}): {error}",
                 line_index + 1,
                 line_index + 1
             ))
-        })?);
+        })?;
+        records.push(operation(record, line_index + 1)?);
     }
     if records.is_empty() {
         return Err(ApiError::invalid_request(
@@ -585,15 +589,14 @@ async fn import_nodes(
     State(state): State<Arc<AppState>>,
     body: axum::body::Bytes,
 ) -> Result<Json<TransactionResponse>, ApiError> {
-    let records: Vec<BulkNodeRecord> = decode_ndjson(&body)?;
-    let operations = records
-        .into_iter()
-        .map(|record| TransactionOperation::Insert {
+    let operations = decode_ndjson(&body, |record: BulkNodeRecord, line| {
+        triviumdb::document::validate_node_import_payload(&record.payload, line)?;
+        Ok(TransactionOperation::Insert {
             id: record.id,
             vector: record.vector,
             payload: record.payload,
         })
-        .collect();
+    })?;
     import_operations(state, operations).await
 }
 
@@ -601,16 +604,14 @@ async fn import_edges(
     State(state): State<Arc<AppState>>,
     body: axum::body::Bytes,
 ) -> Result<Json<TransactionResponse>, ApiError> {
-    let records: Vec<BulkEdgeRecord> = decode_ndjson(&body)?;
-    let operations = records
-        .into_iter()
-        .map(|record| TransactionOperation::Link {
+    let operations = decode_ndjson(&body, |record: BulkEdgeRecord, _| {
+        Ok(TransactionOperation::Link {
             source: record.source,
             target: record.target,
             label: record.label,
             weight: record.weight,
         })
-        .collect();
+    })?;
     import_operations(state, operations).await
 }
 

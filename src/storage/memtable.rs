@@ -84,7 +84,9 @@ fn increment_json_number(
         };
     }
     let sum = a + b;
-    if (b != 0.0 && sum == a) || (a != 0.0 && sum == b) {
+    // 按绝对值排序后，从舍入和中减去大加数可精确恢复实际计入的小加数。
+    let (larger, smaller) = if a.abs() >= b.abs() { (a, b) } else { (b, a) };
+    if !sum.is_finite() || sum - larger != smaller {
         return Err(invalid());
     }
     serde_json::Number::from_f64(sum)
@@ -556,6 +558,7 @@ pub struct MemTable<T: VectorType> {
     deferred_text_path: Option<String>,
     deferred_text_meta: Option<crate::storage::file_format::TextIndexMetadata>,
     pub(crate) checkpoint_token: Option<[u8; 16]>,
+    pub(crate) published_bytes: Arc<crate::observability::PublishedWriteBytes>,
     text_replay: bool,
     text_replay_checkpoint_seen: bool,
     pending_text_mutations: Vec<PendingTextMutation>,
@@ -675,6 +678,7 @@ impl<T: VectorType> MemTable<T> {
             deferred_text_path: None,
             deferred_text_meta: None,
             checkpoint_token: None,
+            published_bytes: Default::default(),
             text_replay: false,
             text_replay_checkpoint_seen: false,
             pending_text_mutations: Vec::new(),
@@ -746,6 +750,7 @@ impl<T: VectorType> MemTable<T> {
             deferred_text_path: None,
             deferred_text_meta: None,
             checkpoint_token: None,
+            published_bytes: Default::default(),
             text_replay: false,
             text_replay_checkpoint_seen: false,
             pending_text_mutations: Vec::new(),

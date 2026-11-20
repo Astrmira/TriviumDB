@@ -288,8 +288,15 @@ pub(crate) fn execute_pipeline_with_limit<T: VectorType>(
     ctx.record_observation("node_count", mt.node_count() as u64);
     if let Some(metrics) = crate::observability::process_memory_snapshot() {
         ctx.record_observation("process_rss_bytes", metrics.rss_bytes);
-        ctx.record_observation("process_major_faults", metrics.major_faults);
-        ctx.record_observation("process_minor_faults", metrics.minor_faults);
+        for (name, faults) in [
+            ("process_total_faults", metrics.total_faults),
+            ("process_major_faults", metrics.major_faults),
+            ("process_minor_faults", metrics.minor_faults),
+        ] {
+            if let Some(count) = faults {
+                ctx.record_observation(name, count);
+            }
+        }
     }
 
     // ═══════════════════════════════════════════════════════

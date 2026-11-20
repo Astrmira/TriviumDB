@@ -1569,6 +1569,28 @@ async fn ndjson分块协议包含meta_rows_summary与profile() {
 }
 
 #[tokio::test]
+async fn 节点导入遇到文档归档字段时整批拒绝() {
+    let (app, _directory) = app("import_document_reference").await;
+    let response = raw_request(
+        app.clone(),
+        "POST",
+        "/v1/import/nodes",
+        br#"{"id":1,"vector":[1,0],"payload":{"v":1}}
+{"id":2,"vector":[0,1],"payload":{"_tdb_document":{"archive":7}}}
+"#
+        .to_vec(),
+        &[("content-type", "application/x-ndjson")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json(response).await["code"], "TDB_INVALID_INPUT");
+    for id in [1, 2] {
+        let node = request(app.clone(), "GET", &format!("/v1/nodes/{id}"), None, &[]).await;
+        assert_eq!(node.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[tokio::test]
 async fn 索引管理quiver状态与ndjson导入形成完整http契约() {
     let (app, _directory) = app("management_import").await;
     let nodes = raw_request(
@@ -2244,7 +2266,7 @@ async fn zero_prepared_capacity_rejects_registration() {
 
 #[cfg(feature = "test-hooks")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn 写请求在WAL前断开时无业务副作用() {
+async fn 写请求在_wal_前断开时无业务副作用() {
     use triviumdb::test_hooks::{ConcurrencyPoint, pause_at_request};
     let (app, _directory) = app("cancel-in-core").await;
     let gate = pause_at_request(ConcurrencyPoint::BeforeTransactionWal, "cancel-in-core");
@@ -2262,7 +2284,7 @@ async fn 写请求在WAL前断开时无业务副作用() {
     assert!(client.await.unwrap_err().is_cancelled());
     gate.release();
     let response = request(
-        app,
+        app.clone(),
         "POST",
         "/v1/tql",
         Some(serde_json::json!({
@@ -2273,4 +2295,54 @@ async fn 写请求在WAL前断开时无业务副作用() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(json(response).await["rows"][0]["total"]["value"], 0);
+    let inserted = request(
+        app.clone(),
+        "POST",
+        "/v1/transactions",
+        Some(serde_json::json!({
+            "operations":[{"op":"insert","id":1,"vector":[1,0],"payload":{"v":1}}]
+        })),
+        &[],
+    )
+    .await;
+    assert_eq!(inserted.status(), StatusCode::OK);
+    for (uri, body, point) in [
+        (
+            "/v1/transactions",
+            serde_json::json!({"operations":[{"op":"delete","id":1}]}),
+            ConcurrencyPoint::BeforeTransactionWal,
+        ),
+        (
+            "/v1/nodes/delete-many",
+            serde_json::json!({"ids":[1,1]}),
+            ConcurrencyPoint::BeforeTransactionWal,
+        ),
+        (
+            "/v1/nodes/1/compare-and-set",
+            serde_json::json!({"field":"v","expected":1,"replacement":2}),
+            ConcurrencyPoint::DirectWriteWalLockAcquired,
+        ),
+    ] {
+        let gate = pause_at_request(point, "cancel-in-core");
+        let client = tokio::spawn(request(
+            app.clone(),
+            "POST",
+            uri,
+            Some(body),
+            &[("x-request-id", "cancel-in-core")],
+        ));
+        while !gate.is_arrived() {
+            assert!(!client.is_finished(), "请求应进入内核提交屏障 {uri}");
+            tokio::task::yield_now().await;
+        }
+        client.abort();
+        assert!(client.await.unwrap_err().is_cancelled());
+        gate.release();
+        let response = request(app.clone(), "GET", "/v1/nodes/1", None, &[]).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            json(response).await["node"]["payload"],
+            serde_json::json!({"v":1})
+        );
+    }
 }

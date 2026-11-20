@@ -404,6 +404,11 @@ impl<T: VectorType> VecPool<T> {
     }
 
     pub fn flush(&mut self, vec_path: &Path) -> Result<usize> {
+        self.flush_measured(vec_path).map(|(count, _)| count)
+    }
+
+    /// 返回发布后的槽位数，以及本次实际写入向量文件的字节数。
+    pub(crate) fn flush_measured(&mut self, vec_path: &Path) -> Result<(usize, u64)> {
         if self.recovery_required {
             return Err(TriviumError::WalClosed);
         }
@@ -424,7 +429,7 @@ impl<T: VectorType> VecPool<T> {
             self.delta.clear();
             self.has_dirty_base = false;
             self.invalidate_cache();
-            return Ok(0);
+            return Ok((0, 0));
         }
 
         // ── 策略分支 ──
@@ -435,11 +440,16 @@ impl<T: VectorType> VecPool<T> {
         if !self.has_dirty_base && self.mmap.is_some() {
             if self.delta.is_empty() {
                 // 既无脏页也无新增，无需任何 I/O
-                return Ok(self.mmap_count);
+                return Ok((self.mmap_count, 0));
             }
-            self.flush_append(vec_path)
+            let bytes = std::mem::size_of_val(self.delta.as_slice()) as u64;
+            self.flush_append(vec_path).map(|count| (count, bytes))
         } else {
-            self.flush_rewrite(vec_path)
+            let count = self.flush_rewrite(vec_path)?;
+            Ok((
+                count,
+                count as u64 * self.dim as u64 * std::mem::size_of::<T>() as u64,
+            ))
         }
     }
 

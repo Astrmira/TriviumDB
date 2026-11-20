@@ -404,6 +404,9 @@ fn aggregate<T: VectorType>(
     scope: &Scope<'_, T>,
 ) -> Result<TqlValue<T>, TriviumError> {
     let star = matches!(inner,ReturnExprKind::Var(v) if v == "*");
+    if func == AggFunc::Count && star && !distinct {
+        return Ok(json_to_tql_value(serde_json::json!(group.len())));
+    }
     let mut values = Vec::new();
     let mut seen = HashSet::new();
     for &index in group {
@@ -598,15 +601,11 @@ fn finish_inner<T: VectorType>(
             });
         }
     } else {
-        let distinct = expressions
-            .into_iter()
-            .flatten()
-            .filter(|item| item.distinct)
-            .collect::<Vec<_>>();
+        let distinct = expressions.filter(|items| items.iter().any(|item| item.distinct));
         let mut seen = HashSet::new();
         for (index, input) in inputs.iter().enumerate() {
             scope.limits.check_cancelled()?;
-            if !distinct.is_empty() {
+            if let Some(distinct) = distinct {
                 let key = distinct
                     .iter()
                     .map(|item| kind_runtime(&item.kind, input, scope).and_then(runtime_signature))
@@ -689,6 +688,26 @@ pub(super) fn into_nodes<T: VectorType>(
     inputs: &[Input<'_, T>],
     scope: &Scope<'_, T>,
 ) -> Result<TqlResult<T>, TriviumError> {
+    let mut aggregate_keys = Vec::new();
+    if let ReturnClause::Expressions(items) = &scope.query.returns {
+        let mut name_counts = HashMap::new();
+        for item in items {
+            let column = column_name(item);
+            let name = match (&item.kind, &item.alias) {
+                (ReturnExprKind::Aggregate(func, _), None) => format!("{func:?}").to_lowercase(),
+                _ => column.clone(),
+            };
+            *name_counts.entry(name.clone()).or_insert(0usize) += 1;
+            if is_aggregate(&item.kind) {
+                aggregate_keys.push((column, name, item.alias.is_none()));
+            }
+        }
+        for (column, name, _) in &mut aggregate_keys {
+            if name_counts[name] > 1 {
+                name.clone_from(column);
+            }
+        }
+    }
     let mut output = Vec::new();
     for row in rows {
         let mut bindings = match row.source.map(|index| &inputs[index]) {
@@ -748,28 +767,27 @@ pub(super) fn into_nodes<T: VectorType>(
             }
             bindings.retain(|name, _| retained.contains(name));
         }
-        if let ReturnClause::Expressions(items) = &scope.query.returns {
-            for item in items.iter().filter(|item| is_aggregate(&item.kind)) {
-                let column = column_name(item);
-                let value = row.values.get(&column).map(value_json).ok_or_else(|| {
-                    TriviumError::QueryExecution(
-                        "聚合返回列缺失 (Missing aggregate return column)".into(),
-                    )
-                })?;
-                let name = item.alias.clone().unwrap_or_else(|| match &item.kind {
-                    ReturnExprKind::Aggregate(func, _) => format!("{func:?}").to_lowercase(),
-                    _ => column.clone(),
-                });
-                bindings.insert(
-                    name.clone(),
-                    Node {
-                        id: 0,
-                        vector: Vec::new(),
-                        payload: serde_json::json!({name:value}),
-                        edges: Vec::new(),
-                    },
-                );
-            }
+        for (column, preferred, implicit) in &aggregate_keys {
+            let value = row.values.get(column).map(value_json).ok_or_else(|| {
+                TriviumError::QueryExecution(
+                    "聚合返回列缺失 (Missing aggregate return column)".into(),
+                )
+            })?;
+            // 只在短名唯一且未被实体绑定占用时使用兼容名称。
+            let name = if *implicit && bindings.contains_key(preferred) {
+                column
+            } else {
+                preferred
+            };
+            bindings.insert(
+                name.clone(),
+                Node {
+                    id: 0,
+                    vector: Vec::new(),
+                    payload: serde_json::json!({name:value}),
+                    edges: Vec::new(),
+                },
+            );
         }
         output.push(bindings);
     }

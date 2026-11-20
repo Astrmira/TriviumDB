@@ -408,7 +408,11 @@ fn requested_row_limit<T: VectorType>(
         None if query_has_edges(query) => DEFAULT_EDGE_ROW_LIMIT,
         None => usize::MAX,
     };
-    let memory_cap = memory_row_cap(limits.memory_limit, mt);
+    let memory_cap = if limits.memory_limit > 0 && counts_match_rows(query) {
+        limits.memory_limit / 256
+    } else {
+        memory_row_cap(limits.memory_limit, mt)
+    };
     if let Some(limit) = query.limit
         && limit
             .checked_add(query.offset.unwrap_or(0))
@@ -440,6 +444,26 @@ fn requires_full_input(query: &TqlQuery, ordered_find: bool) -> bool {
 
 fn is_aggregate(kind: &ReturnExprKind) -> bool {
     matches!(kind, ReturnExprKind::Aggregate(..))
+}
+
+fn counts_match_rows(query: &TqlQuery) -> bool {
+    let ReturnClause::Expressions(items) = &query.returns else {
+        return false;
+    };
+    matches!(
+        query.entry,
+        QueryEntry::Match { .. } | QueryEntry::OptionalMatch { .. }
+    ) && query.rank.is_none()
+        && query.pipeline.is_empty()
+        && !items.is_empty()
+        && items.iter().all(|item| {
+            matches!(&item.kind, ReturnExprKind::Aggregate(AggFunc::Count, inner)
+            if matches!(inner.as_ref(), ReturnExprKind::Var(v) if v == "*"))
+        })
+        && query.order_by.iter().all(|order| {
+            matches!(&order.expr, TqlExpr::Variable(name)
+            if items.iter().any(|item| item.alias.as_ref() == Some(name)))
+        })
 }
 
 fn admit_input_rows<T: VectorType>(
@@ -715,7 +739,11 @@ fn execute_binding_rows_inner<T: VectorType>(
         query.entry,
         QueryEntry::Match { .. } | QueryEntry::OptionalMatch { .. }
     ) {
-        snapshot_query.returns = ReturnClause::All;
+        snapshot_query.returns = if counts_match_rows(query) {
+            ReturnClause::Variables(Vec::new())
+        } else {
+            ReturnClause::All
+        };
     }
     let (mut results, ordered_output) = match &query.entry {
         QueryEntry::Find { filter } => execute_find(
@@ -1976,6 +2004,7 @@ fn collect_single_edge_rows_inner<T: VectorType>(
         limits,
         pipeline: None,
     };
+    let count_only = counts_match_rows(query) && query.predicate.is_none();
     let mut expanded = Vec::new();
     let mut budget = matching::WorkBudget::new(MAX_BUDGET, limits.query_control.as_ref());
     'anchors: for start in candidates {
@@ -2028,9 +2057,21 @@ fn collect_single_edge_rows_inner<T: VectorType>(
             }
             let mut nodes = HashMap::new();
             for (pattern, id) in [(left, start), (right, end)] {
-                if let Some(var) = &pattern.var {
+                if !count_only && let Some(var) = &pattern.var {
                     nodes.insert(var.clone(), memory.snapshot(id, mt)?);
                 }
+            }
+            if count_only {
+                matched = true;
+                expanded.push(EdgeBindingRow {
+                    nodes,
+                    edge: None,
+                    anchor: start,
+                });
+                if expanded.len() > row_limit {
+                    break 'anchors;
+                }
+                continue;
             }
             memory.retain(
                 edge.label
@@ -2071,7 +2112,7 @@ fn collect_single_edge_rows_inner<T: VectorType>(
         }
         if optional && !matched {
             let mut nodes = HashMap::new();
-            if let Some(var) = &left.var {
+            if !count_only && let Some(var) = &left.var {
                 nodes.insert(var.clone(), memory.snapshot(start, mt)?);
             }
             expanded.push(EdgeBindingRow {

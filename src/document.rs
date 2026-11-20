@@ -17,6 +17,16 @@ pub use source::{
     DocumentSourceMapEntry, DocumentSourceSpan, SourceMapKind,
 };
 
+/// 校验逐行交换的普通节点；受管理文档及归档引用由文档接入或快照整体传输。
+pub fn validate_node_import_payload(payload: &serde_json::Value, line: usize) -> Result<()> {
+    if payload.get(DOCUMENT_FIELD).is_some() {
+        return Err(TriviumError::InvalidInput(format!(
+            "第 {line} 行含受管理文档，跨库传输请使用快照或文档接入接口 (Line {line} contains a managed document; use snapshots or document ingestion for transfer)"
+        )).at_field("payload._tdb_document"));
+    }
+    Ok(())
+}
+
 /// 文档或片段的真实检索表示；向量沿用数据库的维度及dtype契约。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, bound = "")]
