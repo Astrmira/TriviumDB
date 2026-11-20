@@ -109,6 +109,12 @@ enum Commands {
         db: DbArgs,
         /// 输入文件路径（.jsonl）
         input: String,
+        /// 单事务允许读取的 JSONL 字节数
+        #[arg(long, default_value_t = 64 * 1024 * 1024)]
+        max_input_bytes: usize,
+        /// 单事务允许的节点与边操作总数
+        #[arg(long, default_value_t = 100_000)]
+        max_operations: usize,
     },
 
     /// 手动触发压缩（compaction）
@@ -276,9 +282,14 @@ fn run(cli: Cli, cfg: config::Config) -> CliResult {
             let handle = open_read_only(&db, &cfg)?;
             commands::export::run(&handle, &db.path, &output)
         }
-        Commands::Import { db, input } => {
+        Commands::Import {
+            db,
+            input,
+            max_input_bytes,
+            max_operations,
+        } => {
             let mut handle = open(&db, &cfg)?;
-            commands::import::run(&mut handle, &input)
+            commands::import::run(&mut handle, &input, max_input_bytes, max_operations)
         }
         Commands::Compact(db) => {
             let mut handle = open(&db, &cfg)?;

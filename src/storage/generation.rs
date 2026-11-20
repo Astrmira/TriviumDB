@@ -8,7 +8,7 @@
 use crate::VectorType;
 use crate::database::DatabaseReader;
 use crate::error::{Result, TriviumError};
-use crate::storage::fs::robust_rename_and_sync;
+use crate::storage::fs::{rename_publication_entry, sync_parent_directory};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
@@ -154,13 +154,27 @@ impl GenerationStore {
                 reason: error.to_string(),
             }
         })?;
-        {
+        let result = crate::error::WriteErrorInfo::capture(|write| {
             use std::io::Write;
+            write.phase = crate::error::WritePhase::Publish;
             let mut file = std::fs::File::create(&temporary)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
+            drop(file);
+            rename_publication_entry(&temporary, &target)?;
+            // 指针已对读者可见，后续同步失败需由调用方核对发布结果。
+            write.outcome = crate::error::WriteOutcome::Unknown;
+            #[cfg(feature = "test-hooks")]
+            crate::test_hooks::io_result(
+                crate::test_hooks::IoPoint::GenerationPointerDirectorySync,
+            )?;
+            sync_parent_directory(&target)?;
+            Ok(())
+        });
+        if result.is_err() {
+            std::fs::remove_file(&temporary).ok();
         }
-        robust_rename_and_sync(&temporary, &target)?;
+        result?;
         Ok(current)
     }
 

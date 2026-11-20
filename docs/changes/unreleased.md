@@ -6,6 +6,11 @@
 
 ## 中文说明
 
+- HTTP 事务在组 WAL 同步成功后确认幂等回执。同步之前发生的实体版本读取错误会使旧 ETag 整体失效，同键重试可以取回原先分配的节点 ID。HTTP 整节点、边、搜索结果和 TQL 投影中的嵌套大整数采用同一十进制字符串编码。
+- 文件组回收先持久退役发布日志，再删除恢复备份。Windows 使用同卷写穿透移动发布控制文件。代际指针替换后的同步错误携带 `publish/unknown`，调用方可读取当前代际确认结果。
+- TQL 简写向量查询在文档谓词匹配集内取 Top-K。`FIND` 默认按节点 ID 分页，显式字段排序可按有序索引游标取页。`SET VECTOR` 按唯一目标写入，`MATCH … CREATE` 拒绝在已绑定节点上提供属性，集合字面量检查成员之间的逗号。
+- Python 搜索 Hook 在同一请求的各阶段共享 `custom_data` 字典。回调属性求值、返回值和上下文转换失败时，检索返回 Hook 错误。
+- CLI 原子导入可设置输入字节和操作数上限。Console 边读取与路径遍历在复制和展开前执行会话预算。调和中心性只维护已发现的距离，可变长路径用显式栈遍历，N-gram 在生成前按字符数准入。
 - CLI 和 Server 的节点导入在写入前识别受管理文档的保留字段，整批拒绝跨库归档指针。Payload 的 `$inc` 在写 WAL 前检查浮点加法的完整增量，拒绝会发生部分舍入的补丁。
 - TQL 多列 `DISTINCT` 按完整投影去重。Rust `tql_nodes()` 遇到多个同名聚合时以表达式标识各列。减法支持紧邻操作数的写法，行注释支持 CR、LF 和 CRLF。只需行重数的 MATCH 计数跳过节点快照。
 - 并行 PageRank 按节点顺序归并残差。图扩散以更宽的精度计算门控，门控归零的边仍计入归一化分母。双向扩散分别计入正反边，自环只计一次。图算法先准入边扫描预算，节点对相似度排序遵守 Top-K 容量。
@@ -16,6 +21,11 @@
 
 ## English
 
+- HTTP transactions confirm idempotent receipts after the group WAL sync succeeds. If entity-version reads fail before that point, the server invalidates prior ETags. A retry with the same key can retrieve the original allocated IDs. Nested large integers in node, edge, search and TQL responses use the same decimal string encoding.
+- Checkpoint cleanup durably retires the publication journal before removing recovery backups. On Windows, control files use same-volume write-through moves. A sync error after a generation pointer switch carries `publish/unknown`; callers can read the current generation to reconcile the outcome.
+- Shorthand TQL vector search ranks the nodes matching its document predicate before taking Top-K. By default, `FIND` pages by node ID. Explicit field ordering can page through an ordered index cursor. `SET VECTOR` writes each target once. `MATCH … CREATE` rejects properties on previously bound nodes, and collection literals require separators between members.
+- Python search hooks share a request-local `custom_data` dictionary across stages. Errors resolving callbacks, decoding return values or converting the context propagate as hook errors.
+- Atomic CLI imports support input-byte and operation limits. Console edge reads and path traversal apply session budgets before copying or expanding the graph. Harmonic centrality tracks discovered distances, variable-length paths use an explicit stack, and N-gram generation admits bounded character input before allocating grams.
 - The CLI and Server node importers reject an entire batch containing reserved managed-document payloads before transferring archive references across databases. Payload `$inc` checks that the full increment survives floating-point addition before writing to the WAL.
 - TQL deduplicates the full projection in multi-column `DISTINCT` queries. Rust `tql_nodes()` uses expression names for colliding aggregate columns. Subtraction accepts adjacent operands, and line comments end at CR, LF or CRLF. MATCH counts that depend only on row multiplicity skip node snapshots.
 - Parallel PageRank sums convergence residuals in node order. Graph diffusion evaluates attention in higher precision and keeps fully suppressed edges in the normalization denominator. Bidirectional traversal counts reciprocal edges separately and self-loops once. Graph algorithms admit edge scans before building adjacency lists, and node similarity stays within the Top-K pair capacity.

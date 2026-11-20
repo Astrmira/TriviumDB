@@ -627,3 +627,32 @@ fn 宿主关闭失败保留同一文件锁且允许原会话重试() {
     );
     reopened.close().unwrap();
 }
+
+#[test]
+fn 图读取在过滤和复制之前按会话预算计费() {
+    let root = TestDir::new("console-graph-budget");
+    let mut db = seed(root.file("data.tdb").as_str());
+    db.insert_with_id(3, &[0., 1.], json!({})).unwrap();
+    db.link(1, 2, "first", 1.).unwrap();
+    db.link(1, 3, "last", 1.).unwrap();
+    let small = ConsoleSession::from_json(r#"{"maxOperations":1}"#).unwrap();
+    let enough = ConsoleSession::from_json(r#"{"maxOperations":3}"#).unwrap();
+    for cmd in [
+        json!({"operation":"edges","node":"1"}),
+        json!({"operation":"edges","node":"3","incoming":true}),
+        json!({"operation":"path","source":"1","target":"3","maxDepth":2,"label":"missing"}),
+    ] {
+        let err = db.console_request(&small, &request(cmd)).unwrap_err();
+        assert_eq!(err.code(), "QueueFull");
+        assert_eq!(err.details()["resource"], "console_operations");
+    }
+    assert_eq!(
+        call(
+            &mut db,
+            &enough,
+            json!({"operation":"path","source":"1","target":"3","maxDepth":2,"label":"last"})
+        ),
+        json!({"path":["1","3"]})
+    );
+    db.close().unwrap();
+}

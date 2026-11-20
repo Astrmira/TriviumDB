@@ -20,8 +20,8 @@ use memory::QueryMemory;
 
 use super::pipeline::BindingValue as RuntimeValue;
 use super::planner::{
-    AccessPath, NodeAccessPlan, plan_filter, plan_filter_ordered, plan_filter_with_limit,
-    plan_match, plan_match_node_filter,
+    AccessPath, NodeAccessPlan, plan_filter, plan_filter_with_limit, plan_match,
+    plan_match_node_filter,
 };
 use super::tql_ast::*;
 use super::tql_source::{QueryOrigin, SourceSelector, TqlSource};
@@ -600,7 +600,7 @@ fn execute_tql_context_inner<T: VectorType>(
         let find_plan = if query.pipeline.is_empty()
             && let QueryEntry::Find { filter } = &query.entry
         {
-            let ordered = find_ordered_find_plan(query, filter, memtable);
+            let ordered = find_ordered_find_plan(query, memtable);
             let (row_limit, _) = requested_row_limit(
                 query,
                 requires_full_input(query, ordered.is_some()),
@@ -727,7 +727,7 @@ fn execute_binding_rows_inner<T: VectorType>(
 ) -> Result<(TqlResult<T>, bool), TriviumError> {
     let ordered_find = matches!(
         &query.entry,
-        QueryEntry::Find { filter } if find_ordered_find_plan(query, filter, memtable).is_some()
+        QueryEntry::Find { .. } if find_ordered_find_plan(query, memtable).is_some()
     );
     let requires_full_input = requires_full_input(query, ordered_find);
     let (row_limit, user_limited) =
@@ -914,6 +914,7 @@ fn execute_pipeline_set<T: VectorType>(
         .map_or(0, |request| request.query().limits.max_vector_scores);
     let shorthand_search =
         query.pipeline.is_empty() && matches!(query.entry, QueryEntry::Search { .. });
+    let search_filter = shorthand_search_filter(query);
     let plan = crate::query::cascades::optimize_pipeline_scoped(
         query,
         mt,
@@ -929,7 +930,7 @@ fn execute_pipeline_set<T: VectorType>(
                     plan.stages.first().map(|stage| &stage.operator),
                 ) {
                     (QueryEntry::Search { vector, top_k, expand, .. }, _) if shorthand_search => {
-                        lower_shorthand_search(vector, *top_k, expand.as_ref(), query, mt)?
+                        lower_shorthand_search(vector, *top_k, expand.as_ref(), search_filter, mt)?
                     }
                     (
                         QueryEntry::Search {
@@ -1098,7 +1099,9 @@ fn execute_pipeline_set<T: VectorType>(
     };
     let mut operator_origins = vec![limits.origin(SourceSelector::Entry); operators.len()];
     if shorthand_search || (pelorus_source.is_some() && query.pipeline.is_empty()) {
-        if let Some(predicate) = &query.predicate {
+        if search_filter.is_none()
+            && let Some(predicate) = &query.predicate
+        {
             operators.push(Box::new(PipelinePredicateFilter {
                 predicate: predicate.clone(),
             }));
@@ -2629,30 +2632,6 @@ fn collect_predicate_equalities(
     }
 }
 
-fn filter_is_equality_conjunction(filter: &Filter) -> bool {
-    match filter {
-        Filter::Eq(field, _) => field != "id",
-        Filter::And(filters) => {
-            !filters.is_empty() && filters.iter().all(filter_is_equality_conjunction)
-        }
-        _ => false,
-    }
-}
-
-fn collect_filter_equalities(filter: &Filter, output: &mut Vec<(String, serde_json::Value)>) {
-    match filter {
-        Filter::Eq(field, value) if field != "id" => {
-            output.push((field.clone(), value.clone()));
-        }
-        Filter::And(filters) => {
-            for filter in filters {
-                collect_filter_equalities(filter, output);
-            }
-        }
-        _ => {}
-    }
-}
-
 struct PipelinePredicateFilter {
     predicate: Predicate,
 }
@@ -2991,21 +2970,33 @@ fn execute_find<T: VectorType>(
     memory: &QueryMemory,
 ) -> Result<(TqlResult<T>, bool), TriviumError> {
     let mut results = Vec::new();
-    let ordered_plan = find_ordered_find_plan(query, filter, mt);
-    let ordered_output = ordered_plan.is_some();
-    let access_plan = ordered_plan
-        .clone()
-        .unwrap_or_else(|| plan_find_filter(query, filter, mt, row_limit));
-    let full_scan = matches!(access_plan.access_path, AccessPath::FullNodeScan);
-    let filter_covered = query.predicate.is_none()
-        && matches!(
-            (&access_plan.access_path, filter),
-            (AccessPath::PropertyIndex { field: indexed }, Filter::Eq(field, _)) if indexed == field
-        );
-    let candidate_ids: Box<dyn Iterator<Item = NodeId> + '_> = if full_scan {
-        Box::new(mt.active_node_ids())
+    let cursor = find_ordered_field(query).and_then(|(field, desc)| {
+        let bound = super::planner::ordered_range(filter)
+            .filter(|(name, ..)| *name == field)
+            .map(|(_, op, inclusive, value)| (op, inclusive, value));
+        mt.property_indexes().ordered_cursor(field, desc, bound)
+    });
+    let ordered_output = cursor.is_some();
+    let mut filter_covered = false;
+    let candidate_ids: Box<dyn Iterator<Item = NodeId> + '_> = if let Some(cursor) = cursor {
+        Box::new(cursor)
     } else {
-        Box::new(access_plan.candidates.into_iter())
+        let mut plan = plan_find_filter(query, filter, mt, row_limit);
+        filter_covered = query.predicate.is_none()
+            && matches!(
+                (&plan.access_path, filter),
+                (AccessPath::PropertyIndex { field: indexed }, Filter::Eq(field, _)) if indexed == field
+            );
+        if matches!(
+            plan.access_path,
+            AccessPath::FullNodeScan | AccessPath::ColdPayloadScan
+        ) {
+            Box::new(mt.active_node_ids())
+        } else {
+            // 未指定顺序时，所有访问路径统一按实体身份分页。
+            plan.candidates.sort_unstable();
+            Box::new(plan.candidates.into_iter())
+        }
     };
     for (scanned, id) in candidate_ids.enumerate() {
         if scanned & 0xff == 0
@@ -3080,13 +3071,19 @@ fn find_ordered_field(query: &TqlQuery) -> Option<(&str, bool)> {
 
 fn find_ordered_find_plan<T: VectorType>(
     query: &TqlQuery,
-    filter: &Filter,
     mt: &MemTable<T>,
 ) -> Option<super::planner::NodeAccessPlan> {
     let (field, descending) = find_ordered_field(query)?;
-    // ORDER BY 索引只能提供候选顺序；入口 Filter 和 WHERE 都可能继续淘汰候选。
-    // 在过滤前按 OFFSET + LIMIT 截断会造成分页缺行，因此这里必须读取完整有序候选。
-    plan_filter_ordered(filter, field, descending, None, mt)
+    mt.property_indexes()
+        .has_exact_ordered_index(field)
+        .then(|| NodeAccessPlan {
+            access_path: AccessPath::OrderedPropertyIndex {
+                field: field.into(),
+                descending,
+            },
+            estimated_rows: mt.node_count(),
+            candidates: Vec::new(),
+        })
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -3204,50 +3201,52 @@ fn execute_match<T: VectorType>(
 //  SEARCH 执行路径 (桥接到向量管线)
 // ═══════════════════════════════════════════════════════════════════════
 
+fn shorthand_search_filter(query: &TqlQuery) -> Option<&Filter> {
+    match (&query.entry, &query.predicate) {
+        (QueryEntry::Search { expand: None, .. }, Some(Predicate::DocFilter { var, filter }))
+            if query.pipeline.is_empty() && var.as_deref().is_none_or(|name| name == "_") =>
+        {
+            Some(filter)
+        }
+        _ => None,
+    }
+}
+
 fn lower_shorthand_search<T: VectorType>(
     vector: &[serde_json::Number],
     top_k: usize,
     expand: Option<&ExpandClause>,
-    query: &TqlQuery,
+    search_filter: Option<&Filter>,
     mt: &MemTable<T>,
 ) -> Result<Vec<Box<dyn crate::query::pipeline::PipelineOperator<T>>>, TriviumError> {
-    let indexed_filter = if expand.is_none() {
-        query
-            .predicate
-            .as_ref()
-            .and_then(|predicate| match predicate {
-                Predicate::DocFilter { var, filter }
-                    if var.as_deref().is_none_or(|var| var == "_")
-                        && filter_is_equality_conjunction(filter) =>
-                {
-                    let mut equalities = Vec::new();
-                    collect_filter_equalities(filter, &mut equalities);
-                    let candidates = if equalities.len() == 1 {
-                        mt.find_by_property_index(&equalities[0].0, &equalities[0].1)
-                    } else {
-                        mt.find_by_composite_property_index(&equalities)
-                            .map(|(_, ids)| ids)
-                            .or_else(|| mt.find_by_bitmap_intersection(&equalities))
-                    }?;
-                    Some((filter.clone(), candidates))
-                }
-                _ => None,
-            })
-    } else {
-        None
-    };
-    if let Some((filter, candidates)) = indexed_filter {
-        return Ok(vec![
-            Box::new(crate::query::pipeline::NodeIdsSource { ids: candidates }),
-            Box::new(crate::query::pipeline::PayloadFilter { filter }),
-            Box::new(crate::query::pipeline::ExactRerank {
-                query: vector
-                    .iter()
-                    .map(T::from_json_number)
-                    .collect::<Result<Vec<_>, _>>()?,
-                top_k: Some(top_k),
-            }),
-        ]);
+    if let Some(filter) = search_filter {
+        use crate::query::pipeline::{
+            ExactRerank, FilteredNodeScanSource, NodeIdsSource, PayloadFilter, PipelineOperator,
+        };
+        let plan = plan_filter_with_limit(filter, Some(usize::MAX), mt);
+        let mut stages: Vec<Box<dyn PipelineOperator<T>>> = match plan.access_path {
+            AccessPath::FullNodeScan | AccessPath::ColdPayloadScan => {
+                vec![Box::new(FilteredNodeScanSource {
+                    filter: filter.clone(),
+                })]
+            }
+            _ => vec![
+                Box::new(NodeIdsSource {
+                    ids: plan.candidates,
+                }),
+                Box::new(PayloadFilter {
+                    filter: filter.clone(),
+                }),
+            ],
+        };
+        stages.push(Box::new(ExactRerank {
+            query: vector
+                .iter()
+                .map(T::from_json_number)
+                .collect::<Result<_, _>>()?,
+            top_k: Some(top_k),
+        }));
+        return Ok(stages);
     }
     crate::query::pipeline::lower_search_entry(vector, top_k, expand)
 }
@@ -4050,6 +4049,7 @@ fn generate_explain_plan<T: VectorType>(
     plan.insert("entry".into(), serde_json::json!(entry_type));
     plan.insert("detail".into(), serde_json::json!(entry_detail));
 
+    let search_filter = shorthand_search_filter(query);
     let (access_path, estimated_rows, reversed) = match &query.entry {
         QueryEntry::Find { filter } => {
             let planned = find_plan.unwrap_or_else(|| plan_filter(filter, mt));
@@ -4067,10 +4067,16 @@ fn generate_explain_plan<T: VectorType>(
             let planned = scoped_match_plan(pattern, mt, true, limits);
             (planned.access_path, planned.estimated_rows, false)
         }
-        QueryEntry::Search { .. }
-        | QueryEntry::Text { .. }
-        | QueryEntry::Documents { .. }
-        | QueryEntry::Pelorus { .. } => (AccessPath::FullNodeScan, mt.node_count(), false),
+        QueryEntry::Search { .. } => search_filter.map_or_else(
+            || (AccessPath::FullNodeScan, mt.node_count(), false),
+            |filter| {
+                let planned = plan_filter_with_limit(filter, Some(usize::MAX), mt);
+                (planned.access_path, planned.estimated_rows, false)
+            },
+        ),
+        QueryEntry::Text { .. } | QueryEntry::Documents { .. } | QueryEntry::Pelorus { .. } => {
+            (AccessPath::FullNodeScan, mt.node_count(), false)
+        }
     };
     plan.insert(
         "access_path".into(),
@@ -4175,7 +4181,15 @@ fn generate_explain_plan<T: VectorType>(
         );
     }
     if let QueryEntry::Search { vector, top_k, .. } = &query.entry {
-        let estimated_candidates = top_k.saturating_mul(8).max(64).min(mt.node_count());
+        let estimated_candidates = if search_filter.is_some() {
+            estimated_rows
+        } else {
+            top_k.saturating_mul(8).max(64).min(mt.node_count())
+        };
+        plan.insert(
+            "filter_before_top_k".into(),
+            serde_json::json!(search_filter.is_some()),
+        );
         let estimated_temp_bytes =
             estimated_candidates.saturating_mul(std::mem::size_of::<(NodeId, f32)>());
         let estimated_vector_page_reads = estimated_candidates
@@ -4184,7 +4198,7 @@ fn generate_explain_plan<T: VectorType>(
             .div_ceil(4096);
         plan.insert(
             "vector_access_path".into(),
-            serde_json::json!(if mt.quiver().is_some() {
+            serde_json::json!(if search_filter.is_none() && mt.quiver().is_some() {
                 "ann_post_filter"
             } else {
                 "exact_fallback"
@@ -4717,6 +4731,25 @@ fn execute_create<T: VectorType>(
     limits: &ExecutionContext,
     memory: &QueryMemory,
 ) -> Result<Vec<MutationOp<T>>, TriviumError> {
+    if let Some(source) = source {
+        for node in &create.nodes {
+            if node
+                .payload
+                .as_object()
+                .is_some_and(|fields| !fields.is_empty())
+                && let Some(var) = &node.var
+                && source
+                    .pattern
+                    .nodes
+                    .iter()
+                    .any(|bound| bound.var.as_ref() == Some(var))
+            {
+                return Err(TriviumError::QueryExecution(format!(
+                    "请使用 SET 修改已绑定节点 {var} (Use SET to modify bound node {var})"
+                )));
+            }
+        }
+    }
     let matches = if let Some(source) = source {
         let query = build_match_query(&source.pattern, source.predicate.as_ref());
         execute_tql_context(&query, mt, limits.for_entry())?
@@ -4804,11 +4837,18 @@ fn execute_set_vector<T: VectorType>(
         .iter()
         .map(T::from_json_number)
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(results
+    let ids: BTreeSet<_> = results
         .iter()
-        .filter_map(|row| row.get(var))
-        .map(|node| MutationOp::UpdateVector {
-            id: node.id,
+        .filter_map(|row| row.get(var).map(|node| node.id))
+        .collect();
+    memory.retain(
+        ids.len()
+            .saturating_mul(std::mem::size_of_val(converted.as_slice())),
+    )?;
+    Ok(ids
+        .into_iter()
+        .map(|id| MutationOp::UpdateVector {
+            id,
             vector: converted.clone(),
         })
         .collect())

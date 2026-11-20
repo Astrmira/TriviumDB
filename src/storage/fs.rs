@@ -50,33 +50,7 @@ pub(crate) fn rename_new(from: &Path, to: &Path) -> std::io::Result<()> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
-        }
-        let path = |value: &Path| {
-            let mut wide: Vec<u16> = value.as_os_str().encode_wide().collect();
-            if wide.contains(&0) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "重命名路径包含 NUL (Rename path contains NUL)",
-                ));
-            }
-            wide.push(0);
-            Ok(wide)
-        };
-        let from = path(from)?;
-        let to = path(to)?;
-        const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
-        // SAFETY: 两个 Vec<u16> 均满足 u16 对齐，有效长度包含终止 NUL，
-        // 整个同步调用期间独占持有；系统只读、不保存指针且不接管缓冲所有权。
-        // 不设置 REPLACE_EXISTING 或 COPY_ALLOWED，并发碰撞及跨卷移动均返回错误。
-        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) } != 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
+        move_write_through(from, to, false)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
@@ -85,6 +59,44 @@ pub(crate) fn rename_new(from: &Path, to: &Path) -> std::io::Result<()> {
             std::io::ErrorKind::Unsupported,
             "当前平台不支持排他原子重命名 (Exclusive atomic rename is unsupported)",
         ))
+    }
+}
+
+#[cfg(windows)]
+fn move_write_through(from: &Path, to: &Path, replace: bool) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
+    }
+    let path = |value: &Path| {
+        let mut wide: Vec<u16> = value.as_os_str().encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "重命名路径包含 NUL (Rename path contains NUL)",
+            ));
+        }
+        wide.push(0);
+        Ok(wide)
+    };
+    let from = path(from)?;
+    let to = path(to)?;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    let flags = MOVEFILE_WRITE_THROUGH
+        | if replace {
+            MOVEFILE_REPLACE_EXISTING
+        } else {
+            0
+        };
+    // SAFETY: 两个 Vec<u16> 均满足 u16 对齐，有效长度包含终止 NUL，
+    // 整个同步调用期间独占持有；系统只读、不保存指针且不接管缓冲所有权。
+    // 仅覆盖发布允许替换已有目标；禁用跨卷复制。
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), flags) } != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -151,31 +163,50 @@ pub(crate) fn robust_rename(from: &Path, to: &Path) -> std::io::Result<()> {
 
     #[cfg(windows)]
     {
-        let max_retries = 10;
-        let mut delay = std::time::Duration::from_millis(1);
-        for attempt in 0..max_retries {
-            match std::fs::rename(from, to) {
-                Ok(()) => return Ok(()),
-                Err(error) if attempt < max_retries - 1 => {
-                    let os_error = error.raw_os_error();
-                    if os_error == Some(5) || os_error == Some(32) {
-                        tracing::debug!(
-                            "原子重命名第 {} 次失败，系统错误 {:?}，将在 {:?} 后重试 (Atomic rename attempt failed; retrying after delay)",
-                            attempt + 1,
-                            os_error,
-                            delay
-                        );
-                        std::thread::sleep(delay);
-                        delay = (delay * 2).min(std::time::Duration::from_millis(50));
-                        continue;
-                    }
-                    return Err(error);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Err(std::io::Error::other("原子重命名重试次数耗尽"))
+        retry_rename(|| std::fs::rename(from, to))
     }
+}
+
+/// 发布指针与日志的目录项在 Windows 上通过同卷写穿透移动提交。
+pub(crate) fn rename_publication_entry(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        retry_rename(|| move_write_through(from, to, true))
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(from, to)
+    }
+}
+
+#[cfg(windows)]
+fn retry_rename(mut operation: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
+    let max_retries = 10;
+    let mut delay = std::time::Duration::from_millis(1);
+    for attempt in 0..max_retries {
+        match operation() {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < max_retries - 1 => {
+                let os_error = error.raw_os_error();
+                if os_error == Some(5) || os_error == Some(32) {
+                    tracing::debug!(
+                        "原子重命名第 {} 次失败，系统错误 {:?}，将在 {:?} 后重试 (Atomic rename attempt failed; retrying after delay)",
+                        attempt + 1,
+                        os_error,
+                        delay
+                    );
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(std::time::Duration::from_millis(50));
+                    continue;
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::other(
+        "原子重命名重试次数耗尽 (Atomic rename retries exhausted)",
+    ))
 }
 
 #[cfg(test)]

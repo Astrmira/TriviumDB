@@ -2346,3 +2346,38 @@ async fn 写请求在_wal_前断开时无业务副作用() {
         );
     }
 }
+
+#[tokio::test]
+async fn 大整数在整节点和单列投影中保留精度和嵌套结构() {
+    use serde_json::json;
+    let (app, _dir) = app("exact-http-json").await;
+    let payload = json!({"wide":9007199254740993u64, "values":[9007199254740991i64, i64::MIN, {"max":u64::MAX,"literal":"001"}]});
+    let expected = json!({"wide":"9007199254740993","values":[9007199254740991i64,"-9223372036854775808",{"max":"18446744073709551615","literal":"001"}]});
+    let tx = request(
+        app.clone(),
+        "POST",
+        "/v1/transactions",
+        Some(json!({"operations":[{"op":"insert","id":1,"vector":[1.,0.],"payload":payload}]})),
+        &[],
+    )
+    .await;
+    assert_eq!(tx.status(), StatusCode::OK);
+    let get = request(app.clone(), "GET", "/v1/nodes/1", None, &[]).await;
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_eq!(json(get).await["node"]["payload"], expected);
+    let tql = request(
+        app,
+        "POST",
+        "/v1/tql",
+        Some(json!({"query":"MATCH (n) RETURN n, n.wide AS wide, n.values AS items"})),
+        &[],
+    )
+    .await;
+    assert_eq!(tql.status(), StatusCode::OK);
+    let body = json(tql).await;
+    let rows = body["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["n"]["payload"], expected);
+    assert_eq!(rows[0]["wide"]["value"], expected["wide"]);
+    assert_eq!(rows[0]["items"]["value"], expected["values"]);
+}

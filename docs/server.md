@@ -204,7 +204,7 @@ Server 不为认知算子维护另一套 HTTP API；`TEXT`、`RESIDUAL`、`DIVER
 
 普通及 Prepared TQL 的空结果保留静态投影列名。没有结果值可推断类型时，`kind` 为 `null`。查询诊断的字节位置按客户端提交的原始 UTF-8 计算。
 
-节点详情和批量读取响应的 ID 均为十进制字符串。`batch-get`、事务和批量写入接受这些字符串与精确的 JSON 无符号整数。TQL 的 `uint` 值和超出 JavaScript 安全整数范围的 `int` 值使用十进制字符串，同一规则适用于列表和对象投影中的整数。
+节点详情和批量读取响应的 ID 均为十进制字符串。`batch-get`、事务和批量写入接受这些字符串与精确的 JSON 无符号整数。TQL 的 `uint` 值和超出 JavaScript 安全整数范围的 `int` 值使用十进制字符串，此规则递归覆盖节点 Payload、边 Metadata、路径步骤及列表和对象投影。普通 JSON 字符串保持字符串。将大整数写回数值字段时，请使用能精确输出整数的 JSON 编码器，避免经过 JavaScript Number 或将原值作为字符串写入。
 
 ### 属性索引
 
@@ -279,7 +279,7 @@ Content-Type: application/vnd.triviumdb.vector+f32
 - 删除节点或边后移除对应版本条目，并更新仍存在的关联节点版本。对已删除实体使用旧 ETag 会返回冲突。TQL 写入统一推进细粒度版本代际并释放旧版本表。
 - Core 版本不匹配返回 `409 TDB_WRITE_CONFLICT`，HTTP 前置头条件拒绝使用 `TDB_HTTP_PRECONDITION_FAILED` 并保留 `legacyCode=WRITE_CONFLICT`。
 - `Idempotency-Key` 同键同请求重放首次结果，同键不同请求返回 `409 TDB_IDEMPOTENCY_CONFLICT`，旧类别为 IDEMPOTENCY_KEY_REUSED。
-- 幂等缓存和 Server generation 是进程内状态，重启后 epoch 改变。
+- 幂等缓存按键保存请求的 SHA-256 摘要与回执。组同步完成后确认回执；实体 ETag 刷新遇到读取错误时，Server 整体失效旧 ETag。缓存和 generation 在进程重启后重置。
 
 统一错误响应包含 `code`、双语 `title`、`detail` 和 `retryable`。常见状态码包括 400、404、409、413、415、422、423、500、503 和 504。
 

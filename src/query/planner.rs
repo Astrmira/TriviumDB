@@ -136,18 +136,14 @@ pub fn plan_filter_with_limit<T: VectorType>(
         };
     }
     if let Some((field, op, inclusive, value)) = ordered_range(filter)
-        && let Some(candidates) = mt.find_by_property_range(
-            field,
-            op,
-            inclusive,
-            &value,
-            false,
-            if is_single_ordered_range(filter) {
-                limit
-            } else {
-                None
-            },
-        )
+        && let Some(candidates) = if let Some(limit) =
+            limit.filter(|&count| count != usize::MAX && is_single_ordered_range(filter))
+        {
+            mt.property_indexes()
+                .range_ids_by_identity(field, op, inclusive, &value, limit)
+        } else {
+            mt.find_by_property_range(field, op, inclusive, &value, false, None)
+        }
     {
         return NodeAccessPlan {
             access_path: AccessPath::OrderedPropertyIndex {
@@ -450,7 +446,7 @@ fn is_single_ordered_range(filter: &Filter) -> bool {
     )
 }
 
-fn ordered_range(filter: &Filter) -> Option<(&str, Ordering, bool, serde_json::Value)> {
+pub(super) fn ordered_range(filter: &Filter) -> Option<(&str, Ordering, bool, serde_json::Value)> {
     fn exact_ordered_bound(value: serde_json::Value) -> Option<serde_json::Value> {
         const MAX_EXACT_INTEGER: u64 = 1u64 << 53;
         let precise = value

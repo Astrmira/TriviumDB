@@ -257,7 +257,9 @@ generations/
     └── data.tdb...
 ```
 
-`publish_current()` 使用临时文件、文件 `fsync`、原子 rename 和父目录同步，并在切换前验证 manifest、文件校验和、代际 ID 与实际节点数。`open_current()` 在解析 current 与获取代际共享租约期间持有管理共享锁，避免与切代或回收竞态。`GenerationReader` 在整个生命周期持有外部 runtime 共享租约。`reclaim_generation()` 取得排他租约后，校验当前库可用、回收目标是有效的旧代际且只包含该代际的数据库制品，然后删除旧目录。
+`publish_current()` 在切换前验证 manifest、文件校验和、代际 ID 与节点数，然后写入并同步临时文件、替换指针、同步父目录。发布阶段返回 `not_committed` 表示指针替换尚未完成。返回 `unknown` 时，指针已对当前读者可见，调用方可通过 `resolve_current()` 核对目标代际。
+
+`open_current()` 在解析 current 与获取代际共享租约期间持有管理共享锁，避免与切代或回收竞态。`GenerationReader` 在整个生命周期持有外部 runtime 共享租约。`reclaim_generation()` 取得排他租约后，校验当前库可用、回收目标是有效的旧代际且只包含该代际的数据库制品，然后删除旧目录。
 
 租约写入独立 runtime 目录，generation root 保持只读。默认 runtime 位于系统临时目录的 `triviumdb-runtime/store-<hash>`，也可使用 `GenerationStore::with_runtime_dir(root, runtime_dir)` 指定可写位置。
 
@@ -1146,6 +1148,8 @@ print(ctx.timings)
 print(ctx.custom_data)   # Hook 注入的自定义数据
 print(ctx.aborted)       # 管线是否被 Hook 提前终止
 ```
+
+每次 Python 检索从独立的空字典开始。回调可在 `ctx["custom_data"]` 中写入 JSON 值，后续回调与返回的 `ctx.custom_data` 可读取这些值。回调属性求值失败、返回类型错误或写入无效上下文时，检索返回 `TDB_HOOK_EXECUTION`。
 
 **Node.js：**
 ```javascript

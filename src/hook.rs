@@ -64,7 +64,7 @@ impl Default for HookContext {
 impl HookContext {
     pub fn new() -> Self {
         Self {
-            custom_data: serde_json::Value::Null,
+            custom_data: serde_json::json!({}),
             stage_timings: Vec::new(),
             stage_counts: Vec::new(),
             observations: Vec::new(),

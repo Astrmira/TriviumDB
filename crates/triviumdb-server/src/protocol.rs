@@ -323,6 +323,11 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    pub(crate) fn awaiting_group_sync(&self) -> bool {
+        self.write
+            .is_some_and(|write| write.outcome == triviumdb::error::WriteOutcome::Committed)
+    }
+
     pub(crate) fn at_field(mut self, field: &str) -> Self {
         if self.target.is_none() {
             self.target = Some(Box::new(triviumdb::error::ErrorTarget::Field {
@@ -717,12 +722,12 @@ pub fn encode_node(node: triviumdb::node::NodeView<f32>) -> serde_json::Value {
         "type": "node",
         "id": node.id.to_string(),
         "vector": node.vector,
-        "payload": node.payload,
+        "payload": SafeJson(&node.payload),
         "edges": node.edges.into_iter().map(|edge| serde_json::json!({
             "targetId": edge.target_id.to_string(),
             "label": edge.label,
             "weight": edge.weight,
-            "metadata": edge.metadata,
+            "metadata": SafeJson(&edge.metadata),
         })).collect::<Vec<_>>(),
     })
 }
@@ -747,7 +752,7 @@ impl Serialize for EdgeList<'_> {
             target_id: DecimalId,
             label: &'a str,
             weight: f32,
-            metadata: &'a serde_json::Value,
+            metadata: SafeJson<'a>,
         }
 
         let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
@@ -756,7 +761,7 @@ impl Serialize for EdgeList<'_> {
                 target_id: DecimalId(edge.target_id),
                 label: &edge.label,
                 weight: edge.weight,
-                metadata: &edge.metadata,
+                metadata: SafeJson(&edge.metadata),
             })?;
         }
         sequence.end()
@@ -771,7 +776,7 @@ impl Serialize for PathIds<'_> {
     }
 }
 
-struct SafeJson<'a>(&'a serde_json::Value);
+pub(crate) struct SafeJson<'a>(pub(crate) &'a serde_json::Value);
 
 impl Serialize for SafeJson<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -812,7 +817,7 @@ impl Serialize for QueryValue<'_> {
                 value.serialize_field("type", "node")?;
                 value.serialize_field("id", &DecimalId(node.id))?;
                 value.serialize_field("vector", &node.vector)?;
-                value.serialize_field("payload", &node.payload)?;
+                value.serialize_field("payload", &SafeJson(&node.payload))?;
                 value.serialize_field("edges", &EdgeList(&node.edges))?;
                 value.end()
             }
@@ -824,7 +829,7 @@ impl Serialize for QueryValue<'_> {
                 value.serialize_field("target", &DecimalId(edge.target_id))?;
                 value.serialize_field("label", &edge.label)?;
                 value.serialize_field("weight", &edge.weight)?;
-                value.serialize_field("metadata", &edge.metadata)?;
+                value.serialize_field("metadata", &SafeJson(&edge.metadata))?;
                 if let Some(graph_id) = &edge.graph_id {
                     value.serialize_field("graph_id", graph_id)?;
                 }

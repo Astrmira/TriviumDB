@@ -95,6 +95,39 @@ fn measured<T>(action: impl FnOnce() -> T) -> (T, usize) {
     (result, peak)
 }
 
+#[test]
+fn 有序小分页在游标上跳过不合格记录且查询峰值小于一份候选目录() {
+    use triviumdb::query::{tql_executor::execute_tql, tql_parser::parse_tql};
+    use triviumdb::storage::memtable::MemTable;
+    let mut mt = MemTable::<f32>::new(1);
+    mt.set_auto_build_quiver(false);
+    const N: u64 = 16_384;
+    for id in 1..=N {
+        mt.insert_with_id(id, &[1.], serde_json::json!({"x":id,"keep":id % 3 == 1}))
+            .unwrap();
+    }
+    mt.register_ordered_property_index("x");
+    let query = parse_tql("FIND {keep:true} RETURN _ ORDER BY _.x DESC LIMIT 1 OFFSET 1").unwrap();
+    let (rows, peak) = measured(|| execute_tql(&query, &mt).unwrap());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["_"].id, 16_381);
+    assert!(peak < N as usize * size_of::<u64>(), "查询分配峰值 {peak}");
+}
+
+#[test]
+fn 三元字符索引按字符上限准入且拒绝长值时分配有界() {
+    use triviumdb::index::property::PropertyIndexRegistry;
+    let mut registry = PropertyIndexRegistry::default();
+    // 4,098 个字符恰好有 4,096 个三元组，UTF-8 字节数不参与计数。
+    let accepted = serde_json::json!({"s":"甲".repeat(4098)});
+    registry.register_ngram("s", [(1, &accepted)]).unwrap();
+    assert_eq!(registry.ngram_lookup("s", "甲甲甲").unwrap(), Some(vec![1]));
+    let rejected = "乙".repeat(100_000);
+    let (error, peak) = measured(|| registry.ngram_lookup("s", &rejected).unwrap_err());
+    assert_eq!(error.code(), "TDB_INVALID_INPUT");
+    assert!(peak < rejected.len(), "拒绝输入时的分配峰值 {peak}");
+}
+
 fn sample(path: &str, mode: StorageMode) -> Database<f32> {
     let mut db = Database::open_with_config(
         path,

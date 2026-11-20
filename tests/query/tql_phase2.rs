@@ -7,13 +7,7 @@ use triviumdb::Database;
 
 const DIM: usize = 4;
 
-fn tmp_db(name: &str) -> String {
-    let dir = std::env::temp_dir().join("triviumdb_test");
-    std::fs::create_dir_all(&dir).ok();
-    dir.join(format!("p2_{}", name))
-        .to_string_lossy()
-        .to_string()
-}
+use super::tmp_db;
 
 fn cleanup(path: &str) {
     crate::cleanup_files::database(path);

@@ -49,7 +49,10 @@ pub(crate) fn validate_index_fields(fields: &[String], composite: bool) -> Resul
 }
 
 fn text_ngrams(text: &str) -> Result<Vec<String>> {
-    let chars = text.chars().collect::<Vec<_>>();
+    let chars = text
+        .chars()
+        .take(MAX_NGRAMS_PER_VALUE + NGRAM_WIDTH)
+        .collect::<Vec<_>>();
     if chars.len() < NGRAM_WIDTH {
         return Ok(Vec::new());
     }
@@ -1409,6 +1412,61 @@ impl PropertyIndexRegistry {
                 .has_exact_order()
                 .then(|| index.ordered_ids(descending, limit))
         })
+    }
+
+    pub(crate) fn ordered_cursor(
+        &self,
+        field: &str,
+        descending: bool,
+        bound: Option<(Ordering, bool, Value)>,
+    ) -> Option<impl Iterator<Item = NodeId> + '_> {
+        let index = self
+            .ordered_indexes
+            .get(field)
+            .filter(|index| index.has_exact_order())?;
+        let range = bound
+            .filter(|(_, _, value)| exact_range_bound(value))
+            .and_then(|(order, inclusive, value)| {
+                ordered_key(&value).map(|key| (key.0, order, inclusive))
+            });
+        Some(
+            index
+                .entries
+                .iter_values(descending, range)
+                .flat_map(|posting| posting.iter().copied()),
+        )
+    }
+
+    /// 无显式排序的分页取最小实体 ID；范围按键访问，堆只保留当前页所需候选。
+    pub(crate) fn range_ids_by_identity(
+        &self,
+        field: &str,
+        op: Ordering,
+        inclusive: bool,
+        value: &Value,
+        limit: usize,
+    ) -> Option<Vec<NodeId>> {
+        if !exact_range_bound(value) {
+            return None;
+        }
+        let index = self.ordered_indexes.get(field)?;
+        let key = ordered_key(value)?;
+        let ids = index
+            .entries
+            .iter_values(false, Some((key.0, op, inclusive)))
+            .flatten()
+            .copied();
+        let mut heap = std::collections::BinaryHeap::new();
+        for id in ids {
+            if heap.len() < limit {
+                heap.push(id);
+            } else if let Some(mut worst) = heap.peek_mut()
+                && id < *worst
+            {
+                *worst = id;
+            }
+        }
+        Some(heap.into_sorted_vec())
     }
 
     pub(crate) fn has_exact_ordered_index(&self, field: &str) -> bool {

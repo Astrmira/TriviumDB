@@ -15,7 +15,7 @@ use pyo3::types::{PyDict, PyList};
 /// 将 Python 对象包装为 Rust SearchHook trait 实现
 ///
 /// Python 类只需实现感兴趣的方法（鸭子类型）：
-/// - on_pre_search(self, query_vector, config, ctx) -> None
+/// - on_pre_search(self, query_vector, ctx) -> Optional[list[float]]
 /// - on_post_recall(self, hits, ctx) -> None
 /// - on_rerank(self, hits, ctx) -> Optional[list]
 /// - on_post_search(self, hits, ctx) -> None
@@ -50,7 +50,9 @@ impl PySearchHookWrapper {
     }
 
     fn record_python_error(ctx: &mut crate::hook::HookContext, stage: &str, error: PyErr) {
-        ctx.error = Some(format!("Python Hook {stage} 执行失败: {error}"));
+        ctx.error = Some(format!(
+            "Python Hook 执行失败 (Python hook failed): {stage}: {error}"
+        ));
     }
 
     /// 将 Rust Vec<SearchHit> 转换为 Python list[dict]
@@ -97,223 +99,142 @@ impl PySearchHookWrapper {
             .collect()
     }
 
-    fn set_context_data(
-        py: Python<'_>,
-        dict: &Bound<'_, PyDict>,
+    fn invoke<R>(
+        &self,
+        stage: &str,
         ctx: &mut crate::hook::HookContext,
-    ) -> bool {
-        match json_to_pyobject(py, &ctx.custom_data).and_then(|v| dict.set_item("custom_data", v)) {
-            Ok(()) => true,
-            Err(error) => {
-                Self::record_python_error(ctx, "context", error);
-                false
+        argument: impl FnOnce(Python<'_>) -> PyResult<PyObject>,
+        decode: impl FnOnce(Python<'_>, PyObject) -> PyResult<R>,
+    ) -> Option<R> {
+        self.with_callback(ctx, |py, ctx| {
+            let call = || -> PyResult<Option<R>> {
+                let method = match self.py_hook.bind(py).getattr(stage) {
+                    Ok(method) => method,
+                    Err(error)
+                        if error.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) =>
+                    {
+                        // 已定义的描述符即使抛 AttributeError，也属于回调求值错误。
+                        let missing = PyDict::new(py);
+                        let definition = py
+                            .import("inspect")?
+                            .getattr("getattr_static")?
+                            .call1((self.py_hook.bind(py), stage, &missing))?;
+                        if definition.is(&missing) {
+                            return Ok(None);
+                        }
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                };
+                let data = PyDict::new(py);
+                data.set_item("custom_data", json_to_pyobject(py, &ctx.custom_data)?)?;
+                data.set_item("abort", ctx.abort)?;
+                let result = method.call1((argument(py)?, &data))?;
+                let replacement = if result.is_none() {
+                    None
+                } else {
+                    Some(decode(py, result.unbind())?)
+                };
+                let required = |key: &str| {
+                    data.get_item(key)?.ok_or_else(|| {
+                        PyValueError::new_err(format!(
+                            "Hook 上下文缺少字段 (Missing hook context field): {key}"
+                        ))
+                    })
+                };
+                let custom = required("custom_data")?;
+                let custom = pyobject_to_json(custom.downcast::<PyDict>()?.as_any())?;
+                let abort = required("abort")?.extract::<bool>()?;
+                ctx.custom_data = custom;
+                ctx.abort = abort;
+                Ok(replacement)
+            };
+            match call() {
+                Ok(value) => value,
+                Err(error) => {
+                    Self::record_python_error(ctx, stage, error);
+                    None
+                }
             }
-        }
+        })
+    }
+    fn hit_callback(
+        &self,
+        stage: &str,
+        hits: &[crate::node::SearchHit],
+        ctx: &mut crate::hook::HookContext,
+    ) -> Option<Vec<crate::node::SearchHit>> {
+        self.invoke(
+            stage,
+            ctx,
+            |py| Self::hits_to_py(py, hits),
+            |py, value| Self::py_to_hits(py, &value),
+        )
     }
 }
 
 impl crate::hook::SearchHook for PySearchHookWrapper {
     fn on_pre_search(
         &self,
-        query_vector: &mut Vec<f32>,
+        query: &mut Vec<f32>,
         _config: &mut crate::database::SearchConfig,
         ctx: &mut crate::hook::HookContext,
     ) {
-        self.with_callback(ctx, |py, ctx| {
-            let hook = self.py_hook.bind(py);
-            if let Ok(method) = hook.getattr("on_pre_search")
-                && let Ok(py_vec) = pyo3::types::PyList::new(py, query_vector.iter())
-            {
-                let py_ctx = PyDict::new(py);
-                if !Self::set_context_data(py, &py_ctx, ctx) {
-                    return;
-                }
-                let _ = py_ctx.set_item("abort", ctx.abort);
-
-                match method.call1((&py_vec, &py_ctx)) {
-                    Ok(result) => {
-                        if let Ok(new_vec) = result.extract::<Vec<f32>>() {
-                            *query_vector = new_vec;
-                        }
-                        if let Ok(Some(abort_val)) = py_ctx.get_item("abort")
-                            && let Ok(ab) = abort_val.extract::<bool>()
-                        {
-                            ctx.abort = ab;
-                        }
-                    }
-                    Err(error) => Self::record_python_error(ctx, "on_pre_search", error),
-                }
-            }
-        });
+        if let Some(value) = self.invoke(
+            "on_pre_search",
+            ctx,
+            |py| Ok(PyList::new(py, query.iter())?.into_any().unbind()),
+            |py, value| value.extract::<Vec<f32>>(py),
+        ) {
+            *query = value;
+        }
     }
-
     fn on_custom_recall(
         &self,
-        query_vector: &[f32],
+        query: &[f32],
         _config: &crate::database::SearchConfig,
         ctx: &mut crate::hook::HookContext,
     ) -> Option<Vec<crate::node::SearchHit>> {
-        self.with_callback(ctx, |py, ctx| {
-            let hook = self.py_hook.bind(py);
-            let Ok(method) = hook.getattr("on_custom_recall") else {
-                return None;
-            };
-            let py_ctx = PyDict::new(py);
-            if !Self::set_context_data(py, &py_ctx, ctx) {
-                return None;
-            }
-            match method.call1((query_vector.to_vec(), py_ctx)) {
-                Ok(result) if !result.is_none() => match Self::py_to_hits(py, &result.unbind()) {
-                    Ok(hits) => Some(hits),
-                    Err(error) => {
-                        Self::record_python_error(ctx, "on_custom_recall", error);
-                        None
-                    }
-                },
-                Ok(_) => None,
-                Err(error) => {
-                    Self::record_python_error(ctx, "on_custom_recall", error);
-                    None
-                }
-            }
-        })
+        self.invoke(
+            "on_custom_recall",
+            ctx,
+            |py| Ok(PyList::new(py, query)?.into_any().unbind()),
+            |py, value| Self::py_to_hits(py, &value),
+        )
     }
-
     fn on_pre_graph_expand(
         &self,
-        seeds: &mut Vec<crate::node::SearchHit>,
+        hits: &mut Vec<crate::node::SearchHit>,
         ctx: &mut crate::hook::HookContext,
     ) {
-        self.with_callback(ctx, |py, ctx| {
-            let hook = self.py_hook.bind(py);
-            let Ok(method) = hook.getattr("on_pre_graph_expand") else {
-                return;
-            };
-            let py_hits = match Self::hits_to_py(py, seeds) {
-                Ok(value) => value,
-                Err(error) => {
-                    Self::record_python_error(ctx, "on_pre_graph_expand", error);
-                    return;
-                }
-            };
-            let py_ctx = PyDict::new(py);
-            if !Self::set_context_data(py, &py_ctx, ctx) {
-                return;
-            }
-            match method.call1((py_hits, py_ctx)) {
-                Ok(result) if !result.is_none() => match Self::py_to_hits(py, &result.unbind()) {
-                    Ok(value) => *seeds = value,
-                    Err(error) => Self::record_python_error(ctx, "on_pre_graph_expand", error),
-                },
-                Ok(_) => {}
-                Err(error) => Self::record_python_error(ctx, "on_pre_graph_expand", error),
-            }
-        });
+        if let Some(updated) = self.hit_callback("on_pre_graph_expand", hits, ctx) {
+            *hits = updated;
+        }
     }
-
     fn on_post_recall(
         &self,
         hits: &mut Vec<crate::node::SearchHit>,
         ctx: &mut crate::hook::HookContext,
     ) {
-        self.with_callback(ctx, |py, ctx| {
-            let hook = self.py_hook.bind(py);
-            if let Ok(method) = hook.getattr("on_post_recall") {
-                let py_hits = match Self::hits_to_py(py, hits) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        Self::record_python_error(ctx, "on_post_recall", error);
-                        return;
-                    }
-                };
-                let py_ctx = PyDict::new(py);
-                if !Self::set_context_data(py, &py_ctx, ctx) {
-                    return;
-                }
-
-                match method.call1((&py_hits, &py_ctx)) {
-                    Ok(result) if !result.is_none() => {
-                        let obj = result.unbind();
-                        match Self::py_to_hits(py, &obj) {
-                            Ok(value) => *hits = value,
-                            Err(error) => Self::record_python_error(ctx, "on_post_recall", error),
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(error) => Self::record_python_error(ctx, "on_post_recall", error),
-                }
-            }
-        });
+        if let Some(updated) = self.hit_callback("on_post_recall", hits, ctx) {
+            *hits = updated;
+        }
     }
-
-    fn on_rerank(
-        &self,
-        hits: &mut Vec<crate::node::SearchHit>,
-        ctx: &mut crate::hook::HookContext,
-    ) -> Option<Vec<crate::node::SearchHit>> {
-        self.with_callback(ctx, |py, ctx| {
-            let hook = self.py_hook.bind(py);
-            if let Ok(method) = hook.getattr("on_rerank") {
-                let py_hits = match Self::hits_to_py(py, hits) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        Self::record_python_error(ctx, "on_rerank", error);
-                        return None;
-                    }
-                };
-                let py_ctx = PyDict::new(py);
-                if !Self::set_context_data(py, &py_ctx, ctx) {
-                    return None;
-                }
-                match method.call1((&py_hits, &py_ctx)) {
-                    Ok(result) if !result.is_none() => {
-                        return match Self::py_to_hits(py, &result.unbind()) {
-                            Ok(hits) => Some(hits),
-                            Err(error) => {
-                                Self::record_python_error(ctx, "on_rerank", error);
-                                None
-                            }
-                        };
-                    }
-                    Ok(_) => {}
-                    Err(error) => Self::record_python_error(ctx, "on_rerank", error),
-                }
-            }
-            None
-        })
-    }
-
     fn on_post_search(
         &self,
         hits: &mut Vec<crate::node::SearchHit>,
         ctx: &mut crate::hook::HookContext,
     ) {
-        self.with_callback(ctx, |py, ctx| {
-            let hook = self.py_hook.bind(py);
-            if let Ok(method) = hook.getattr("on_post_search") {
-                let py_hits = match Self::hits_to_py(py, hits) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        Self::record_python_error(ctx, "on_post_search", error);
-                        return;
-                    }
-                };
-                let py_ctx = PyDict::new(py);
-                if !Self::set_context_data(py, &py_ctx, ctx) {
-                    return;
-                }
-                match method.call1((&py_hits, &py_ctx)) {
-                    Ok(result) if !result.is_none() => {
-                        match Self::py_to_hits(py, &result.unbind()) {
-                            Ok(value) => *hits = value,
-                            Err(error) => Self::record_python_error(ctx, "on_post_search", error),
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(error) => Self::record_python_error(ctx, "on_post_search", error),
-                }
-            }
-        });
+        if let Some(updated) = self.hit_callback("on_post_search", hits, ctx) {
+            *hits = updated;
+        }
+    }
+    fn on_rerank(
+        &self,
+        hits: &mut Vec<crate::node::SearchHit>,
+        ctx: &mut crate::hook::HookContext,
+    ) -> Option<Vec<crate::node::SearchHit>> {
+        self.hit_callback("on_rerank", hits, ctx)
     }
 }
 

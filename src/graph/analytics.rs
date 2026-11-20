@@ -552,32 +552,32 @@ fn shortest_weighted_path(
 ) -> Result<WeightedSearchState> {
     let control = crate::request::control().unwrap_or_default();
     control.check()?;
-    let mut distances =
-        BTreeMap::from_iter(graph.weighted.keys().copied().map(|id| (id, f64::INFINITY)));
+    let mut distances = BTreeMap::new();
     let mut parents = BTreeMap::<NodeId, NodeId>::new();
-    if banned_nodes.contains(&source) || !distances.contains_key(&source) {
+    if banned_nodes.contains(&source) || !graph.weighted.contains_key(&source) {
         return Ok((distances, parents));
     }
     distances.insert(source, 0.0);
+    // 非负有限距离的位序与数值顺序一致。只保留已发现但尚未确定的节点。
+    let mut frontier = BTreeMap::from([(0u64, BTreeSet::from([source]))]);
     let mut settled = BTreeSet::new();
-    loop {
+    while let Some(mut nearest) = frontier.first_entry() {
         crate::graph::budget::check_control(&control)?;
-        let next = distances
-            .iter()
-            .filter(|(id, distance)| !settled.contains(*id) && distance.is_finite())
-            .min_by(|left, right| {
-                left.1
-                    .total_cmp(right.1)
-                    .then_with(|| {
-                        weighted_path_to(&parents, *left.0)
-                            .cmp(&weighted_path_to(&parents, *right.0))
-                    })
-                    .then_with(|| left.0.cmp(right.0))
-            })
-            .map(|(&id, &distance)| (id, distance));
-        let Some((node, distance)) = next else {
-            break;
+        let distance = f64::from_bits(*nearest.key());
+        let nodes = nearest.get_mut();
+        let node = if target.is_some() && nodes.len() > 1 {
+            // 需要返回路径时，同距离按完整路径字典序选择。
+            *nodes
+                .iter()
+                .min_by_key(|id| weighted_path_to(&parents, **id))
+                .expect("非空前沿")
+        } else {
+            *nodes.first().expect("非空前沿")
         };
+        nodes.remove(&node);
+        if nodes.is_empty() {
+            nearest.remove();
+        }
         settled.insert(node);
         if target == Some(node) {
             break;
@@ -594,15 +594,34 @@ fn shortest_weighted_path(
             let candidate_distance = distance + weight;
             let current_distance = distances.get(&neighbor).copied().unwrap_or(f64::INFINITY);
             let replace = candidate_distance < current_distance
-                || candidate_distance == current_distance && candidate_distance.is_finite() && {
-                    let mut candidate_path = weighted_path_to(&parents, node);
-                    candidate_path.push(neighbor);
-                    candidate_path < weighted_path_to(&parents, neighbor)
-                };
+                || target.is_some()
+                    && candidate_distance == current_distance
+                    && candidate_distance.is_finite()
+                    && {
+                        let mut candidate_path = weighted_path_to(&parents, node);
+                        candidate_path.push(neighbor);
+                        candidate_path < weighted_path_to(&parents, neighbor)
+                    };
             if replace {
-                distances.insert(neighbor, candidate_distance);
+                if candidate_distance < current_distance {
+                    if let std::collections::btree_map::Entry::Occupied(mut old) =
+                        frontier.entry(current_distance.to_bits())
+                    {
+                        old.get_mut().remove(&neighbor);
+                        if old.get().is_empty() {
+                            old.remove();
+                        }
+                    }
+                    frontier
+                        .entry(candidate_distance.to_bits())
+                        .or_default()
+                        .insert(neighbor);
+                    distances.insert(neighbor, candidate_distance);
+                }
                 // 父节点已确定，前缀在后续松弛中保持稳定。
-                parents.insert(neighbor, node);
+                if target.is_some() {
+                    parents.insert(neighbor, node);
+                }
             }
         }
     }

@@ -786,11 +786,19 @@ impl<T: VectorType + Serialize + serde::de::DeserializeOwned> Database<T> {
                 struct Edges<'a> {
                     edges: Vec<EdgeOutput<'a>>,
                 }
+                let mt = super::read_or_recover(&self.memtable);
+                mt.ensure_readable()?;
                 if incoming {
-                    let edges = self.get_incoming_edges(node_id, None)?;
-                    if !edges.is_empty() {
-                        check_count(edges.len(), options.max_operations)?;
+                    let mut examined = 0usize;
+                    for &source in mt.get_incoming_sources(node_id) {
+                        active.control.check()?;
+                        examined =
+                            examined.saturating_add(mt.get_edges(source).map_or(0, <[_]>::len));
+                        if examined > options.max_operations {
+                            check_count(examined, options.max_operations)?;
+                        }
                     }
+                    let edges = mt.get_incoming_edges(node_id, None);
                     let output = Edges {
                         edges: edges
                             .iter()
@@ -807,7 +815,7 @@ impl<T: VectorType + Serialize + serde::de::DeserializeOwned> Database<T> {
                     };
                     encode_response(&request.request_id, &output, limit, false, &runtime)
                 } else {
-                    let edges = self.get_edges(node_id)?;
+                    let edges = mt.get_edges(node_id).unwrap_or_default();
                     if !edges.is_empty() {
                         check_count(edges.len(), options.max_operations)?;
                     }
@@ -834,8 +842,22 @@ impl<T: VectorType + Serialize + serde::de::DeserializeOwned> Database<T> {
                 max_depth,
                 label,
             } => {
-                let path =
-                    self.shortest_path(id(&source)?, id(&target)?, max_depth, label.as_deref())?;
+                let mt = super::read_or_recover(&self.memtable);
+                mt.ensure_readable()?;
+                let path = crate::graph::pathfinding::shortest_path_checked(
+                    &*mt,
+                    id(&source)?,
+                    id(&target)?,
+                    max_depth,
+                    label.as_deref(),
+                    |visited, examined| {
+                        active.control.check()?;
+                        if visited.max(examined) > options.max_operations {
+                            check_count(visited.max(examined), options.max_operations)?;
+                        }
+                        Ok::<_, TriviumError>(())
+                    },
+                )?;
                 respond(&json!({"path":path.map(strings)}), false)
             }
             Command::Indexes => respond(&json!({"indexes":self.index_info()?}), false),

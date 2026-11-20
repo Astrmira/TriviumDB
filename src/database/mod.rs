@@ -2086,7 +2086,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                 target,
                 max_depth,
                 label,
-                crate::request::check_current,
+                |_, _| crate::request::check_current(),
             )
         })?
     }

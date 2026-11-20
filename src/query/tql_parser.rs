@@ -804,9 +804,7 @@ impl TqlParser {
             };
             vector.push(value);
             self.finish_source("vector_element", element_mark);
-            if self.at(&TqlToken::Comma) {
-                self.advance();
-            }
+            self.expect_separator_or_end(&TqlToken::RBracket)?;
         }
         self.expect(&TqlToken::RBracket)?;
         self.finish_source("vector", vector_mark);
@@ -1505,9 +1503,7 @@ impl TqlParser {
                     let mut sub_filters = Vec::new();
                     while !self.at(&TqlToken::RBracket) {
                         sub_filters.push(self.parse_doc_filter()?);
-                        if self.at(&TqlToken::Comma) {
-                            self.advance();
-                        }
+                        self.expect_separator_or_end(&TqlToken::RBracket)?;
                     }
                     self.expect(&TqlToken::RBracket)?;
 
@@ -1546,9 +1542,7 @@ impl TqlParser {
                             filters.push(f);
                             self.finish_source("filter", operator_mark);
 
-                            if self.at(&TqlToken::Comma) {
-                                self.advance();
-                            }
+                            self.expect_separator_or_end(&TqlToken::RBrace)?;
                         }
                         self.expect(&TqlToken::RBrace)?;
                         self.finish_source("filter_field", filter_mark);
@@ -1563,9 +1557,7 @@ impl TqlParser {
                 _ => return Err(format!("Unexpected token in doc filter: {:?}", self.peek())),
             }
 
-            if self.at(&TqlToken::Comma) {
-                self.advance();
-            }
+            self.expect_separator_or_end(&TqlToken::RBrace)?;
         }
 
         self.expect(&TqlToken::RBrace)?;
@@ -2285,14 +2277,19 @@ impl TqlParser {
         self.sourced("array", Self::parse_json_array_source_inner)
     }
 
+    fn expect_separator_or_end(&mut self, end: &TqlToken) -> Result<(), String> {
+        if !self.at(end) {
+            self.expect(&TqlToken::Comma)?;
+        }
+        Ok(())
+    }
+
     fn parse_json_array_source_inner(&mut self) -> Result<Vec<serde_json::Value>, String> {
         self.expect(&TqlToken::LBracket)?;
         let mut items = Vec::new();
         while !self.at(&TqlToken::RBracket) {
             items.push(self.parse_json_value()?);
-            if self.at(&TqlToken::Comma) {
-                self.advance();
-            }
+            self.expect_separator_or_end(&TqlToken::RBracket)?;
         }
         self.expect(&TqlToken::RBracket)?;
         Ok(items)
@@ -2423,9 +2420,7 @@ impl TqlParser {
                             )));
                         }
                         weight = self.parse_json_number()? as f32;
-                        if self.at(&TqlToken::Comma) {
-                            self.advance();
-                        }
+                        self.expect_separator_or_end(&TqlToken::RBrace)?;
                     }
                     self.expect(&TqlToken::RBrace)?;
                 }
@@ -2486,9 +2481,7 @@ impl TqlParser {
             self.expect(&TqlToken::Colon)?;
             let val = self.parse_json_value()?;
             map.insert(key, val);
-            if self.at(&TqlToken::Comma) {
-                self.advance();
-            }
+            self.expect_separator_or_end(&TqlToken::RBrace)?;
         }
         self.expect(&TqlToken::RBrace)?;
         Ok(serde_json::Value::Object(map))

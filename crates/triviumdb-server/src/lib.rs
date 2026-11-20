@@ -767,7 +767,7 @@ async fn search_vector(
         "hits": hits.into_iter().map(|hit| serde_json::json!({
             "id": hit.id.to_string(),
             "score": hit.score,
-            "payload": hit.payload,
+            "payload": protocol::SafeJson(&hit.payload),
         })).collect::<Vec<_>>(),
         "generation": etag,
     }))
@@ -1164,7 +1164,7 @@ async fn get_neighbors(
     }
     Ok(Json(serde_json::json!({
         "nodes": result.nodes.into_iter().map(|node| serde_json::json!({
-            "type": "node", "id": node.id.to_string(), "payload": node.payload
+            "type": "node", "id": node.id.to_string(), "payload": protocol::SafeJson(&node.payload)
         })).collect::<Vec<_>>(),
         "edges": result.edges.into_iter().map(encode_graph_edge).collect::<Vec<_>>(),
         "visitedNodes": result.visited_nodes,
@@ -1275,7 +1275,7 @@ async fn get_paths(
                     "target": step.edge_target.to_string(),
                     "label": step.label,
                     "weight": step.weight,
-                    "metadata": step.metadata,
+                    "metadata": protocol::SafeJson(&step.metadata),
                 })).collect::<Vec<_>>(),
             })
         })
@@ -1294,7 +1294,7 @@ fn encode_graph_edge(edge: triviumdb::graph::reachability::SubgraphEdge) -> serd
         "target": edge.target_id.to_string(),
         "label": edge.label,
         "weight": edge.weight,
-        "metadata": edge.metadata,
+        "metadata": protocol::SafeJson(&edge.metadata),
     })
 }
 

@@ -3,7 +3,7 @@
 //! 完整解析后在同一内核事务中插入节点并建立边，自动 ID 在提交预检时解析。
 
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 
 use colored::Colorize;
 use serde_json::Value;
@@ -21,11 +21,11 @@ struct Record<T> {
     edges: Vec<Edge>,
 }
 
-pub fn run(handle: &mut DbHandle, input: &str) -> CliResult {
+pub fn run(handle: &mut DbHandle, input: &str, max_bytes: usize, max_ops: usize) -> CliResult {
     match handle {
-        DbHandle::F32(database) => run_typed(database, input, false),
-        DbHandle::F16(database) => run_typed(database, input, false),
-        DbHandle::U64(database) => run_typed(database, input, true),
+        DbHandle::F32(database) => run_typed(database, input, false, max_bytes, max_ops),
+        DbHandle::F16(database) => run_typed(database, input, false, max_bytes, max_ops),
+        DbHandle::U64(database) => run_typed(database, input, true, max_bytes, max_ops),
     }
 }
 
@@ -33,14 +33,41 @@ fn run_typed<T: VectorType + serde::Serialize + serde::de::DeserializeOwned>(
     database: &mut Database<T>,
     input: &str,
     integer_literals: bool,
+    max_bytes: usize,
+    max_ops: usize,
 ) -> CliResult {
     let file = File::open(input)?;
-    let reader = BufReader::new(file);
+    let size = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+    let admit = |resource, used: usize, requested: usize, limit: usize| {
+        if requested > limit.saturating_sub(used) {
+            Err(TriviumError::ResourceBudgetExceeded {
+                resource,
+                used,
+                requested,
+                limit,
+            })
+        } else {
+            Ok(())
+        }
+    };
+    admit("import_input_bytes", 0, size, max_bytes)?;
+    let mut reader = BufReader::new(file.take((max_bytes as u64).saturating_add(1)));
+    let mut bytes = 0;
+    let mut operations = 0;
+    let mut line = String::new();
+    let mut lineno = 0;
 
     let mut builder = TxBuilder::new();
     let mut outgoing_edges = Vec::new();
-    for (lineno, line) in reader.lines().enumerate() {
-        let line = line?;
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            break;
+        }
+        admit("import_input_bytes", bytes, n, max_bytes)?;
+        bytes += n;
+        lineno += 1;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -48,11 +75,14 @@ fn run_typed<T: VectorType + serde::Serialize + serde::de::DeserializeOwned>(
         let v: Value = serde_json::from_str(trimmed).map_err(|e| {
             format!(
                 "第 {} 行 JSON 解析失败 / Failed to parse JSON at line {}: {e}",
-                lineno + 1,
-                lineno + 1
+                lineno, lineno
             )
         })?;
-        let record = parse_record::<T>(&v, lineno + 1, integer_literals)?;
+        let added =
+            1usize.saturating_add(v.get("edges").and_then(Value::as_array).map_or(0, Vec::len));
+        admit("import_operations", operations, added, max_ops)?;
+        operations += added;
+        let record = parse_record::<T>(&v, lineno, integer_literals)?;
         if let Some(id) = record.id {
             builder.insert_with_id(id, &record.vector, record.payload);
         } else {

@@ -940,7 +940,7 @@ fn save_inner<T: VectorType>(
         crate::test_hooks::ConcurrencyPoint::AfterPublicationCommitted,
         path,
     );
-    publication::cleanup(path).ok();
+    publication::cleanup(path)?;
     crate::storage::index_container::cleanup_components(path)?;
     if generation > 1 {
         std::fs::remove_file(payload_path_for_generation(path, generation - 1)).ok();

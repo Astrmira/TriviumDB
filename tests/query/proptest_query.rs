@@ -8,18 +8,6 @@ use triviumdb::Database;
 
 const DIM: usize = 4;
 
-fn tmp_db(name: &str) -> String {
-    let dir = std::env::temp_dir().join("triviumdb_test");
-    std::fs::create_dir_all(&dir).ok();
-    dir.join(format!("proptest_{}", name))
-        .to_string_lossy()
-        .to_string()
-}
-
-fn cleanup(path: &str) {
-    crate::cleanup_files::database(path);
-}
-
 // TQL 语法片段生成器
 prop_compose! {
     fn random_tql()(
@@ -46,8 +34,8 @@ proptest! {
 
     #[test]
     fn 测试_属性驱动_随机语法解析不恐慌(query in random_tql()) {
-        let path = tmp_db("fuzz_query");
-        cleanup(&path);
+        let dir = super::support::TestDir::new("fuzz_query");
+        let path = dir.file("data.tdb");
 
         let db = Database::<f32>::open(&path, DIM).unwrap();
 
@@ -58,8 +46,7 @@ proptest! {
 
         assert!(result.is_ok(), "TQL 解析器发生了致命 Panic，导致主线程崩溃！查询: {}", query);
 
-        drop(db); // 修复: 在 Windows 平台，必须显式完全注销 Mmap 文件句柄
-        cleanup(&path); // 之后再执行物理删除，防止底层读写冲突和死锁蓝屏
+        drop(db);
     }
 }
 
@@ -68,7 +55,8 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(200))]
     #[test]
     fn 测试_完全乱码_语法解析器绝不Panic(garbage in ".*") {
-         let path = tmp_db("fuzz_garbage");
+         let dir = super::support::TestDir::new("fuzz_garbage");
+         let path = dir.file("data.tdb");
          let db = Database::<f32>::open(&path, DIM).unwrap();
 
          let result = catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -76,7 +64,6 @@ proptest! {
          }));
 
          assert!(result.is_ok(), "乱码解析诱发了 Panic: {}", garbage);
-         drop(db); // 修复: Windows 显式内存解除映射
-         cleanup(&path);
+         drop(db);
     }
 }

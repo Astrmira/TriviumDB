@@ -522,3 +522,51 @@ fn 导出保护所有制品名称族及文本硬链接并保留可检索正文()
     assert_eq!(db.get_payload(1).unwrap(), Some(json!({"fact":"alpha"})));
     db.close().unwrap();
 }
+
+#[test]
+fn 导入预算按原始字节及节点与边合计且拒绝保留原库() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("data.tdb");
+    let input = root.path().join("import.jsonl");
+    let mut db = Database::<f32>::open(path.to_str().unwrap(), 1).unwrap();
+    db.insert_with_id(1, &[1.], json!("existing")).unwrap();
+    db.close().unwrap();
+    let batch = r#"{"id":2,"vector":[2],"edges":[{"target":1,"label":"r","weight":0.5}]}
+{"id":3,"vector":[3],"payload":"新"}
+"#;
+    std::fs::write(&input, batch).unwrap();
+    for (bytes, ops, accept) in [
+        (batch.len() - 1, 3, false),
+        (batch.len(), 2, false),
+        (batch.len(), 3, true),
+    ] {
+        let cmd = tdb()
+            .args([
+                "import",
+                path.to_str().unwrap(),
+                input.to_str().unwrap(),
+                "--dim",
+                "1",
+                "--max-input-bytes",
+                &bytes.to_string(),
+                "--max-operations",
+                &ops.to_string(),
+            ])
+            .assert();
+        if accept {
+            cmd.success();
+        } else {
+            cmd.failure();
+        }
+        let mut db = Database::<f32>::open_read_only(path.to_str().unwrap(), 1).unwrap();
+        assert_eq!(db.get_payload(1).unwrap(), Some(json!("existing")));
+        if accept {
+            assert_eq!(db.all_node_ids().unwrap(), [1, 2, 3]);
+            assert_eq!(db.get_payload(3).unwrap(), Some(json!("新")));
+            assert_eq!(db.get_edge(2, 1, "r").unwrap().unwrap().weight, 0.5);
+        } else {
+            assert_eq!(db.all_node_ids().unwrap(), [1]);
+        }
+        db.close().unwrap();
+    }
+}

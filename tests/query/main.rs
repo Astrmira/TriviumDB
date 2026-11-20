@@ -20,6 +20,22 @@ mod source_locations;
 #[path = "../support/mod.rs"]
 mod support;
 
+/// 每次调用独占制品名称，多个测试进程和同名用例可以同时运行。
+fn tmp_db(name: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join("triviumdb_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join(format!(
+        "query_{}_{}_{name}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
+    .to_str()
+    .unwrap()
+    .to_owned()
+}
+
 // Cargo 的仿真启动参数不会自动传给测试内部创建的子进程。
 fn query_child_command() -> std::process::Command {
     let executable = std::env::current_exe().unwrap();

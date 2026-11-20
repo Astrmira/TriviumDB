@@ -251,7 +251,7 @@ pub fn shortest_path<T: VectorType>(
     max_depth: usize,
     label_filter: Option<&str>,
 ) -> Option<Path> {
-    shortest_path_checked(mt, src, dst, max_depth, label_filter, || {
+    shortest_path_checked(mt, src, dst, max_depth, label_filter, |_, _| {
         Ok::<_, std::convert::Infallible>(())
     })
     .unwrap_or_else(|never| match never {})
@@ -263,37 +263,42 @@ pub(crate) fn shortest_path_checked<T: VectorType, E>(
     dst: NodeId,
     max_depth: usize,
     label_filter: Option<&str>,
-    check: impl Fn() -> std::result::Result<(), E>,
+    check: impl Fn(usize, usize) -> std::result::Result<(), E>,
 ) -> std::result::Result<Option<Path>, E> {
-    check()?;
+    let mut scanned = 0usize;
+    check(0, 0)?;
     if !mt.contains(src) || !mt.contains(dst) {
         return Ok(None);
     }
+    check(1, 0)?;
     if src == dst {
         return Ok(Some(vec![src]));
     }
     let mut parents = HashMap::from([(src, src)]);
     let mut queue = VecDeque::from([(src, 0usize)]);
     while let Some((id, depth)) = queue.pop_front() {
-        check()?;
+        check(parents.len(), scanned)?;
         if depth >= max_depth {
             break;
         }
         for edge in mt.get_edges(id).unwrap_or_default() {
-            check()?;
+            scanned += 1;
+            check(parents.len(), scanned)?;
             if label_filter.is_some_and(|label| label != edge.label) {
                 continue;
             }
             let next = edge.target_id;
+            let next_count = parents.len() + 1;
             let std::collections::hash_map::Entry::Vacant(slot) = parents.entry(next) else {
                 continue;
             };
+            check(next_count, scanned)?;
             slot.insert(id);
             if next == dst {
                 let mut path = vec![dst];
                 let mut current = dst;
                 while current != src {
-                    check()?;
+                    check(parents.len(), scanned)?;
                     current = parents[&current];
                     path.push(current);
                 }
@@ -334,92 +339,38 @@ pub(crate) fn variable_length_paths_view<T: VectorType>(
     label_filter: Option<&str>,
     limit: usize,
 ) -> Vec<(NodeId, Path)> {
-    if limit == 0 || !mt.contains(src) {
+    if limit == 0 || min_depth > max_depth || !mt.contains(src) {
         return Vec::new();
     }
-    let mut results = Vec::new();
-    let mut visited = HashSet::new();
-    visited.insert(src);
-
-    dfs_variable_length(
-        mt,
-        src,
-        &vec![src],
-        min_depth,
-        max_depth,
-        label_filter,
-        &mut visited,
-        &mut results,
-        limit,
-    );
-
-    results
-}
-
-fn dfs_variable_length<T: VectorType>(
-    mt: &impl GraphRead<T>,
-    current: NodeId,
-    path: &Vec<NodeId>,
-    min_depth: usize,
-    max_depth: usize,
-    label_filter: Option<&str>,
-    visited: &mut HashSet<NodeId>,
-    results: &mut Vec<(NodeId, Path)>,
-    limit: usize,
-) {
-    let depth = path.len() - 1; // 路径中的边数 = 节点数 - 1
-
-    // 当前深度在有效范围内，收集结果
-    if depth >= min_depth {
-        results.push((current, path.clone()));
-        if results.len() >= limit {
-            return;
-        }
+    let mut paths = Vec::new();
+    let mut path = vec![src];
+    let mut visited = HashSet::from([src]);
+    let mut stack = vec![mt.get_edges(src).unwrap_or_default().iter()];
+    if min_depth == 0 {
+        paths.push((src, path.clone()));
     }
-
-    // 已达最大深度，不再展开
-    if depth >= max_depth {
-        return;
-    }
-
-    if let Some(edges) = mt.get_edges(current) {
-        for edge in edges {
-            // 标签过滤
-            if let Some(lf) = label_filter
-                && edge.label != lf
+    while paths.len() < limit {
+        let Some(edges) = stack.last_mut() else { break };
+        if path.len() - 1 < max_depth
+            && let Some(edge) = edges.next()
+        {
+            if label_filter.is_some_and(|label| edge.label != label)
+                || !visited.insert(edge.target_id)
             {
                 continue;
             }
-
-            let next = edge.target_id;
-            if visited.contains(&next) {
-                continue; // 防环
+            let next_depth = path.len();
+            path.push(edge.target_id);
+            if next_depth >= min_depth {
+                paths.push((edge.target_id, path.clone()));
             }
-
-            visited.insert(next);
-            let mut new_path = path.clone();
-            new_path.push(next);
-
-            dfs_variable_length(
-                mt,
-                next,
-                &new_path,
-                min_depth,
-                max_depth,
-                label_filter,
-                visited,
-                results,
-                limit,
-            );
-
-            if results.len() >= limit {
-                visited.remove(&next);
-                return;
-            }
-
-            visited.remove(&next); // 回溯
+            stack.push(mt.get_edges(edge.target_id).unwrap_or_default().iter());
+        } else {
+            stack.pop();
+            visited.remove(&path.pop().expect("路径与游标栈同步"));
         }
     }
+    paths
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
