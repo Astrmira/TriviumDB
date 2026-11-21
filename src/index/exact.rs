@@ -92,14 +92,14 @@ impl<'a, T: VectorType> QueryScorer<'a, T> {
         let Some((query, query_norm)) = &self.half else {
             return T::similarity(self.query, vector);
         };
-        let mut dot = 0.;
+        let mut dot = crate::vector::CompensatedDot::default();
         let mut norm = 0.;
         for (&a, &b) in query.iter().zip(vector) {
             let b = f64::from(b.to_f32());
-            dot += f64::from(a) * b;
+            dot.add(f64::from(a) * b);
             norm += b * b;
         }
-        crate::vector::normalized_cosine(dot, *query_norm, norm)
+        crate::vector::normalized_cosine(dot.value(), *query_norm, norm)
     }
 }
 
@@ -132,7 +132,7 @@ pub fn search<T: VectorType>(
         .ok_or_else(|| TriviumError::CapacityAllocationFailed {
             reason: "精确查询工作区估算溢出".into(),
         })?;
-    let _workspace = runtime.reserve_workspace(estimate)?;
+    let _workspace = db.reserve_instance_workspace(estimate)?;
     runtime
         .pool(runtime.parallelism())?
         .install(|| search_inner(db, query, top_k, &control))
@@ -195,7 +195,7 @@ pub(crate) fn rank_unique_ids<T: VectorType>(
         .ok_or_else(|| TriviumError::CapacityAllocationFailed {
             reason: "候选堆工作区溢出 (Candidate heap workspace overflowed)".into(),
         })?;
-    let _workspace = db.resource_runtime().reserve_workspace(bytes)?;
+    let _workspace = db.reserve_instance_workspace(bytes)?;
     let scorer = QueryScorer::new(query);
     let mut heap = BinaryHeap::with_capacity(k);
     let control = crate::request::control().unwrap_or_default();
@@ -240,7 +240,7 @@ fn hydrate_candidates<T: VectorType>(
                 })
         },
     )?;
-    let _payload_workspace = db.resource_runtime().reserve_workspace(bytes)?;
+    let _payload_workspace = db.reserve_instance_workspace(bytes)?;
     candidates
         .into_iter()
         .map(|candidate| {

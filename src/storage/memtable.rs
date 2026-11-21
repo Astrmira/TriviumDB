@@ -1020,13 +1020,13 @@ impl<T: VectorType> MemTable<T> {
         // 优先从空闲槽复活
         let sig = calculate_json_signature(&payload);
         let idx = if let Some(free_idx) = self.free_slots.pop() {
-            self.vec_pool.update(free_idx, vector);
+            self.vec_pool.update(free_idx, vector)?;
             self.indices_to_ids[free_idx] = id;
             self.fast_tags[free_idx] = sig;
             free_idx
         } else {
             let i = self.indices_to_ids.len();
-            self.vec_pool.push(vector);
+            self.vec_pool.push(vector)?;
             self.indices_to_ids.push(id);
             self.fast_tags.push(sig);
             i
@@ -1121,13 +1121,13 @@ impl<T: VectorType> MemTable<T> {
         // 1. 记录向量（优先尝试从空闲槽复活，否则推入尾部增量层）
         let sig = calculate_json_signature(&payload);
         let idx = if let Some(free_idx) = self.free_slots.pop() {
-            self.vec_pool.update(free_idx, vector); // 原地重生
+            self.vec_pool.update(free_idx, vector)?; // 原地重生
             self.indices_to_ids[free_idx] = id;
             self.fast_tags[free_idx] = sig;
             free_idx
         } else {
             let i = self.indices_to_ids.len();
-            self.vec_pool.push(vector); // 追尾拓展
+            self.vec_pool.push(vector)?; // 追尾拓展
             self.indices_to_ids.push(id);
             self.fast_tags.push(sig);
             i
@@ -1192,13 +1192,13 @@ impl<T: VectorType> MemTable<T> {
         // 优先从空闲槽复活
         let sig = calculate_json_signature(&payload);
         let idx = if let Some(free_idx) = self.free_slots.pop() {
-            self.vec_pool.update(free_idx, vector);
+            self.vec_pool.update(free_idx, vector)?;
             self.indices_to_ids[free_idx] = id;
             self.fast_tags[free_idx] = sig;
             free_idx
         } else {
             let i = self.indices_to_ids.len();
-            self.vec_pool.push(vector);
+            self.vec_pool.push(vector)?;
             self.indices_to_ids.push(id);
             self.fast_tags.push(sig);
             i
@@ -2783,6 +2783,14 @@ impl<T: VectorType> MemTable<T> {
     }
 
     /// 查询属性索引。字段已建索引时即使值不存在也返回空切片。
+    pub(crate) fn property_posting(
+        &self,
+        field: &str,
+        value: &serde_json::Value,
+    ) -> Option<crate::index::property::PropertyPosting<'_>> {
+        self.property_indexes.posting(field, value)
+    }
+
     pub fn find_by_property_index_limit(
         &self,
         field: &str,
@@ -3076,7 +3084,7 @@ impl<T: VectorType> MemTable<T> {
 
         // 1. 向量层：通过 VecPool 逻辑删除（置零），并回收物理卡槽
         if let Some(idx) = self.ids_to_indices.remove(&id) {
-            self.vec_pool.zero_out(idx);
+            self.vec_pool.zero_out(idx)?;
             self.indices_to_ids[idx] = 0; // 盖上墓碑标识，防止后续被误认
             self.free_slots.push(idx); // 抛入环保回收池，供下一个 insert 使用！
         }
@@ -3450,7 +3458,7 @@ impl<T: VectorType> MemTable<T> {
         self.validate_update_vector(id, vector)?;
         match self.ids_to_indices.get(&id) {
             Some(&idx) => {
-                self.vec_pool.update(idx, vector);
+                self.vec_pool.update(idx, vector)?;
                 // QuIVer 增量更新：soft_delete 旧向量 + incremental_insert 新向量
                 if !self.quiver_sync_paused
                     && let Some(ref mut quiver) = self.quiver_index
@@ -3595,7 +3603,7 @@ impl<T: VectorType> MemTable<T> {
         )
     }
 
-    pub(crate) fn reserve_graph_workspace(
+    pub(crate) fn reserve_instance_workspace(
         &self,
         bytes: usize,
     ) -> Result<crate::resources::RequestWorkspace> {

@@ -433,12 +433,16 @@ fn 二进制向量以字符串保留完整位宽() {
 #[test]
 fn 半精度协议使用数值且不把存储位模式当作浮点值() {
     let root = TestDir::new("console_half");
-    let mut db = Database::<half::f16>::open(&root.file("半精度.tdb"), 2).unwrap();
+    let path = root.file("半精度.tdb");
+    let mut db = Database::<half::f16>::open(&path, 2).unwrap();
     let session = ConsoleSession::from_json(r#"{"readOnly":false}"#).unwrap();
-    db.console_request(&session,&request(json!({"operation":"importNodes","records":[{"id":"1","vector":[1.0007,1.0004882812500002],"payload":{}}]}))).unwrap();
-    // 入站先取 f32，再按 half 最近偶数舍入：普通上侧值取 0x3c01，f32 中点取 0x3c00。
-    assert_eq!(db.get(1).unwrap().unwrap().vector[0].to_bits(), 0x3c01);
-    assert_eq!(db.get(1).unwrap().unwrap().vector[1].to_bits(), 0x3c00);
+    db.console_request(&session,&request(json!({"operation":"importNodes","records":[{"id":"1","vector":[1.00048828125,1.0004882812501],"payload":{}}]}))).unwrap();
+    db.close().unwrap();
+    let mut db = Database::<half::f16>::open(&path, 2).unwrap();
+    // 精确中点取偶数，略大于中点取上侧的相邻 half。
+    let session = ConsoleSession::new(ConsoleOptions::default()).unwrap();
+    assert_eq!(db.get(1).unwrap().unwrap().vector[0].to_bits(), 0x3c00);
+    assert_eq!(db.get(1).unwrap().unwrap().vector[1].to_bits(), 0x3c01);
     let result: Value = serde_json::from_str(
         &db.console_request(
             &session,
@@ -449,7 +453,7 @@ fn 半精度协议使用数值且不把存储位模式当作浮点值() {
     .unwrap();
     assert_eq!(
         result["data"]["nodes"][0]["vector"],
-        json!([1.0009765625, 1.0])
+        json!([1.0, 1.0009765625])
     );
     db.close().unwrap();
 }

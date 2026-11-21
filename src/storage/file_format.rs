@@ -1755,7 +1755,7 @@ fn load_rom<T: VectorType>(
     if is_aligned {
         let t_slice =
             unsafe { std::slice::from_raw_parts(vec_block.as_ptr() as *const T, vector_elements) };
-        memtable.vec_pool_mut().push(t_slice);
+        memtable.vec_pool_mut().append_records(t_slice)?;
     } else {
         // 不对齐
         let mut v = Vec::new();
@@ -1774,7 +1774,7 @@ fn load_rom<T: VectorType>(
             let elem: T = bytemuck::pod_read_unaligned(chunk);
             v.push(elem);
         }
-        memtable.vec_pool_mut().push(&v);
+        memtable.vec_pool_mut().append_records(&v)?;
     }
 
     load_edges(

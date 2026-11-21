@@ -498,9 +498,23 @@ fn order_value<T: VectorType>(
         TqlExpr::IsNull { expr, negated } => RuntimeValue::Bool(
             matches!(order_value(expr, row, inputs, scope)?, RuntimeValue::Null) != *negated,
         ),
-        _ => row.source.map_or(RuntimeValue::Null, |index| {
-            expression(expr, &inputs[index], scope)
-        }),
+        _ => {
+            let Some(index) = row.source else {
+                return Ok(RuntimeValue::Null);
+            };
+            let mut resolved = expr.clone();
+            if let Some(var) = resolved.metric_binding_mut()
+                && let ReturnClause::Expressions(items) = &scope.query.returns
+                && let Some(item) = items.iter().find(|item| column_name(item) == *var)
+            {
+                match &item.kind {
+                    ReturnExprKind::Var(source)
+                    | ReturnExprKind::Scalar(TqlExpr::Variable(source)) => var.clone_from(source),
+                    _ => return Ok(RuntimeValue::Null),
+                }
+            }
+            expression(&resolved, &inputs[index], scope)
+        }
     })
 }
 

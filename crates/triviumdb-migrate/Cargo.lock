@@ -1147,7 +1147,6 @@ dependencies = [
  "tempfile",
  "triviumdb",
  "triviumdb-migration-source",
- "uuid",
 ]
 
 [[package]]

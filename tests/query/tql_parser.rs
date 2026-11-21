@@ -478,7 +478,7 @@ fn SEARCH_带WHERE过滤() {
 #[test]
 fn SEARCH_完整三融合() {
     let q = parse_tql(
-        r#"SEARCH VECTOR [0.1, 0.2] TOP 20 EXPAND [:related*1..2] WHERE {heat: {$gte: 0.7}} RETURN * ORDER BY a.score DESC LIMIT 10"#
+        r#"SEARCH VECTOR [0.1, 0.2] TOP 20 EXPAND [:related*1..2] WHERE {heat: {$gte: 0.7}} RETURN * ORDER BY _.score DESC LIMIT 10"#
     ).unwrap();
     assert!(matches!(q.entry, QueryEntry::Search { .. }));
     assert!(q.predicate.is_some());

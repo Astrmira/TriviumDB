@@ -10,25 +10,7 @@ use crate::node::NodeId;
 use crate::storage::memtable::MemTable;
 use std::collections::HashMap;
 
-/// PageRank 算法配置
-pub struct PageRankConfig {
-    /// 阻尼因子（默认 0.85）
-    pub damping: f64,
-    /// 最大迭代次数（默认 100）
-    pub max_iterations: usize,
-    /// 收敛阈值（L1 范数差值低于此值则提前停止，默认 1e-6）
-    pub tolerance: f64,
-}
-
-impl Default for PageRankConfig {
-    fn default() -> Self {
-        Self {
-            damping: 0.85,
-            max_iterations: 100,
-            tolerance: 1e-6,
-        }
-    }
-}
+pub use super::subset::SubsetPageRankConfig as PageRankConfig;
 
 /// 计算所有节点的 PageRank 分数
 ///
@@ -38,12 +20,13 @@ pub fn pagerank<T: VectorType>(
     mt: &MemTable<T>,
     config: &PageRankConfig,
     label_filter: Option<&str>,
-) -> Vec<(NodeId, f64)> {
+) -> crate::Result<Vec<(NodeId, f64)>> {
+    config.validate()?;
     let mut all_ids = mt.all_node_ids();
     all_ids.sort_unstable();
     let n = all_ids.len();
     if n == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let init_val = 1.0 / n as f64;
@@ -117,5 +100,5 @@ pub fn pagerank<T: VectorType>(
 
     let mut result: Vec<(NodeId, f64)> = scores.into_iter().collect();
     result.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    result
+    Ok(result)
 }

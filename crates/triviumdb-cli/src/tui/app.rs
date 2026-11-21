@@ -384,8 +384,8 @@ impl App {
 
     /// 以当前选中节点的向量为 query 做相似度检索（搜索 Playground）。
     fn run_search(&mut self) {
-        let (vector, qid) = match &self.detail {
-            Some(n) => (n.vector.clone(), n.id),
+        let qid = match &self.detail {
+            Some(n) => n.id,
             None => {
                 self.status = "无选中节点可作为检索样例".into();
                 return;
@@ -393,7 +393,7 @@ impl App {
         };
 
         let start = Instant::now();
-        match self.handle.search_f32(&vector, 20, 1, 0.0) {
+        match self.handle.search_by_node(qid, 20, 1, 0.0) {
             Ok(hits) => {
                 let mut rows: CliRows = Vec::new();
                 let mut scores: Vec<f32> = Vec::new();

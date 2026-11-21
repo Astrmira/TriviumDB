@@ -1679,8 +1679,8 @@ impl TqlParser {
             return Ok(Predicate::Not(Box::new(inner)));
         }
 
-        // 括号
-        if self.at(&TqlToken::LParen) {
+        // 括号后的算术或比较运算属于标量表达式，其余括号交给谓词分组。
+        if self.at(&TqlToken::LParen) && !self.group_has_scalar_suffix() {
             self.advance();
             let inner = self.parse_predicate()?;
             self.expect(&TqlToken::RParen)?;
@@ -1694,45 +1694,72 @@ impl TqlParser {
         }
 
         // 表达式比较或 var MATCHES 文档过滤
+        let left = self.parse_expr()?;
+        if let TqlExpr::Variable(ident) = &left
+            && self.at(&TqlToken::Matches)
+        {
+            self.advance();
+            let filter = self.parse_doc_filter()?;
+            return Ok(Predicate::DocFilter {
+                var: Some(ident.clone()),
+                filter,
+            });
+        }
         if matches!(
             self.peek(),
-            TqlToken::Ident(_) | TqlToken::Rank | TqlToken::DollarOp(_)
+            TqlToken::Eq
+                | TqlToken::Ne
+                | TqlToken::Gt
+                | TqlToken::Gte
+                | TqlToken::Lt
+                | TqlToken::Lte
         ) {
-            let checkpoint = self.pos;
-            let left = self.parse_expr()?;
-            if let TqlExpr::Variable(ident) = &left
-                && self.at(&TqlToken::Matches)
-            {
-                self.advance();
-                let filter = self.parse_doc_filter()?;
-                return Ok(Predicate::DocFilter {
-                    var: Some(ident.clone()),
-                    filter,
-                });
-            }
-            if matches!(
-                self.peek(),
-                TqlToken::Eq
-                    | TqlToken::Ne
-                    | TqlToken::Gt
-                    | TqlToken::Gte
-                    | TqlToken::Lt
-                    | TqlToken::Lte
-            ) {
-                let op = self.parse_comp_op()?;
-                let right = self.parse_expr()?;
-                return Ok(Predicate::Compare { left, op, right });
-            }
-            self.pos = checkpoint;
-            let ident = self.parse_ident()?;
-            return Err(format!(
-                "Unexpected token after identifier '{}': {:?}",
-                ident,
-                self.peek()
-            ));
+            let op = self.parse_comp_op()?;
+            let right = self.parse_expr()?;
+            return Ok(Predicate::Compare { left, op, right });
         }
+        if matches!(left, TqlExpr::IsNull { .. }) {
+            self.synthetic_source("expression");
+            return Ok(Predicate::Compare {
+                left,
+                op: TqlCompOp::Eq,
+                right: TqlExpr::Literal(TqlLiteral::Bool(true)),
+            });
+        }
+        Err(self.error_here("谓词需要比较运算符 (Expected a predicate comparison)"))
+    }
 
-        Err(format!("Unexpected token in predicate: {:?}", self.peek()))
+    fn group_has_scalar_suffix(&self) -> bool {
+        let mut depth = 0;
+        for (i, token) in self.tokens.iter().enumerate().skip(self.pos) {
+            match token {
+                TqlToken::LParen => depth += 1,
+                TqlToken::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return matches!(
+                            self.tokens.get(i + 1),
+                            Some(
+                                TqlToken::Plus
+                                    | TqlToken::Dash
+                                    | TqlToken::Star
+                                    | TqlToken::Slash
+                                    | TqlToken::Eq
+                                    | TqlToken::Ne
+                                    | TqlToken::Lt
+                                    | TqlToken::Lte
+                                    | TqlToken::Gt
+                                    | TqlToken::Gte
+                                    | TqlToken::Is
+                                    | TqlToken::Matches
+                            )
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -2851,7 +2878,10 @@ fn validate_pipeline_scope_origin(
             QueryEntry::Documents { .. } | QueryEntry::Pelorus { .. }
         )
     {
-        if matches!(query.entry, QueryEntry::Find { .. }) {
+        if matches!(
+            query.entry,
+            QueryEntry::Find { .. } | QueryEntry::Search { .. } | QueryEntry::Text { .. }
+        ) {
             return validate_final_scope(
                 query,
                 ["_".to_owned()].into(),

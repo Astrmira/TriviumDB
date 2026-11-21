@@ -835,6 +835,8 @@ RETURN clustered, topic(clustered) AS topic_id, topic_score(clustered) AS confid
 
 ## 表达式、聚合与空值
 
+`WHERE` 比较的两侧均可使用标量表达式。例如 `WHERE n.x<-1` 与 `WHERE 0 > (n.x + 1)` 对整数属性给出相同结果。`WHERE n.z IS NULL` 和 `WHERE n.z IS NOT NULL` 可直接作为谓词，也可与其他条件用 `AND` 或 `OR` 组合。
+
 表达式支持 `+ - * /`、括号优先级、参数、属性、一等分数、`COALESCE`、`IS NULL/IS NOT NULL`、`path()` 与 `path_length()`。认知管线新增 `text_score()`、`diversity_score()`、`residual_score()`、`topic()` 与 `topic_score()`；未携带对应分数的行返回 Null。除零、非数值算术和非有限结果返回 Null。
 
 整数的字面量、属性、节点 ID 与 Prepared 参数覆盖 `i64::MIN..=u64::MAX`；Rust 一等值使用 `Int(i64)`、`UInt(u64)`、`Float(f64)`。`WHERE`、排序与 `MIN/MAX` 共用精确数值比较，整数和浮点混合比较保持整数精度。浮点相等比较使用实际数值相等；`+0.0` 与 `-0.0` 相等。

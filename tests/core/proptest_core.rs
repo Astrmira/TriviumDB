@@ -42,25 +42,29 @@ proptest! {
     fn memtable_crud_node_count_不变量(ops in prop::collection::vec(arb_memop(4), 1..30)) {
         use triviumdb::storage::memtable::MemTable;
         let mut mt = MemTable::<f32>::new(4);
-        let mut alive = std::collections::HashSet::new();
+        let mut alive = std::collections::BTreeMap::new();
+        let mut next_id = 1;
 
         for op in ops {
             match op {
                 MemOp::Insert(vec) => {
-                    if let Ok(id) = mt.insert(&vec, json!({})) {
-                        alive.insert(id);
-                    }
+                    prop_assert_eq!(mt.insert(&vec, json!({})).unwrap(), next_id);
+                    alive.insert(next_id, vec);
+                    next_id += 1;
                 }
                 MemOp::Delete(id) => {
-                    if mt.contains(id) {
-                        let _ = mt.delete(id);
-                        alive.remove(&id);
+                    if alive.remove(&id).is_some() {
+                        mt.delete(id).unwrap();
+                    } else {
+                        prop_assert_eq!(mt.delete(id).unwrap_err().code(), "TDB_NODE_NOT_FOUND");
                     }
                 }
             }
         }
-        prop_assert_eq!(mt.node_count(), alive.len(),
-            "node_count ({}) != alive set size ({})", mt.node_count(), alive.len());
+        prop_assert_eq!(mt.node_count(), alive.len());
+        for (id, vector) in alive {
+            prop_assert_eq!(mt.get_vector(id), Some(vector.as_slice()));
+        }
     }
 
     /// 不变量：插入后 get_payload 一定返回 Some，delete 后一定返回 None

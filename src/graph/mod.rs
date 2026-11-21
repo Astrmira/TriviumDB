@@ -9,6 +9,7 @@ pub mod centrality;
 pub mod constrained;
 pub mod leiden;
 pub mod pagerank;
+mod path_cost;
 pub mod pathfinding;
 pub mod reachability;
 pub mod subset;

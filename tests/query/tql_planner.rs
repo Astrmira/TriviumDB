@@ -590,6 +590,42 @@ fn 分页按模式起点取行且重叠赋值按文本次序持久化() {
     }
 }
 
+#[test]
+fn 等价标量谓词与反向边模式独立解析() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("predicate.tdb");
+    let mut db = Database::<f32>::open(path.to_str().unwrap(), 1).unwrap();
+    db.insert_with_id(1, &[1.], json!({"x":-2})).unwrap();
+    db.insert_with_id(2, &[1.], json!({"x":2,"z":1})).unwrap();
+    db.link(1, 2, "r", 1.).unwrap();
+    for predicate in [
+        "n.x<-1",
+        "(n.x + 1) < 0",
+        "0 > n.x + 1",
+        "n.z IS NULL",
+        "((n.x < -1) AND (n.z IS NULL))",
+        "((n.x) + 1) * 2 < 0",
+    ] {
+        let rows = db
+            .tql(&format!("MATCH (n) WHERE {predicate} RETURN n"))
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|r| r["n"].as_node().unwrap().id)
+                .collect::<Vec<_>>(),
+            [1],
+            "{predicate}"
+        );
+    }
+    let rows = db.tql("MATCH (n)<-[:r]-(a) WHERE a.x<-1 RETURN n").unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| r["n"].as_node().unwrap().id)
+            .collect::<Vec<_>>(),
+        [2]
+    );
+}
+
 #[cfg(feature = "test-hooks")]
 #[test]
 fn 单跳分页按需扫描且失败谓词释放端点额度() {

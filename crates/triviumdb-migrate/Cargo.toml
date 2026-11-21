@@ -17,12 +17,11 @@ serde_json = "1"
 sha2 = "0.10"
 fs2 = "0.4.3"
 half = { version = "2.7.1", features = ["serde"] }
-uuid = { version = "1", features = ["v4"] }
 rayon = "1.10"
 crc32fast = "1.5"
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 bytemuck = "1"
 
 [features]

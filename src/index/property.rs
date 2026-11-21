@@ -73,6 +73,21 @@ fn text_ngrams(text: &str) -> Result<Vec<String>> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PropertyKey(Vec<u8>);
 
+pub(crate) enum PropertyPosting<'a> {
+    Heap(&'a [NodeId]),
+    Mapped(&'a [[u8; 8]]),
+}
+impl PropertyPosting<'_> {
+    pub(crate) fn contains(&self, id: NodeId) -> bool {
+        match self {
+            Self::Heap(ids) => ids.binary_search(&id).is_ok(),
+            Self::Mapped(ids) => ids
+                .binary_search_by_key(&id, |bytes| u64::from_le_bytes(*bytes))
+                .is_ok(),
+        }
+    }
+}
+
 impl PropertyKey {
     pub(crate) fn encoded_len(&self) -> usize {
         self.0.len()
@@ -213,7 +228,7 @@ impl HashPropertyIndex {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum PropertyIndexKind {
     Hash,
@@ -1479,47 +1494,45 @@ impl PropertyIndexRegistry {
         self.unique_indexes.remove(field);
     }
 
+    pub(crate) fn posting(&self, field: &str, value: &Value) -> Option<PropertyPosting<'_>> {
+        let key = PropertyKey::from_json(value)?;
+        if let Some(index) = self.indexes.get(field) {
+            return Some(PropertyPosting::Heap(
+                index
+                    .entries
+                    .get(&key)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            ));
+        }
+        let mapped = self.mapped.as_ref()?;
+        let Some(range) = mapped.blocks.get(&(field.to_owned(), key)) else {
+            return mapped
+                .blocks
+                .range((field.to_owned(), PropertyKey(Vec::new()))..)
+                .next()
+                .filter(|((name, _), _)| name == field)
+                .map(|_| PropertyPosting::Heap(&[]));
+        };
+        let (ids, tail) = mapped.mmap.get(range.clone())?.as_chunks::<8>();
+        tail.is_empty().then_some(PropertyPosting::Mapped(ids))
+    }
+
     pub fn lookup_limit(
         &self,
         field: &str,
         value: &Value,
         limit: Option<usize>,
     ) -> Option<Vec<NodeId>> {
-        let key = PropertyKey::from_json(value)?;
-        if let Some(index) = self.indexes.get(field) {
-            let ids = index
-                .entries
-                .get(&key)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            return Some(
-                ids.iter()
-                    .copied()
-                    .take(limit.unwrap_or(usize::MAX))
-                    .collect(),
-            );
-        }
-        let mapped = self.mapped.as_ref()?;
-        let Some(range) = mapped.blocks.get(&(field.to_owned(), key)) else {
-            return mapped
-                .blocks
-                .keys()
-                .any(|(name, _)| name == field)
-                .then(Vec::new);
-        };
-        let bytes = mapped.mmap.get(range.clone())?;
-        if !bytes.len().is_multiple_of(std::mem::size_of::<NodeId>()) {
-            return None;
-        }
-        Some(
-            bytes
-                .as_chunks::<8>()
-                .0
+        let limit = limit.unwrap_or(usize::MAX);
+        Some(match self.posting(field, value)? {
+            PropertyPosting::Heap(ids) => ids[..ids.len().min(limit)].to_vec(),
+            PropertyPosting::Mapped(ids) => ids
                 .iter()
-                .take(limit.unwrap_or(usize::MAX))
-                .map(|raw| u64::from_le_bytes(*raw))
+                .take(limit)
+                .map(|id| u64::from_le_bytes(*id))
                 .collect(),
-        )
+        })
     }
 
     pub fn lookup(&self, field: &str, value: &Value) -> Option<Vec<NodeId>> {

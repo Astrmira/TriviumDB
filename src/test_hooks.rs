@@ -113,6 +113,7 @@ pub enum IoPoint {
     IndexContainerPublish,
     CheckpointWalClear,
     MigrationPublishFile,
+    MigrationDirectorySync,
     MigrationAfterFirstFile,
     MigrationPublishMarker,
     MigrationAfterCommit,

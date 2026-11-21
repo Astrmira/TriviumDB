@@ -496,6 +496,32 @@ pub enum TqlExpr {
     Literal(TqlLiteral),
 }
 
+impl TqlExpr {
+    /// 排序中的指标参数先解析 RETURN 节点别名，再读取来源行上的指标。
+    pub(super) fn metric_binding_mut(&mut self) -> Option<&mut String> {
+        match self {
+            Self::Depth { var }
+            | Self::GraphScore { var }
+            | Self::TextScore { var }
+            | Self::DiversityScore { var }
+            | Self::ResidualScore { var }
+            | Self::Topic { var }
+            | Self::TopicScore { var }
+            | Self::Community { var }
+            | Self::PairLeft { var }
+            | Self::PairRight { var }
+            | Self::Similarity { var }
+            | Self::Path { var }
+            | Self::PathStrength { var }
+            | Self::PathCount { var }
+            | Self::PathLength { var }
+            | Self::PathRank { var }
+            | Self::GraphMetric { var, .. } => Some(var),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TqlBinaryOp {
     Add,

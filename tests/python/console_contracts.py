@@ -152,7 +152,7 @@ def run_console_contract(root: str) -> None:
             assert node == {"id": "1", "vector": ["1", "0"] if dtype == "u64" else [1.0, 0.0], "payload": {"dtype": dtype}, "edges": []}
             if dtype == "f16":
                 writable = triviumdb.ConsoleSession('{"readOnly":false}')
-                db.console_request(writable, wire({"operation": "importNodes", "records": [{"id": "2", "vector": [1.0007, 1.0004882812500002], "payload": {}}]}))
+                db.console_request(writable, wire({"operation": "importNodes", "records": [{"id": "2", "vector": [1.0004882812500002, 1.0004882812499998], "payload": {}}]}))
                 assert db.get(2).vector == [1.0009765625, 1.0]
         finally:
             db.close()

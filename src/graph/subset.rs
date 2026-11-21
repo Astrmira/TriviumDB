@@ -33,6 +33,21 @@ pub struct SubsetPageRankConfig {
     pub tolerance: f64,
 }
 
+impl SubsetPageRankConfig {
+    pub(super) fn validate(&self) -> Result<()> {
+        if !(0.0..1.0).contains(&self.damping)
+            || !self.tolerance.is_finite()
+            || self.tolerance <= 0.0
+            || self.max_iterations == 0
+        {
+            return Err(TriviumError::QueryExecution(
+            "PageRank 配置非法：damping 必须位于 [0,1)，迭代次数和 tolerance 必须为正 (Invalid PageRank configuration)".into(),
+        ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for SubsetPageRankConfig {
     fn default() -> Self {
         Self {
@@ -86,15 +101,7 @@ pub(crate) fn subset_pagerank_view<T: VectorType>(
     max_examined_edges: usize,
 ) -> Result<SubsetPageRankResult> {
     let control = validate_members(mt, nodes)?;
-    if !(0.0..1.0).contains(&config.damping)
-        || !config.tolerance.is_finite()
-        || config.tolerance <= 0.0
-        || config.max_iterations == 0
-    {
-        return Err(TriviumError::QueryExecution(
-            "PageRank 配置非法：damping 必须位于 [0,1)，迭代次数和 tolerance 必须为正 (Invalid PageRank configuration)".into(),
-        ));
-    }
+    config.validate()?;
     if nodes.is_empty() {
         return Ok(SubsetPageRankResult {
             scores: Vec::new(),
@@ -224,15 +231,7 @@ pub(crate) fn subset_pagerank_parallel_view<T: VectorType>(
 ) -> Result<SubsetPageRankResult> {
     let control = validate_members(mt, nodes)?;
     use rayon::prelude::*;
-    if !(0.0..1.0).contains(&config.damping)
-        || !config.tolerance.is_finite()
-        || config.tolerance <= 0.0
-        || config.max_iterations == 0
-    {
-        return Err(TriviumError::QueryExecution(
-            "PageRank 配置非法：damping 必须位于 [0,1)，迭代次数和 tolerance 必须为正 (Invalid PageRank configuration)".into(),
-        ));
-    }
+    config.validate()?;
     let examined_edges = admit_subset_edges(
         mt,
         nodes,
@@ -760,7 +759,7 @@ fn betweenness<T: VectorType>(
     // 预算紧张时减少同时保留的源工作区；单源仍不足时返回原始额度错误。
     let _workspace = loop {
         let peak = base.saturating_add(per_worker.saturating_mul(workers));
-        match mt.facts().reserve_graph_workspace(peak) {
+        match mt.facts().reserve_instance_workspace(peak) {
             Ok(lease) => break lease,
             Err(
                 TriviumError::CapacityReservationRejected { .. }

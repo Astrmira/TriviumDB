@@ -449,7 +449,9 @@ impl TqlLexer {
                             if self.peek() == Some('=') {
                                 self.advance();
                                 TqlToken::Lte
-                            } else if self.peek() == Some('-') {
+                            } else if self.peek() == Some('-')
+                                && !self.peek_ahead(1).is_some_and(|c| c.is_ascii_digit())
+                            {
                                 self.advance();
                                 TqlToken::LeftArrow
                             } else {

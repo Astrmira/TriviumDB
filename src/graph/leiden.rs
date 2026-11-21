@@ -200,11 +200,11 @@ impl WeightedGraph {
         let mut adjacency = vec![Vec::new(); nodes.len()];
         for ((left, right), weight) in undirected {
             check()?;
-            adjacency[left].push((right, weight));
-            if left != right {
-                adjacency[right].push((left, weight));
+            if left == right {
+                adjacency[left].push((left, 2.0 * weight));
             } else {
                 adjacency[left].push((right, weight));
+                adjacency[right].push((left, weight));
             }
         }
         for neighbors in &mut adjacency {
@@ -235,7 +235,7 @@ fn local_moving<E>(
 ) -> std::result::Result<(Vec<usize>, usize), E> {
     let mut communities = (0..graph.len()).collect::<Vec<_>>();
     let mut totals = graph.degree.clone();
-    if graph.total_weight_twice <= f64::EPSILON {
+    if graph.total_weight_twice == 0.0 {
         return Ok((communities, 0));
     }
     for iteration in 0..max_iterations {
@@ -250,7 +250,9 @@ fn local_moving<E>(
             let mut weights = BTreeMap::<usize, f64>::new();
             for &(neighbor, weight) in &graph.adjacency[node] {
                 check()?;
-                *weights.entry(communities[neighbor]).or_default() += weight;
+                if neighbor != node {
+                    *weights.entry(communities[neighbor]).or_default() += weight;
+                }
             }
             totals[current] -= degree;
             let current_gain = weights.get(&current).copied().unwrap_or_default()
@@ -260,7 +262,9 @@ fn local_moving<E>(
             for (community, internal_weight) in weights {
                 check()?;
                 let gain = internal_weight - degree * totals[community] / graph.total_weight_twice;
-                if gain > best_gain + 1e-12 || (gain - best_gain).abs() <= 1e-12 && community < best
+                let tolerance = 1e-12 * degree;
+                if gain > best_gain + tolerance
+                    || (gain - best_gain).abs() <= tolerance && community < best
                 {
                     best = community;
                     best_gain = gain;
@@ -340,17 +344,22 @@ fn aggregate<E>(
             } else {
                 (right, left)
             };
-            *edges.entry(pair).or_default() += weight;
+            // 自环在邻接表中保存双倍度，收缩前还原为单条物理边权。
+            *edges.entry(pair).or_default() += if source == target {
+                weight * 0.5
+            } else {
+                weight
+            };
         }
     }
     let mut adjacency = vec![Vec::new(); dense.len()];
     for ((left, right), weight) in edges {
         check()?;
-        adjacency[left].push((right, weight));
-        if left != right {
-            adjacency[right].push((left, weight));
+        if left == right {
+            adjacency[left].push((left, 2.0 * weight));
         } else {
             adjacency[left].push((right, weight));
+            adjacency[right].push((left, weight));
         }
     }
     for neighbors in &mut adjacency {
@@ -387,6 +396,7 @@ pub(crate) fn compute_centroids_checked<E>(
             members.entry(cluster).or_default().push(vector);
         }
     }
+    let mut centroids = HashMap::with_capacity(members.len());
     for (cluster, members) in members {
         let mut centroid = Vec::with_capacity(dim);
         for axis in 0..dim {
@@ -411,8 +421,9 @@ pub(crate) fn compute_centroids_checked<E>(
                 nonfinite
             });
         }
-        result.centroids.insert(cluster, centroid);
+        centroids.insert(cluster, centroid);
     }
+    result.centroids = centroids;
     Ok(())
 }
 
@@ -447,6 +458,29 @@ mod tests {
         };
         let result = run_leiden(&snap, &LeidenConfig::default());
         assert_eq!(result.num_clusters, 0);
+    }
+
+    #[test]
+    fn 权重缩放保持社区且收缩保持自环度数() {
+        for scale in [1.0, 1e-20, 1e20] {
+            let snap = make_snapshot(vec![(1, 2, scale)]);
+            let result = run_leiden(
+                &snap,
+                &LeidenConfig {
+                    min_community_size: 1,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(result.node_to_cluster, HashMap::from([(1, 1), (2, 1)]));
+        }
+        let snap = make_snapshot(vec![(1, 1, 3.), (1, 2, 2.), (2, 3, 1.)]);
+        let check = || Ok::<(), std::convert::Infallible>(());
+        let graph = WeightedGraph::from_snapshot(&snap, &[1, 2, 3], &check).unwrap();
+        assert_eq!(graph.degree, [8., 3., 1.]);
+        let (merged, _) = aggregate(&graph, &[0, 0, 1], &check).unwrap();
+        assert_eq!(merged.degree, [11., 1.]);
+        let (one, _) = aggregate(&merged, &[0, 0], &check).unwrap();
+        assert_eq!(one.degree, [12.]);
     }
 
     #[test]
@@ -574,5 +608,7 @@ mod tests {
         let c = result.centroids.values().next().unwrap();
         // 质心应约为 (1/3, 1/3, 1/3)
         assert!((c[0] - 1.0 / 3.0).abs() < 0.01);
+        compute_centroids(&mut result, &HashMap::new(), 3);
+        assert!(result.centroids.is_empty());
     }
 }

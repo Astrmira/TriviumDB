@@ -1014,10 +1014,9 @@ fn execute_pipeline_set<T: VectorType>(
                         source_query.returns = ReturnClause::All;
                         if let QueryEntry::Match { pattern }
                         | QueryEntry::OptionalMatch { pattern } = &mut source_query.entry
-                            && pattern.edges.is_empty()
                             && pattern.nodes.first().is_some_and(|node| node.var.is_none())
                         {
-                            pattern.nodes[0].var = Some("_".into());
+                            pattern.nodes[0].var = Some(MATCH_ANCHOR.into());
                         }
                         // 返回行上限由最终管线执行，来源仍遵守内存、遍历和取消预算。
                         let mut source_limits = limits.clone();
@@ -2120,7 +2119,7 @@ fn collect_single_edge_rows_inner<T: VectorType>(
             expanded.push(EdgeBindingRow {
                 nodes,
                 edge: view,
-                anchor: start,
+                anchor: if plan.reversed { end } else { start },
             });
             if expanded.len() > row_limit {
                 break 'anchors;
@@ -2204,38 +2203,91 @@ struct TqlScopeProjection {
 const CURRENT_BINDING: &str = "\0current";
 // 关系匹配的每一行在普通投影中保留重数；节点集仍按绑定归一化。
 pub(super) const MATCH_ROW: &str = "\0match_row";
+const MATCH_ANCHOR: &str = "\0anchor";
 
 #[derive(Clone, Copy, Debug)]
 enum BoundMetric {
     Similarity,
-    SimilarityApproximate,
     Path,
     PathStrength,
     PathCount,
     PathRank,
+    Depth,
+    GraphScore,
+    TextScore,
+    DiversityScore,
+    ResidualScore,
+    Topic,
+    TopicScore,
+    Community,
+    PairLeft,
+    PairRight,
+    Graph(crate::query::pipeline::GraphMetric),
 }
 
 impl BoundMetric {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 27] = [
         Self::Similarity,
-        Self::SimilarityApproximate,
         Self::Path,
         Self::PathStrength,
         Self::PathCount,
         Self::PathRank,
+        Self::Depth,
+        Self::GraphScore,
+        Self::TextScore,
+        Self::DiversityScore,
+        Self::ResidualScore,
+        Self::Topic,
+        Self::TopicScore,
+        Self::Community,
+        Self::PairLeft,
+        Self::PairRight,
+        Self::Graph(crate::query::pipeline::GraphMetric::PageRank),
+        Self::Graph(crate::query::pipeline::GraphMetric::Degree),
+        Self::Graph(crate::query::pipeline::GraphMetric::Betweenness),
+        Self::Graph(crate::query::pipeline::GraphMetric::SaPpr),
+        Self::Graph(crate::query::pipeline::GraphMetric::HarmonicCentrality),
+        Self::Graph(crate::query::pipeline::GraphMetric::WeightedDistance),
+        Self::Graph(crate::query::pipeline::GraphMetric::NodeSimilarity),
+        Self::Graph(crate::query::pipeline::GraphMetric::CoreNumber),
+        Self::Graph(crate::query::pipeline::GraphMetric::TriangleCount),
+        Self::Graph(crate::query::pipeline::GraphMetric::ClusteringCoefficient),
+        Self::Graph(crate::query::pipeline::GraphMetric::Authority),
+        Self::Graph(crate::query::pipeline::GraphMetric::Hub),
     ];
 
     fn key(self, var: &str) -> String {
-        format!("\0{self:?}:{var}")
+        format!("\0{var}:{self:?}")
     }
 
     fn clear_snapshot(var: &str, values: &mut BTreeMap<String, RuntimeValue>) {
-        for metric in Self::ALL {
-            values.remove(&metric.key(var));
+        let prefix = format!("\0{var}:");
+        values.retain(|key, _| !key.starts_with(&prefix));
+    }
+
+    fn score(
+        self,
+        row: &crate::query::pipeline::NodeRow,
+    ) -> Option<crate::query::pipeline::ScoreValue> {
+        match self {
+            Self::Similarity => row.similarity,
+            Self::GraphScore => row.graph_score,
+            Self::TextScore => row.text_score,
+            Self::DiversityScore => row.diversity_score,
+            Self::ResidualScore => row.residual_score,
+            Self::TopicScore => row.topic_score,
+            Self::PathStrength => row.path_strength,
+            Self::Graph(metric) => row.graph_metric(metric),
+            _ => None,
         }
     }
 
     fn value(self, row: &crate::query::pipeline::NodeRow, var: &str) -> RuntimeValue {
+        if let Some(bindings) = &row.bindings
+            && !matches!(bindings.get(var), Some(RuntimeValue::Node(_)))
+        {
+            return RuntimeValue::Null;
+        }
         if var != current_binding(row) {
             return row
                 .bindings
@@ -2244,18 +2296,16 @@ impl BoundMetric {
                 .cloned()
                 .unwrap_or(RuntimeValue::Null);
         }
-        use crate::query::pipeline::ScoreKind;
         match self {
-            Self::Similarity => row.similarity.map(|score| RuntimeValue::Float(score.value)),
-            Self::SimilarityApproximate => row
-                .similarity
-                .map(|score| RuntimeValue::Bool(score.kind == ScoreKind::Approximate)),
+            Self::Depth => row.provenance.min_depth.map(|v| runtime_u64(v as u64)),
+            Self::Topic => row.topic_id.map(runtime_u64),
+            Self::Community => row.community_id.map(runtime_u64),
+            Self::PairLeft => row.pair.map(|v| runtime_u64(v.0)),
+            Self::PairRight => row.pair.map(|v| runtime_u64(v.1)),
             Self::Path => row.path.clone().map(RuntimeValue::Path),
-            Self::PathStrength => row
-                .path_strength
-                .map(|score| RuntimeValue::Float(score.value)),
             Self::PathCount => row.path_count.map(|count| runtime_u64(count as u64)),
             Self::PathRank => row.path_rank.map(|rank| runtime_u64(rank as u64)),
+            metric => metric.score(row).map(|s| RuntimeValue::Float(s.value)),
         }
         .unwrap_or(RuntimeValue::Null)
     }
@@ -2266,12 +2316,35 @@ impl BoundMetric {
         to: &str,
         values: &mut BTreeMap<String, RuntimeValue>,
     ) {
+        use crate::query::pipeline::ScoreKind;
+        Self::clear_snapshot(to, values);
+        let source_prefix = format!("\0{from}:");
+        if from != current_binding(row) {
+            if let Some(bindings) = &row.bindings {
+                for (key, value) in bindings
+                    .range(source_prefix.clone()..)
+                    .take_while(|(key, _)| key.starts_with(&source_prefix))
+                {
+                    values.insert(
+                        format!("\0{to}:{}", &key[source_prefix.len()..]),
+                        value.clone(),
+                    );
+                }
+            }
+            return;
+        }
         for metric in Self::ALL {
-            let key = metric.key(to);
             let value = metric.value(row, from);
-            if matches!(value, RuntimeValue::Null) {
-                values.remove(&key);
-            } else {
+            if !matches!(value, RuntimeValue::Null) {
+                let key = metric.key(to);
+                if let Some(score) = metric.score(row)
+                    && score.kind != ScoreKind::Exact
+                {
+                    values.insert(
+                        format!("{key}:approx"),
+                        RuntimeValue::Bool(score.kind == ScoreKind::Approximate),
+                    );
+                }
                 values.insert(key, value);
             }
         }
@@ -2295,34 +2368,54 @@ fn activate_projected_metrics(
     values: &BTreeMap<String, RuntimeValue>,
 ) {
     use crate::query::pipeline::{ScoreKind, ScoreValue};
-    let number = |metric: BoundMetric| match values.get(&metric.key(primary)) {
-        Some(RuntimeValue::Float(value)) => Some(*value),
-        _ => None,
+    let score = |metric: BoundMetric| {
+        let key = metric.key(primary);
+        let Some(RuntimeValue::Float(value)) = values.get(&key) else {
+            return None;
+        };
+        let kind = match values.get(&format!("{key}:approx")) {
+            Some(RuntimeValue::Bool(true)) => ScoreKind::Approximate,
+            Some(RuntimeValue::Bool(false)) => ScoreKind::DepthBounded,
+            _ => ScoreKind::Exact,
+        };
+        Some(ScoreValue {
+            value: *value,
+            kind,
+        })
     };
     let count = |metric: BoundMetric| match values.get(&metric.key(primary)) {
         Some(RuntimeValue::Int(value)) => usize::try_from(*value).ok(),
         Some(RuntimeValue::UInt(value)) => usize::try_from(*value).ok(),
         _ => None,
     };
-    row.similarity = number(BoundMetric::Similarity).map(|value| ScoreValue {
-        value,
-        kind: if matches!(
-            values.get(&BoundMetric::SimilarityApproximate.key(primary)),
-            Some(RuntimeValue::Bool(true))
-        ) {
-            ScoreKind::Approximate
-        } else {
-            ScoreKind::Exact
-        },
-    });
+    row.similarity = score(BoundMetric::Similarity);
     row.path = match values.get(&BoundMetric::Path.key(primary)) {
         Some(RuntimeValue::Path(path)) => Some(path.clone()),
         _ => None,
     };
-    row.path_strength = number(BoundMetric::PathStrength).map(|value| ScoreValue {
-        value,
-        kind: ScoreKind::Exact,
-    });
+    row.path_strength = score(BoundMetric::PathStrength);
+    let unsigned = |metric: BoundMetric| match values.get(&metric.key(primary)) {
+        Some(RuntimeValue::Int(value)) => u64::try_from(*value).ok(),
+        Some(RuntimeValue::UInt(value)) => Some(*value),
+        _ => None,
+    };
+    row.provenance.min_depth = count(BoundMetric::Depth);
+    row.topic_id = unsigned(BoundMetric::Topic);
+    row.community_id = unsigned(BoundMetric::Community);
+    row.pair = unsigned(BoundMetric::PairLeft).zip(unsigned(BoundMetric::PairRight));
+    row.graph_score = score(BoundMetric::GraphScore);
+    row.text_score = score(BoundMetric::TextScore);
+    row.diversity_score = score(BoundMetric::DiversityScore);
+    row.residual_score = score(BoundMetric::ResidualScore);
+    row.topic_score = score(BoundMetric::TopicScore);
+    row.graph_metrics.clear();
+    for metric in BoundMetric::ALL {
+        if let BoundMetric::Graph(name) = metric
+            && let Some(value) = score(metric)
+        {
+            row.graph_metrics.insert(name, value);
+        }
+    }
     row.path_count = count(BoundMetric::PathCount);
     row.path_rank = count(BoundMetric::PathRank);
 }
@@ -2371,7 +2464,6 @@ impl<T: VectorType> crate::query::pipeline::PipelineOperator<T> for TqlMatchSour
                         .and_then(|node| node.var.as_ref())
                         .and_then(|name| nodes.get(name))
                         .map(|node| node.id)
-                        .or_else(|| nodes.values().map(|node| node.id).min())
                         .ok_or_else(|| TriviumError::QueryExecution("MATCH 管线来源缺少锚点身份 (MATCH pipeline source has no anchor identity)".into()))?;
                     Ok(EdgeBindingRow { nodes, edge: None, anchor })
                 })
@@ -2384,7 +2476,9 @@ impl<T: VectorType> crate::query::pipeline::PipelineOperator<T> for TqlMatchSour
                 (MATCH_ROW.into(), BindingValue::Bool(true)),
             ]);
             for node in &pattern.nodes {
-                if let Some(name) = &node.var {
+                if let Some(name) = &node.var
+                    && name != MATCH_ANCHOR
+                {
                     bindings.insert(
                         name.clone(),
                         source
@@ -2697,18 +2791,12 @@ impl<T: VectorType> crate::query::pipeline::PipelineOperator<T> for TqlNumericIn
     ) -> Result<crate::query::pipeline::NodeSet, TriviumError> {
         let mut rows = input.into_rows();
         for (field, value) in &self.equalities {
-            let mut allowed = HashSet::new();
-            let mut complete = true;
-            for key in numeric_equality_keys(value) {
-                let Some(ids) = context.memtable.find_by_property_index(field, &key) else {
-                    complete = false;
-                    break;
-                };
-                allowed.extend(ids);
-            }
-            // 只有完整的等价键并集才可缩小候选；最终谓词统一复核。
-            if complete {
-                rows.retain(|row| allowed.contains(&row.id));
+            let postings: Option<Vec<_>> = numeric_equality_keys(value)
+                .iter()
+                .map(|key| context.memtable.property_posting(field, key))
+                .collect();
+            if let Some(postings) = postings {
+                rows.retain(|row| postings.iter().any(|posting| posting.contains(row.id)));
             }
         }
         Ok(crate::query::pipeline::NodeSet::from_rows(rows))
@@ -2769,61 +2857,30 @@ fn eval_pipeline_row_expr<T: VectorType>(
             }
         }
         TqlExpr::Similarity { var } => BoundMetric::Similarity.value(row, var),
-        TqlExpr::GraphScore { .. } => row
-            .graph_score
-            .map(|score| RuntimeValue::Float(score.value))
-            .unwrap_or(RuntimeValue::Null),
-        TqlExpr::GraphMetric { metric, .. } => {
+        TqlExpr::Depth { var } => BoundMetric::Depth.value(row, var),
+        TqlExpr::GraphScore { var } => BoundMetric::GraphScore.value(row, var),
+        TqlExpr::TextScore { var } => BoundMetric::TextScore.value(row, var),
+        TqlExpr::DiversityScore { var } => BoundMetric::DiversityScore.value(row, var),
+        TqlExpr::ResidualScore { var } => BoundMetric::ResidualScore.value(row, var),
+        TqlExpr::Topic { var } => BoundMetric::Topic.value(row, var),
+        TqlExpr::TopicScore { var } => BoundMetric::TopicScore.value(row, var),
+        TqlExpr::Community { var } => BoundMetric::Community.value(row, var),
+        TqlExpr::PairLeft { var } => BoundMetric::PairLeft.value(row, var),
+        TqlExpr::PairRight { var } => BoundMetric::PairRight.value(row, var),
+        TqlExpr::GraphMetric { var, metric } => {
             crate::query::pipeline::graph_metric_from_name(metric)
-                .and_then(|metric| row.graph_metric(metric))
-                .map(|score| RuntimeValue::Float(score.value))
-                .unwrap_or(RuntimeValue::Null)
+                .map_or(RuntimeValue::Null, |metric| {
+                    BoundMetric::Graph(metric).value(row, var)
+                })
         }
-        TqlExpr::TextScore { .. } => row
-            .text_score
-            .map(|score| RuntimeValue::Float(score.value))
-            .unwrap_or(RuntimeValue::Null),
-        TqlExpr::DiversityScore { .. } => row
-            .diversity_score
-            .map(|score| RuntimeValue::Float(score.value))
-            .unwrap_or(RuntimeValue::Null),
-        TqlExpr::ResidualScore { .. } => row
-            .residual_score
-            .map(|score| RuntimeValue::Float(score.value))
-            .unwrap_or(RuntimeValue::Null),
-        TqlExpr::Topic { .. } => row
-            .topic_id
-            .map(|topic| RuntimeValue::Int(topic as i64))
-            .unwrap_or(RuntimeValue::Null),
-        TqlExpr::TopicScore { .. } => row
-            .topic_score
-            .map(|score| RuntimeValue::Float(score.value))
-            .unwrap_or(RuntimeValue::Null),
-        TqlExpr::Depth { .. } => row
-            .provenance
-            .min_depth
-            .map(|depth| RuntimeValue::Int(depth as i64))
-            .unwrap_or(RuntimeValue::Null),
         TqlExpr::PathStrength { var } => BoundMetric::PathStrength.value(row, var),
         TqlExpr::PathCount { var } => BoundMetric::PathCount.value(row, var),
-        TqlExpr::Community { .. } => row
-            .community_id
-            .map(runtime_u64)
-            .unwrap_or(RuntimeValue::Null),
         TqlExpr::Path { var } => BoundMetric::Path.value(row, var),
         TqlExpr::PathLength { var } => match BoundMetric::Path.value(row, var) {
             RuntimeValue::Path(path) => runtime_u64(path.len().saturating_sub(1) as u64),
             _ => RuntimeValue::Null,
         },
         TqlExpr::PathRank { var } => BoundMetric::PathRank.value(row, var),
-        TqlExpr::PairLeft { .. } => row
-            .pair
-            .map(|(left, _)| runtime_u64(left))
-            .unwrap_or(RuntimeValue::Null),
-        TqlExpr::PairRight { .. } => row
-            .pair
-            .map(|(_, right)| runtime_u64(right))
-            .unwrap_or(RuntimeValue::Null),
         TqlExpr::Binary { left, op, right } => eval_binary(
             eval_pipeline_row_expr(left, row, mt),
             *op,
@@ -2861,6 +2918,7 @@ fn eval_pipeline_row_predicate<T: VectorType>(
                 RuntimeValue::Node(id) => mt
                     .get_payload(id)
                     .is_some_and(|payload| filter.matches(&payload)),
+                RuntimeValue::Edge(edge) => filter.matches(&edge_json(&edge)),
                 RuntimeValue::Json(value) => filter.matches(&value),
                 _ => false,
             }

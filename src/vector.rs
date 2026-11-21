@@ -35,7 +35,9 @@ fn finish_cosine(dot: f32, norm_a: f32, norm_b: f32, a: &[f32], b: &[f32]) -> f3
         let denominator = norm_a.sqrt() * norm_b.sqrt();
         if denominator.is_normal() {
             let score = dot / denominator;
-            if score.is_finite() {
+            // 点积误差的上界与分量数和向量范数乘积成正比。严重抵消时用补偿点积复核。
+            if score.is_finite() && score.abs() > (a.len().min(b.len()) as f32 + 4.0) * f32::EPSILON
+            {
                 return score.clamp(-1., 1.);
             }
         }
@@ -49,16 +51,41 @@ fn cosine_similarity_wide(a: &[f32], b: &[f32]) -> f32 {
     cosine_components(a.iter().copied().zip(b.iter().copied()))
 }
 
+#[derive(Default)]
+pub(crate) struct CompensatedDot {
+    sum: f64,
+    residual: f64,
+}
+
+impl CompensatedDot {
+    #[inline]
+    pub(crate) fn add(&mut self, product: f64) {
+        let sum = self.sum + product;
+        self.residual += if self.sum.abs() >= product.abs() {
+            (self.sum - sum) + product
+        } else {
+            (product - sum) + self.sum
+        };
+        self.sum = sum;
+    }
+
+    #[inline]
+    pub(crate) fn value(self) -> f64 {
+        self.sum + self.residual
+    }
+}
+
 #[inline]
 fn cosine_components(components: impl Iterator<Item = (f32, f32)>) -> f32 {
-    let (mut dot, mut norm_a, mut norm_b) = (0f64, 0f64, 0f64);
+    let mut dot = CompensatedDot::default();
+    let (mut norm_a, mut norm_b) = (0f64, 0f64);
     for (a, b) in components {
         let (a, b) = (f64::from(a), f64::from(b));
-        dot += a * b;
+        dot.add(a * b);
         norm_a += a * a;
         norm_b += b * b;
     }
-    normalized_cosine(dot, norm_a, norm_b)
+    normalized_cosine(dot.value(), norm_a, norm_b)
 }
 
 #[inline]

@@ -152,6 +152,20 @@ fn Pelorus懒重建保留已发布曲率并恢复随后写入() {
             db.insert_with_id(id, &[id as f32 / 1024.0, 0.0], serde_json::json!(id))
                 .unwrap();
         }
+        let before = db.estimated_memory();
+        assert_eq!(
+            db.search_pelorus(&[0.0], &Default::default())
+                .unwrap_err()
+                .code(),
+            "TDB_DIMENSION_MISMATCH"
+        );
+        assert_eq!(
+            db.search_pelorus_batch(&[vec![0.0, 0.0], vec![1.0, 1.0]], &Default::default())
+                .unwrap_err()
+                .code(),
+            "TDB_INVALID_VECTOR"
+        );
+        assert_eq!(db.estimated_memory(), before);
         let context =
             RequestContext::with_timeout("pelorus-rebuild", std::time::Duration::ZERO, false)
                 .unwrap();

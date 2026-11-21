@@ -6,6 +6,16 @@
 
 ## 中文说明
 
+- 离线迁移在创建目录前排查源库制品名冲突。预检和复用核对已有目标布局及交付报告，预检失败时回收临时副本。已确认发布的目标在重试失败时仍返回已提交状态。
+- TQL 保留 MATCH 模式左端的节点身份、WITH 后的边谓词和各节点自己的图指标。排序函数可引用 RETURN 中的节点别名。向量与文本查询在执行前检查变量作用域，数值等值过滤直接查询索引成员身份。
+- 精确余弦在严重抵消时采用补偿点积，加权最短路径和 Yen 使用完整边权和比较候选。Pelorus 过滤、精确结果物化和文档来源标识复制在分配前申请实例与共享运行时额度。
+- Node 的 TQL 字符串入口拒绝孤立 UTF-16 代理项。Rust 底层 `VecPool::push`、`update`、`zero_out` 与全图 `pagerank` 返回 `Result`，直接调用这些接口时可用 `?` 传播错误。命名图使用已维护的默认图边数进行准入，Server 按唯一索引的提交结果推进全局 ETag。
+
+- 外部迁移工具支持带 Pelorus 配置的当前格式库，在 Rom 或 Mmap 目标上重建双曲索引。目录重命名后同步父目录失败时返回 `publish/unknown`，重试可确认目标并完成交付。
+- Console 将 JSON 数值直接舍入到目标浮点类型。CLI 以已有节点检索时读取原始 dtype 的向量，保留完整 u64 指纹。Pelorus 单条和批量查询在懒重建前校验维度、有限值及球内范围。
+- Leiden 在权重统一缩放时保持社区划分，自环在每层收缩后保留度数，重新计算质心会替换上次结果。图工作区准入覆盖四张邻接目录及缓冲增长，K-core 按度取点，加权最短路按完整路径字典序处理等距候选。
+- TQL 支持紧邻负数字面量的比较、比较两侧的括号标量及独立空值谓词。命名图写入在输入校验失败时报告 validation，文档分批发布先取得共享内存额度再复制上传状态。
+
 - TQL 按语句中的赋值次序更新跨匹配行重叠的节点。无显式排序的 MATCH 分页从模式左端按节点 ID 枚举。FIND 校验带前缀的变量引用，控制台的行上限适用于显式 LIMIT。交互式 CLI 通过语句解析器识别 MATCH 写入。
 - 旧代际回收记录通过校验的制品清单，文件占用解除后可继续清理。外部迁移工具通过主文件头核对已有目标的 Rom 或 Mmap 布局。
 - BFS 按层限制前沿，双向最短路按不同节点计费。子图 PageRank 和度中心性逐条计算平行边，拒绝缺失的成员，度中心性按节点数减一归一化，单节点分母为一。具名边匹配与全路径枚举逐边读取邻接表。
@@ -30,6 +40,16 @@
 ---
 
 ## English
+
+- Offline migration checks for source artifact name conflicts before creating a directory. Preflight and reuse validate the published layout and report. Failed preflight runs release their temporary copies. Retry errors preserve the committed outcome after publication is confirmed.
+- TQL preserves the left endpoint of MATCH, edge predicates after WITH, and metrics attached to each node binding. Sort functions resolve projected node aliases. Vector and text sources validate variable scope before execution. Numeric equality filters probe index membership directly.
+- Exact cosine uses a compensated dot product under severe cancellation. Weighted shortest paths and Yen compare full sums of edge weights. Pelorus filtering, exact result hydration, and document identity copies reserve instance and shared memory before allocation.
+- Node TQL rejects unpaired UTF-16 surrogates. The low-level Rust methods `VecPool::push`, `update`, `zero_out` and full-graph `pagerank` return `Result`. Direct callers can propagate errors with `?`. Named graph admission uses the maintained default graph edge count. Server advances the global ETag when a unique index change commits.
+
+- The migration tool reads current-format databases with Pelorus configuration and rebuilds the hyperbolic index in Rom or Mmap targets. A directory sync failure after rename reports `publish/unknown`. Retrying confirms the destination and completes publication.
+- The console rounds JSON numbers directly to the target floating-point type. CLI searches by node use the stored vector dtype and preserve all u64 fingerprint bits. Single and batch Pelorus queries validate dimensions, finite values and ball membership before a lazy rebuild.
+- Leiden preserves partitions under uniform weight scaling, retains self-loop degree during contraction and replaces centroids on recomputation. Graph workspace admission covers four adjacency directories and buffer growth. K-core selects by degree and weighted shortest paths break distance ties in full-path lexicographic order.
+- TQL supports comparisons adjacent to negative literals, parenthesized scalars on either side of a comparison and standalone null predicates. Named graph input errors report the validation phase. Document publication reserves shared memory before copying upload state.
 
 - TQL applies assignments in statement order when a node matches several roles. Unordered MATCH pagination enumerates anchors by ID from the left of the pattern. FIND validates qualified references. Explicit LIMIT clauses respect console session caps. The interactive CLI uses the statement parser to dispatch MATCH mutations.
 - Generation reclamation records the validated artifact list and resumes after file handles are released. The external migration tool checks the published file header before reusing a Rom or Mmap destination.

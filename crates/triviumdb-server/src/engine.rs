@@ -1535,7 +1535,7 @@ async fn process_write_batch(inner: &Arc<EngineInner>, mut batch: Vec<WriteComma
                 // 保留已经明确的操作错误；仅成功但尚未完成组同步的请求改为未知结果。
                 let outcome = match (outcome, &failure) {
                     (Ok(_), Some(error)) if !confirmed => Err(error.clone()),
-                    (Err(prior), Some(error)) if prior.awaiting_group_sync() => Err(error.clone()),
+                    (Err(prior), Some(error)) if prior.is_committed() => Err(error.clone()),
                     (outcome, _) => outcome,
                 };
                 let _ = response.send(outcome);
@@ -1648,49 +1648,18 @@ fn execute_write_inner(
             }))
         }
         WriteOperation::CreateIndex(request) => {
-            apply_index_change(database, &request, true)?;
-            versions.generation = versions.generation.saturating_add(1);
-            Ok(StoredWriteResult::Mutation(WriteResult {
-                mutation: MutationResponse {
-                    affected: 1,
-                    created_ids: Vec::new(),
-                },
-                version: versions.snapshot(),
-                replayed: false,
-            }))
-        }
-        WriteOperation::BuildPelorus(config) => {
-            let result = database.build_pelorus_index(config);
-            if result.as_ref().err().is_none_or(|error| {
-                error
-                    .info()
-                    .write
-                    .is_some_and(|write| write.outcome == triviumdb::error::WriteOutcome::Committed)
-            }) {
-                versions.generation = versions.generation.saturating_add(1);
-            }
-            result.map_err(ApiError::from)?;
-            Ok(StoredWriteResult::Mutation(WriteResult {
-                mutation: MutationResponse {
-                    affected: 1,
-                    created_ids: Vec::new(),
-                },
-                version: versions.snapshot(),
-                replayed: false,
-            }))
+            index_write_result(versions, apply_index_change(database, &request, true))
         }
         WriteOperation::DropIndex(request) => {
-            apply_index_change(database, &request, false)?;
-            versions.generation = versions.generation.saturating_add(1);
-            Ok(StoredWriteResult::Mutation(WriteResult {
-                mutation: MutationResponse {
-                    affected: 1,
-                    created_ids: Vec::new(),
-                },
-                version: versions.snapshot(),
-                replayed: false,
-            }))
+            index_write_result(versions, apply_index_change(database, &request, false))
         }
+        WriteOperation::BuildPelorus(config) => index_write_result(
+            versions,
+            database
+                .build_pelorus_index(config)
+                .map(|_| ())
+                .map_err(ApiError::from),
+        ),
         WriteOperation::Transaction(request) => {
             validate_transaction_preconditions(database, versions, &request)?;
             // 在借用事务前读取实际边，覆盖已持久化且尚未登记进版本表的关联边。
@@ -1794,6 +1763,28 @@ fn incident_edge_keys(database: &Database<f32>, id: u64) -> Result<Vec<EdgeKey>,
             .map(|edge| EdgeKey::new(edge.source_id, id, &edge.label)),
     );
     Ok(edges)
+}
+
+fn index_write_result(
+    versions: &mut VersionState,
+    result: Result<(), ApiError>,
+) -> Result<StoredWriteResult, ApiError> {
+    if result
+        .as_ref()
+        .err()
+        .is_none_or(|error| error.is_committed())
+    {
+        versions.generation = versions.generation.saturating_add(1);
+    }
+    result?;
+    Ok(StoredWriteResult::Mutation(WriteResult {
+        mutation: MutationResponse {
+            affected: 1,
+            created_ids: Vec::new(),
+        },
+        version: versions.snapshot(),
+        replayed: false,
+    }))
 }
 
 fn apply_index_change(
@@ -2128,6 +2119,59 @@ fn engine_stopped() -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "test-hooks")]
+    #[tokio::test]
+    async fn 唯一约束发布后清理失败仍推进全局版本() {
+        use triviumdb::test_hooks::{IoPoint, fail_io_at};
+        for create in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("constraint.tdb");
+            let mut db = Database::<f32>::open(path.to_str().unwrap(), 1).unwrap();
+            db.insert(&[1.], serde_json::json!({"key":"a"})).unwrap();
+            if !create {
+                db.create_unique_index("key").unwrap();
+            }
+            let mut versions = VersionState {
+                epoch: "constraint".into(),
+                generation: 3,
+                fine_grained_generation: 0,
+                node_versions: HashMap::new(),
+                edge_versions: HashMap::new(),
+                idempotency: IdempotencyCache::new(4),
+            };
+            let request = IndexRequest {
+                kind: IndexKind::Unique,
+                fields: vec!["key".into()],
+            };
+            let op = if create {
+                WriteOperation::CreateIndex(request)
+            } else {
+                WriteOperation::DropIndex(request)
+            };
+            let failure = fail_io_at(IoPoint::CheckpointWalClear);
+            let error = execute_write(
+                &mut db,
+                &mut versions,
+                op,
+                QueryControl::default(),
+                "index-etag",
+            )
+            .err()
+            .unwrap();
+            drop(failure);
+            assert_eq!(error_body(error).await["write"]["outcome"], "committed");
+            assert_eq!(versions.generation, 4);
+            drop(db);
+            let mut reopened = Database::<f32>::open(path.to_str().unwrap(), 1).unwrap();
+            let duplicate = reopened.insert(&[1.], serde_json::json!({"key":"a"}));
+            if create {
+                assert_eq!(duplicate.unwrap_err().code(), "TDB_UNIQUE_CONSTRAINT");
+            } else {
+                assert_eq!(duplicate.unwrap(), 2);
+            }
+        }
+    }
 
     #[cfg(feature = "test-hooks")]
     #[tokio::test]

@@ -648,7 +648,7 @@ fn Betweenness_采样模式() {
 fn PageRank_星形图_叶节点高于中心() {
     let mt = build_star_graph();
     let config = PageRankConfig::default();
-    let result = pagerank(&mt, &config, None);
+    let result = pagerank(&mt, &config, None).unwrap();
     let pr_map: HashMap<u64, f64> = result.into_iter().collect();
     assert!(
         pr_map[&1] < pr_map[&2],
@@ -660,7 +660,7 @@ fn PageRank_星形图_叶节点高于中心() {
 fn PageRank_总和收敛到1() {
     let mt = build_disconnected_graph();
     let config = PageRankConfig::default();
-    let result = pagerank(&mt, &config, None);
+    let result = pagerank(&mt, &config, None).unwrap();
     let total: f64 = result.iter().map(|(_, pr)| pr).sum();
     assert!(
         (total - 1.0).abs() < 0.01,
@@ -673,7 +673,7 @@ fn PageRank_总和收敛到1() {
 fn PageRank_空图() {
     let mt: MemTable<f32> = MemTable::new(DIM);
     let config = PageRankConfig::default();
-    let result = pagerank(&mt, &config, None);
+    let result = pagerank(&mt, &config, None).unwrap();
     assert!(result.is_empty());
 }
 
@@ -681,7 +681,7 @@ fn PageRank_空图() {
 fn PageRank_标签过滤() {
     let mt = build_disconnected_graph();
     let config = PageRankConfig::default();
-    let result = pagerank(&mt, &config, Some("knows"));
+    let result = pagerank(&mt, &config, Some("knows")).unwrap();
     let pr_map: HashMap<u64, f64> = result.into_iter().collect();
     assert!(
         pr_map[&3] > pr_map[&1],
@@ -693,7 +693,7 @@ fn PageRank_标签过滤() {
 fn PageRank_降序排列() {
     let mt = build_star_graph();
     let config = PageRankConfig::default();
-    let result = pagerank(&mt, &config, None);
+    let result = pagerank(&mt, &config, None).unwrap();
     for window in result.windows(2) {
         assert!(window[0].1 >= window[1].1, "PageRank 结果应按分数降序排列");
     }
@@ -706,7 +706,7 @@ fn 全图并列项按身份排序且零采样贡献为零() {
         mt.insert_with_id(id, &[0.], Default::default()).unwrap();
     }
     assert_eq!(
-        pagerank(&mt, &Default::default(), None),
+        pagerank(&mt, &Default::default(), None).unwrap(),
         [(1, 0.25), (2, 0.25), (7, 0.25), (9, 0.25)]
     );
     assert_eq!(
@@ -797,4 +797,28 @@ fn 质心精确抵消且实例配额在复制向量之前准入() {
         assert_eq!(center, &[1.; 256]);
     }
     db.close().unwrap();
+}
+
+#[test]
+fn 全图排名拒绝非法参数() {
+    let mt = build_star_graph();
+    for config in [
+        PageRankConfig {
+            damping: f64::NAN,
+            ..Default::default()
+        },
+        PageRankConfig {
+            max_iterations: 0,
+            ..Default::default()
+        },
+        PageRankConfig {
+            tolerance: 0.,
+            ..Default::default()
+        },
+    ] {
+        assert_eq!(
+            pagerank(&mt, &config, None).unwrap_err().code(),
+            "TDB_QUERY_EXECUTION"
+        );
+    }
 }

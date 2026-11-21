@@ -196,7 +196,7 @@ Python/Node 提供同步 JSON 调用入口。HTTP 或 IPC 包装、端口监听�
 }
 ```
 
-上面的写入要求宿主显式使用 `{"readOnly":false}`。协议显式节点 ID 字段以十进制字符串传入和返回，避免 JavaScript 精度丢失；TQL 整数字面量由内核解析，parameters 保留 TQL 的原生 JSON 参数规则。u64 向量分量以十进制字符串返回，大整数输入也必须使用字符串；f32/f16 向量使用 JSON 数字，入站统一经过内核 f32 转换通道，f16 再按 half 舍入；出站返回实际数值。Payload 保持 JSON 类型。
+上面的写入要求宿主显式使用 `{"readOnly":false}`。协议显式节点 ID 字段以十进制字符串传入和返回，避免 JavaScript 精度丢失。TQL 整数字面量由内核解析，parameters 保留 TQL 的原生 JSON 参数规则。u64 向量分量以十进制字符串返回，大整数输入也必须使用字符串。f32/f16 向量使用 JSON 数字，内核将解析后的数值直接舍入到目标 dtype，读取时返回实际存储值。Payload 保持 JSON 类型。
 
 > **精度提醒**：Payload 或参数包含大整数时，前端应采用无损 JSON 编解码。
 

@@ -323,7 +323,7 @@ pub struct ApiError {
 }
 
 impl ApiError {
-    pub(crate) fn awaiting_group_sync(&self) -> bool {
+    pub(crate) fn is_committed(&self) -> bool {
         self.write
             .is_some_and(|write| write.outcome == triviumdb::error::WriteOutcome::Committed)
     }

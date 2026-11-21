@@ -222,6 +222,47 @@ fn g1_链星团与自环边界图结果正确() {
 }
 
 #[test]
+fn 孤立节点也须为四张邻接目录准入() {
+    let mut mt = MemTable::<f32>::new(1);
+    let ids = (1..=20).collect::<BTreeSet<_>>();
+    for &id in &ids {
+        mt.insert_with_id(id, &[0.], json!(null)).unwrap();
+    }
+    let lower_bound = ids.len() * 4 * size_of::<(u64, Vec<u64>)>();
+    assert!(build_workspace(&mt, &ids, None, 0, lower_bound - 1).is_err());
+    let graph = build_workspace(&mt, &ids, None, 0, 64 * 1024).unwrap();
+    assert_eq!(k_core(&graph), ids.into_iter().map(|id| (id, 0)).collect());
+}
+
+#[test]
+fn 等距松弛按完整路径的首个分歧选择() {
+    let mut mt = MemTable::<f32>::new(1);
+    let ids = BTreeSet::from([2, 3, 4, 8, 9, 10]);
+    for &id in &ids {
+        mt.insert_with_id(id, &[0.], json!(null)).unwrap();
+    }
+    for (a, b, w) in [
+        (10, 9, 1.),
+        (10, 3, 1.),
+        (10, 2, 1.),
+        (3, 9, 0.),
+        (2, 9, 0.),
+        (2, 8, 0.),
+        (8, 9, 0.),
+        (8, 2, 0.),
+        (2, 4, 0.),
+        (8, 4, 0.),
+    ] {
+        mt.link(a, b, "r".into(), w).unwrap();
+    }
+    let g = build_workspace(&mt, &ids, None, 10, 64 * 1024).unwrap();
+    for (target, expected) in [(9, vec![10, 2, 8, 9]), (4, vec![10, 2, 4])] {
+        let path = weighted_dijkstra(&g, 10, target, 10).unwrap().unwrap();
+        assert_eq!((path.cost, path.nodes), (1., expected));
+    }
+}
+
+#[test]
 fn g2_无三角低度节点与_hits_参数预算边界正确() {
     let mut mt = MemTable::new(2);
     for id in 1..=3 {
@@ -899,4 +940,37 @@ fn 调和中心性与单轮_hits_按构图加实际邻接扫描计费() {
         assert_eq!(scores, [(1, 1.), (2, 0.)].into_iter().collect());
         assert_eq!(context.metrics[1].examined_edges, limit);
     }
+}
+
+#[test]
+fn 两条跨量级路径按完整边权之和排序() {
+    let mut graph = MemTable::<f32>::new(1);
+    let large = 2f32.powi(53);
+    let ids = BTreeSet::from([1, 2, 3, 4, 6]);
+    for &id in &ids {
+        graph.insert_with_id(id, &[0.], json!({})).unwrap();
+    }
+    for (src, dst, weight) in [
+        (1, 2, large),
+        (2, 3, 1.),
+        (3, 6, 1.),
+        (1, 4, large),
+        (4, 6, 0.),
+    ] {
+        graph.link(src, dst, "r".into(), weight).unwrap();
+    }
+    let view = build_workspace(&graph, &ids, None, 100, 1 << 20).unwrap();
+    let first = weighted_dijkstra(&view, 1, 6, 100).unwrap().unwrap();
+    assert_eq!((first.nodes, first.cost), (vec![1, 4, 6], f64::from(large)));
+    let paths = yen_k_shortest_paths(&view, 1, 6, 2, 100, 10).unwrap();
+    assert_eq!(
+        paths
+            .into_iter()
+            .map(|p| (p.nodes, p.cost))
+            .collect::<Vec<_>>(),
+        [
+            (vec![1, 4, 6], f64::from(large)),
+            (vec![1, 2, 3, 6], f64::from(large) + 2.)
+        ]
+    );
 }

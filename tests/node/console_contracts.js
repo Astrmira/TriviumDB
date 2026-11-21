@@ -126,7 +126,7 @@ function runConsoleContract(root, api = { TriviumDB, ConsoleSession }) {
       assert.deepEqual(node, { id: '1', vector: dtype === 'u64' ? ['1', '0'] : [1, 0], payload: { dtype }, edges: [] })
       if (dtype === 'f16') {
         const writable = new Session('{"readOnly":false}')
-        db.consoleRequest(writable, wire({ operation: 'importNodes', records: [{ id: '2', vector: [1.0007, 1.0004882812500002], payload: {} }] }))
+        db.consoleRequest(writable, wire({ operation: 'importNodes', records: [{ id: '2', vector: [1.0004882812500002, 1.0004882812499998], payload: {} }] }))
         assert.deepEqual(db.get(2).vector, [1.0009765625, 1])
       }
     } finally { db.close() }

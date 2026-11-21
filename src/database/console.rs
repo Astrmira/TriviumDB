@@ -1216,9 +1216,8 @@ fn decode_vector<T: VectorType + serde::de::DeserializeOwned>(
 ) -> Result<Vec<T>> {
     values.into_iter().map(|value| {
         if !crate::vector::is_binary_vector::<T>() {
-            let number=value.as_f64().ok_or_else(||invalid("浮点向量分量必须是数字 (Floating vector components must be numbers)"))?;
-            // 浮点入站复用内核 f32 通道；half 的 serde 位模式不属于公开数值协议。
-            return Ok(T::from_f32(number as f32));
+            let number=value.as_number().ok_or_else(||invalid("浮点向量分量必须是数字 (Floating vector components must be numbers)"))?;
+            return T::from_json_number(number);
         }
         let number=match value {
             Value::String(raw) if !raw.is_empty() && raw.bytes().all(|byte|byte.is_ascii_digit()) => raw.parse::<u64>().map_err(|_| invalid("u64 向量分量无效 (Invalid u64 vector component)"))?,

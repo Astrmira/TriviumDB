@@ -728,7 +728,7 @@ mod tests {
     #[test]
     fn test_hook_context() {
         let mut ctx = HookContext::new();
-        assert!(ctx.custom_data.is_null());
+        assert_eq!(ctx.custom_data, serde_json::json!({}));
         assert!(ctx.stage_timings.is_empty());
         assert!(!ctx.abort);
 
@@ -819,7 +819,7 @@ mod tests {
     #[test]
     fn test_hook_context_default() {
         let ctx = HookContext::default();
-        assert!(ctx.custom_data.is_null());
+        assert_eq!(ctx.custom_data, serde_json::json!({}));
         assert!(!ctx.abort);
     }
 
