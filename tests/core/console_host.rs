@@ -656,3 +656,23 @@ fn 图读取在过滤和复制之前按会话预算计费() {
     );
     db.close().unwrap();
 }
+
+#[test]
+fn 控制台显式行数上限由会话准入() {
+    let root = TestDir::new("console-explicit-limit");
+    let mut db = seed(root.file("data.tdb").as_str());
+    let session = ConsoleSession::from_json(r#"{"maxOperations":1}"#).unwrap();
+    for (query, count) in [
+        ("MATCH (n) RETURN n LIMIT 2", 2),
+        ("MATCH (n) RETURN n LIMIT 1 OFFSET 1", 1),
+    ] {
+        assert_eq!(db.tql_values(query).unwrap().len(), count);
+        let error = db
+            .console_request(
+                &session,
+                &request(json!({"operation":"query","query":query})),
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), "TDB_QUERY_BUDGET");
+    }
+}

@@ -81,7 +81,7 @@ PARAM_TYPES = {
 }
 # bulk name→type groups (space-separated names sharing one type)
 for _t, _names in {
-    "int": "max_threads max_active_tasks id src dst key depth expand_depth min_depth max_depth max_visited_nodes "
+    "int": "max_threads max_active_tasks id src dst key depth expand_depth min_depth max_depth max_visited_nodes max_frontier_size "
            "max_anchor_nodes parallelism additional mb interval_secs min_community_size "
            "max_iterations dim new_dim memory_limit_mb expected_nodes max_query_rows top_k recall_k rerank_k "
            "max_edges_per_node max_edges max_results seed payload_cache_mb payload_cache_entry_mb",

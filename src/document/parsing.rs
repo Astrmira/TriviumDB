@@ -704,7 +704,7 @@ fn markdown_hidden_end(raw: &str, start: usize) -> Result<Option<usize>> {
     let Token::StartTag(tag) = token else {
         return Ok(None);
     };
-    if tag.self_closing || !matches!(tag.name.as_slice(), b"script" | b"style" | b"template") {
+    if !matches!(tag.name.as_slice(), b"script" | b"style" | b"template") {
         return Ok(None);
     }
     let name = tag.name;
@@ -718,9 +718,7 @@ fn markdown_hidden_end(raw: &str, start: usize) -> Result<Option<usize>> {
             )
         })?;
         match token {
-            Token::StartTag(tag) if tag.name == name && !tag.self_closing => {
-                depth = depth.saturating_add(1)
-            }
+            Token::StartTag(tag) if tag.name == name => depth = depth.saturating_add(1),
             Token::EndTag(tag) if tag.name == name => {
                 depth -= 1;
                 if depth == 0 {
@@ -780,18 +778,15 @@ fn html_mapped(
                     })?
                     .to_owned();
                 if matches!(name.as_str(), "script" | "style" | "template") {
-                    if !tag.self_closing {
-                        let index =
-                            origins.partition_point(|(local, _)| local.end <= tag.span.start);
-                        let start = origins.get(index).map_or_else(
-                            || html_source_offset(origins, tag.span.start),
-                            |(local, source)| {
-                                source.start
-                                    + tag.span.start.saturating_sub(local.start).min(source.len())
-                            },
-                        );
-                        skipped.push((name.clone(), start));
-                    }
+                    let index = origins.partition_point(|(local, _)| local.end <= tag.span.start);
+                    let start = origins.get(index).map_or_else(
+                        || html_source_offset(origins, tag.span.start),
+                        |(local, source)| {
+                            source.start
+                                + tag.span.start.saturating_sub(local.start).min(source.len())
+                        },
+                    );
+                    skipped.push((name, start));
                     continue;
                 }
                 if !skipped.is_empty() {
@@ -926,16 +921,30 @@ fn json(writer: &mut Writer<'_>, lines: bool) -> Result<()> {
     }
     for range in ranges {
         crate::request::check_current()?;
-        serde_json::from_str::<serde_json::Value>(&raw[range.clone()]).map_err(|error| {
+        serde_json::from_str::<serde::de::IgnoredAny>(&raw[range.clone()]).map_err(|error| {
             invalid(
                 "content",
                 &format!("JSON材料无效 (Invalid JSON document): {error}"),
             )
         })?;
         let record = writer.open("record", None)?;
+        let mut depth = 0usize;
         let mut cursor = range.start;
         while cursor < range.end {
             let byte = raw.as_bytes()[cursor];
+            match byte {
+                b'{' | b'[' => {
+                    depth += 1;
+                    if depth >= 128 {
+                        return Err(invalid(
+                            "content",
+                            "JSON 嵌套过深 (JSON nesting limit exceeded)",
+                        ));
+                    }
+                }
+                b'}' | b']' => depth -= 1,
+                _ => {}
+            }
             if byte.is_ascii_whitespace() || matches!(byte, b'{' | b'}' | b'[' | b']' | b',' | b':')
             {
                 cursor += 1;

@@ -83,6 +83,7 @@ export interface JsReachabilityOptions {
   labels?: string[];
   direction?: ReachabilityDirection;
   maxVisitedNodes?: number;
+  maxFrontierSize?: number;
   maxResults?: number;
   maxEdges?: number;
 }

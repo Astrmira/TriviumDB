@@ -20,7 +20,7 @@ use memory::QueryMemory;
 
 use super::pipeline::BindingValue as RuntimeValue;
 use super::planner::{
-    AccessPath, NodeAccessPlan, plan_filter_with_limit, plan_match, plan_match_node_filter,
+    AccessPath, NodeAccessPlan, plan_filter_with_limit, plan_match_node_filter, plan_match_scan,
 };
 use super::tql_ast::*;
 use super::tql_source::{QueryOrigin, SourceSelector, TqlSource};
@@ -1916,13 +1916,22 @@ struct EdgeBindingRow<T> {
 }
 
 fn scoped_match_plan<T: VectorType>(
+    query: &TqlQuery,
     pattern: &TqlPattern,
     mt: &MemTable<T>,
     optional: bool,
     limits: &ExecutionContext,
 ) -> crate::query::planner::MatchPlan {
     let Some(scope) = &limits.graph else {
-        return plan_match(pattern, mt, optional);
+        let paged = query.limit.is_some()
+            || query.offset.is_some()
+            || matches!(
+                limits.row_overflow,
+                crate::database::RowOverflowPolicy::Break
+            );
+        let mut plan = plan_match_scan(pattern, mt, optional, !paged);
+        plan.candidates.sort_unstable();
+        return plan;
     };
     let graph = limits.graph(mt);
     let mut access = pattern
@@ -1930,7 +1939,7 @@ fn scoped_match_plan<T: VectorType>(
         .first()
         .and_then(|node| node.filter.as_ref())
         .map(|filter| plan_match_node_filter(filter, mt));
-    let candidates = match &mut access {
+    let mut candidates = match &mut access {
         Some(plan)
             if !matches!(
                 plan.access_path,
@@ -1942,6 +1951,7 @@ fn scoped_match_plan<T: VectorType>(
         }
         _ => graph.all_node_ids(),
     };
+    candidates.sort_unstable();
     crate::query::planner::MatchPlan {
         access_path: access
             .map(|plan| plan.access_path)
@@ -1982,7 +1992,7 @@ fn collect_single_edge_rows_inner<T: VectorType>(
     }
     let optional = matches!(query.entry, QueryEntry::OptionalMatch { .. });
     let graph = limits.graph(mt);
-    let plan = scoped_match_plan(pattern, mt, optional, limits);
+    let plan = scoped_match_plan(query, pattern, mt, optional, limits);
     let left = &plan.pattern.nodes[0];
     let right = &plan.pattern.nodes[1];
     let edge_pattern = &plan.pattern.edges[0];
@@ -2006,7 +2016,12 @@ fn collect_single_edge_rows_inner<T: VectorType>(
         limits,
         pipeline: None,
     };
-    let count_only = counts_match_rows(query) && query.predicate.is_none();
+    let count_only = counts_match_rows(query);
+    let mut predicate_vars = Vec::new();
+    if let Some(predicate) = &query.predicate {
+        let default_node = pattern.nodes.iter().find_map(|node| node.var.as_deref());
+        super::tql_parser::predicate_vars(predicate, &mut predicate_vars, false, default_node);
+    }
     let mut expanded = Vec::new();
     let mut budget = matching::WorkBudget::new(MAX_BUDGET, limits.query_control.as_ref());
     'anchors: for start in candidates {
@@ -2018,34 +2033,13 @@ fn collect_single_edge_rows_inner<T: VectorType>(
         {
             continue;
         }
-        // 与匿名边共享物理边枚举、取消和步数预算；排序保留具名边的确定性。
-        let mut edges = BTreeMap::new();
+        let mut matched = false;
         let mut neighbors = matching::Neighbors::new(&graph, start, edge_pattern.direction);
         while let Some((source, edge)) =
             neighbors.next(&graph, &edge_pattern.labels, &mut budget)?
         {
-            let bytes = edges
-                .len()
-                .saturating_add(1)
-                .saturating_mul(std::mem::size_of::<(NodeId, NodeId, &str)>())
-                .saturating_mul(4);
-            if limits.memory_limit > 0 && bytes > limits.memory_limit {
-                return Err(TriviumError::QueryRowBudgetExceeded {
-                    budget: edges.len(),
-                });
-            }
-            edges.insert(
-                (
-                    source,
-                    edge.target_id,
-                    edge.label.as_str(),
-                    graph.edge_graph_id(source, edge),
-                ),
-                edge,
-            );
-        }
-        let mut matched = false;
-        for ((source, target, _, graph_id), edge) in edges {
+            let target = edge.target_id;
+            let graph_id = graph.edge_graph_id(source, edge);
             let end = if source == start { target } else { source };
             if left.var.is_some() && left.var == right.var && start != end {
                 continue;
@@ -2058,54 +2052,74 @@ fn collect_single_edge_rows_inner<T: VectorType>(
                 continue;
             }
             let mut nodes = HashMap::new();
-            for (pattern, id) in [(left, start), (right, end)] {
-                if !count_only && let Some(var) = &pattern.var {
-                    nodes.insert(var.clone(), memory.snapshot(id, mt)?);
-                }
-            }
-            if count_only {
-                matched = true;
-                expanded.push(EdgeBindingRow {
-                    nodes,
-                    edge: None,
-                    anchor: start,
-                });
-                if expanded.len() > row_limit {
-                    break 'anchors;
-                }
-                continue;
-            }
-            memory.retain(
-                edge.label
+            let mut view = None;
+            if query.predicate.is_some() || !count_only {
+                let edge_bytes = edge
+                    .label
                     .len()
+                    .saturating_add(graph_id.map_or(0, str::len))
                     .saturating_add(crate::storage::payload_store::query_clone_peak(
                         &edge.metadata,
                     ))
-                    .saturating_add(256),
-            )?;
-            let view = EdgeView {
-                graph_id: graph_id.map(str::to_owned),
-                source_id: source,
-                target_id: target,
-                label: edge.label.clone(),
-                weight: edge.weight,
-                metadata: edge.metadata.clone(),
-            };
-            let input = returning::Input::Nodes(&nodes, Some((edge_var, &view)));
-            let default_node = pattern
-                .nodes
-                .iter()
-                .filter_map(|node| node.var.as_ref())
-                .find_map(|var| nodes.get(var));
-            if query.predicate.as_ref().is_some_and(|predicate| {
-                !returning::matches_predicate(predicate, &input, &scope, default_node)
-            }) {
-                continue;
+                    .saturating_add(256);
+                let edge_lease = memory.temporary(edge_bytes)?;
+                let candidate = EdgeView {
+                    graph_id: graph_id.map(str::to_owned),
+                    source_id: source,
+                    target_id: target,
+                    label: edge.label.clone(),
+                    weight: edge.weight,
+                    metadata: edge.metadata.clone(),
+                };
+                if let Some(predicate) = &query.predicate {
+                    // 谓词只访问端点身份与属性。候选的凭证随本次判定释放。
+                    let mut leases = Vec::new();
+                    for (endpoint, id) in [(left, start), (right, end)] {
+                        if let Some(var) = &endpoint.var
+                            && predicate_vars.contains(var)
+                        {
+                            leases.push(
+                                memory.temporary(mt.payload_query_peak(id)?.saturating_add(256))?,
+                            );
+                            let payload = mt
+                                .try_get_payload(id)?
+                                .ok_or(TriviumError::NodeNotFound(id))?;
+                            nodes.insert(
+                                var.clone(),
+                                Node {
+                                    id,
+                                    payload: (*payload).clone(),
+                                    vector: Vec::new(),
+                                    edges: Vec::new(),
+                                },
+                            );
+                        }
+                    }
+                    let input = returning::Input::Nodes(&nodes, Some((edge_var, &candidate)));
+                    let default_node = pattern
+                        .nodes
+                        .iter()
+                        .filter_map(|node| node.var.as_ref())
+                        .find_map(|var| nodes.get(var));
+                    if !returning::matches_predicate(predicate, &input, &scope, default_node) {
+                        continue;
+                    }
+                    nodes.clear();
+                }
+                if !count_only {
+                    edge_lease.retain();
+                    view = Some(candidate);
+                    for (endpoint, id) in [(left, start), (right, end)] {
+                        if let Some(var) = &endpoint.var {
+                            nodes.insert(var.clone(), memory.snapshot(id, mt)?);
+                        }
+                    }
+                }
             }
             matched = true;
             expanded.push(EdgeBindingRow {
                 nodes,
-                edge: Some(view),
+                edge: view,
                 anchor: start,
             });
             if expanded.len() > row_limit {
@@ -3133,7 +3147,7 @@ fn execute_match<T: VectorType>(
     }
 
     let graph = limits.graph(mt);
-    let match_plan = scoped_match_plan(pattern, mt, optional, limits);
+    let match_plan = scoped_match_plan(query, pattern, mt, optional, limits);
     let planned_pattern = &match_plan.pattern;
     let full_scan = matches!(
         match_plan.access_path,
@@ -4069,7 +4083,7 @@ fn generate_explain_plan<T: VectorType>(
             (planned.access_path, planned.estimated_rows, false)
         }
         QueryEntry::Match { pattern } => {
-            let planned = scoped_match_plan(pattern, mt, false, limits);
+            let planned = scoped_match_plan(query, pattern, mt, false, limits);
             (
                 planned.access_path,
                 planned.estimated_rows,
@@ -4077,7 +4091,7 @@ fn generate_explain_plan<T: VectorType>(
             )
         }
         QueryEntry::OptionalMatch { pattern } => {
-            let planned = scoped_match_plan(pattern, mt, true, limits);
+            let planned = scoped_match_plan(query, pattern, mt, true, limits);
             (planned.access_path, planned.estimated_rows, false)
         }
         QueryEntry::Search { .. } => search_filter.map_or_else(
@@ -4915,8 +4929,8 @@ fn execute_set<T: VectorType>(
 
     // 同一节点的多字段及重复字段赋值按文本顺序合并，只生成一次替换。
     let mut payloads = BTreeMap::new();
-    for row in &results {
-        for (index, assign) in assignments.iter().enumerate() {
+    for (index, assign) in assignments.iter().enumerate() {
+        for row in &results {
             (|| {
                 let node = row.get(&assign.var).ok_or_else(|| {
                     TriviumError::QueryExecution(format!(

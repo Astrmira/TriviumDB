@@ -582,7 +582,7 @@ fn wcc_度中心性和_brandes_与小图_reference_一致() {
         (three.out_degree, three.in_degree, three.total_degree),
         (2, 1, 3)
     );
-    assert!((three.normalized - 0.25).abs() < 1e-12);
+    assert!((three.normalized - 0.5).abs() < 1e-12);
 
     let chain = BTreeSet::from([1, 2, 3]);
     let centrality = subset_betweenness(&mt, &chain, Some("x"), None, 100).unwrap();

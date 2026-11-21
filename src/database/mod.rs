@@ -3657,17 +3657,25 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
             false,
         )?;
         let _scope = context.enter()?;
-        self.prepare_quiver_rerank_with_source(&query, prepared.source().as_ref())?;
-        let mt = read_or_recover(&self.memtable);
         let mut limits = self.tql_limits.clone();
         limits.query_control = Some(control);
         if let Some(budget) = row_budget {
-            limits.max_query_rows = Some(match limits.max_query_rows {
+            let ceiling = match limits.max_query_rows {
                 Some(current) if current > 0 => current.min(budget),
                 _ => budget,
-            });
+            };
+            if let Some(limit) = query.limit
+                && limit
+                    .checked_add(query.offset.unwrap_or(0))
+                    .is_none_or(|rows| rows > ceiling)
+            {
+                return Err(TriviumError::QueryRowBudgetExceeded { budget: ceiling });
+            }
+            limits.max_query_rows = Some(ceiling);
             limits.row_overflow = RowOverflowPolicy::Throw;
         }
+        self.prepare_quiver_rerank_with_source(&query, prepared.source().as_ref())?;
+        let mt = read_or_recover(&self.memtable);
         crate::query::tql_executor::execute_tql_values_with_source(
             &query,
             &mt,

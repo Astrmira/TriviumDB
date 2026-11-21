@@ -261,6 +261,8 @@ generations/
 
 `open_current()` 在解析 current 与获取代际共享租约期间持有管理共享锁，避免与切代或回收竞态。`GenerationReader` 在整个生命周期持有外部 runtime 共享租约。`reclaim_generation()` 取得排他租约后，校验当前库可用、回收目标是有效的旧代际且只包含该代际的数据库制品，然后删除旧目录。
 
+回收期间，库根目录保存旧代际的制品清单，并将已校验的目录原子移入回收区。文件被占用时，释放句柄后可用同一代际 ID 重试。回收完成后该名称可再次使用。`.tdb-reclaim-` 前缀由代际管理器保留。
+
 租约写入独立 runtime 目录，generation root 保持只读。默认 runtime 位于系统临时目录的 `triviumdb-runtime/store-<hash>`，也可使用 `GenerationStore::with_runtime_dir(root, runtime_dir)` 指定可写位置。
 
 构造时固定相对根目录和运行目录的绝对位置；默认锁空间在根目录存在后按规范路径解析，根目录创建前后的 Store 共享租约。跨进程参与者使用一致的规范根路径与运行目录配置；跨容器将运行目录设为共享可写挂载，并保持根目录挂载路径一致。Reader 存活期间保持根目录位置稳定。升级时先结束旧版本 Reader 进程，再恢复旧代回收。
@@ -724,6 +726,8 @@ const paths = db.reachable(1, {
 `labels=None` 或省略表示全部 label，空列表表示禁止遍历。`min_depth=0` 可让源节点作为深度 0 结果返回。三个预算分别限制访问节点、结果和扫描边；详细接口在超限时保留已完成结果并设置 `truncated=true`。
 
 `max_edges` 在读取邻接表时扣减，`traversed_edges` 包含因标签、端点或去重而舍弃的扫描记录。出边按目标 ID 和标签扫描，反向来源按源 ID 扫描。详细结果只包含预算范围内已发现的路径。
+
+Rust 与 Python 使用 `max_frontier_size`，Node.js 使用 `maxFrontierSize`。该参数限制 BFS 每层新发现的节点数，默认 10,000。Python 的 `reachable`、`reachable_detailed` 和 `query_subgraph` 均接受这个关键字，Node.js 的对应方法通过遍历选项传入。
 
 - Rust：`reachable_detailed()`、`query_subgraph()`
 - Python：`reachable_detailed()`、`query_subgraph()`
@@ -1332,6 +1336,10 @@ WITH 按行保存求值结果与实体身份，后续扩展、过滤和返回使
 MATCH 内联 `id` 和节点的 `.id` 属性使用完整无符号节点 ID；`FIND` 与 `MATCHES` 文档条件读取 Payload 字段。单跳边变量在 WHERE、RETURN、COALESCE、聚合和空值判断中保持边绑定；OPTIONAL MATCH 为符合起点条件且无合格边的记录补齐 Null 列。
 
 MATCH 按物理边保留结果行重数：不同标签的平行边分别计行，双向单跳中的同一自环计一次；属性索引与反向计划保持这一语义。路径采用显式栈执行，有边模式的节点、邻边扫描、路径展开和回溯共享 100,000 步预算，每步检查取消与期限；路径栈和 visited 集合的峰值参与工作区准入。
+
+无显式排序的 `MATCH … LIMIT/OFFSET` 从模式左端按起点 ID 升序枚举。具名边与匿名边使用相同的物理边遍历顺序。`MATCH … SET` 按赋值在语句中的书写次序处理全部匹配行。同一节点通过多个角色命中同一字段时，取最后一项适用赋值。
+
+`FIND` 中的裸字段和 `_.字段` 读取当前节点。显式变量前缀须在当前作用域内定义。`ORDER BY` 还可以引用投影列名或别名，例如 `RETURN _.nested AS picked ORDER BY picked.rank`。
 
 **Python：**
 ```python

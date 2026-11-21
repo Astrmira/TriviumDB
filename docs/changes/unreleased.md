@@ -6,6 +6,11 @@
 
 ## 中文说明
 
+- TQL 按语句中的赋值次序更新跨匹配行重叠的节点。无显式排序的 MATCH 分页从模式左端按节点 ID 枚举。FIND 校验带前缀的变量引用，控制台的行上限适用于显式 LIMIT。交互式 CLI 通过语句解析器识别 MATCH 写入。
+- 旧代际回收记录通过校验的制品清单，文件占用解除后可继续清理。外部迁移工具通过主文件头核对已有目标的 Rom 或 Mmap 布局。
+- BFS 按层限制前沿，双向最短路按不同节点计费。子图 PageRank 和度中心性逐条计算平行边，拒绝缺失的成员，度中心性按节点数减一归一化，单节点分母为一。具名边匹配与全路径枚举逐边读取邻接表。
+- HTML 与 Markdown 正文过滤使用自闭合拼写的 script、style 和 template 元素。JSON 与 JSONL 文档保留大指数数值的原文。
+
 - FIND 分页排序按实际投影列解析，直接查询与 Prepared 查询共用排序语义。普通投影将每行字符串字面量计入查询内存预算。空成员列表按常量条件规划，索引建议按解析后的字段名生成。
 - Server 的节点与边 NDJSON 导入支持幂等重试和版本前置条件。Writer 按请求剩余期限决定是否等待合批。JSON 与 NDJSON 对混合类型列统一返回 mixed。边分页按稳定顺序计数，仅复制当前页的元数据。Server 启动时验证数据库路径可用 UTF-8 表示。
 - 文档零宽选区返回空正文和空来源范围。Python 和 Node 局部更新边时可显式清空元数据。Hash 索引在映射与堆加载模式下均拒绝重复键。专用属性查询在确认结果超限时停止核验。
@@ -25,6 +30,11 @@
 ---
 
 ## English
+
+- TQL applies assignments in statement order when a node matches several roles. Unordered MATCH pagination enumerates anchors by ID from the left of the pattern. FIND validates qualified references. Explicit LIMIT clauses respect console session caps. The interactive CLI uses the statement parser to dispatch MATCH mutations.
+- Generation reclamation records the validated artifact list and resumes after file handles are released. The external migration tool checks the published file header before reusing a Rom or Mmap destination.
+- BFS limits each frontier layer. Bidirectional shortest paths count distinct visited nodes. Induced PageRank and degree centrality count parallel edges and reject missing members. Degree centrality divides by the node count minus one, using one for a singleton. Named-edge matching and all-paths traversal stream adjacency lists.
+- HTML and Markdown extraction skips the contents of script, style and template elements written with a self-closing slash. JSON and JSONL document ingestion preserves numeric literals with large exponents.
 
 - FIND pagination resolves ordering against the actual projection for both direct and prepared queries. Node projections account for string literals per row. Empty membership predicates produce constant decisions, and index advice uses parsed field names.
 - Node and edge NDJSON imports honor idempotency keys and generation preconditions. The writer uses the remaining request deadline when deciding whether to wait for a batch. JSON and NDJSON label heterogeneous columns as mixed. Edge pagination counts in stable order and copies metadata only for the requested page. The server validates that its database path can be represented in UTF-8 before opening it.

@@ -104,6 +104,7 @@ pub enum IoPoint {
     ServerVersionRefresh,
     PublicationRetireJournal,
     GenerationPointerDirectorySync,
+    GenerationArtifactRemoved,
     TextMetadataWrite,
     PropertySidecarWrite,
     GraphSidecarWrite,

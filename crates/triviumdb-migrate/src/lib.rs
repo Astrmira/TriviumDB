@@ -375,6 +375,13 @@ pub fn run_controlled(
     }
     if previous {
         let _published_lease = Lease::published(&report.database)?;
+        if triviumdb::storage::file_format::read_database_layout(utf8(&report.database)?)?.2 != mode
+        {
+            return Err(Failure::new(
+                "TDB_MIGRATION_CONFLICT",
+                "已有目标的存储模式与请求不符 (Published storage mode differs from requested mode)",
+            ));
+        }
         files::finish_publication(&report.database, &owner)?;
         if inspect_typed(&report.database, dtype, dimension, options.memory_bytes)? != expected {
             return Err(Failure::new(

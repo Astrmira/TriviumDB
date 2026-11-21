@@ -542,3 +542,80 @@ fn canonical(
     result.sort();
     result
 }
+
+#[test]
+fn 分页按模式起点取行且重叠赋值按文本次序持久化() {
+    for indexed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("rows.tdb");
+        let file = file.to_str().unwrap();
+        let mut db = Database::<f32>::open(file, 1).unwrap();
+        for id in 1..=6 {
+            db.insert_with_id(id, &[1.], json!({"kind":if id <= 4 { "t" } else { "x" }}))
+                .unwrap();
+        }
+        for (a, b) in [(1, 4), (2, 3), (4, 1), (3, 2)] {
+            db.link(a, b, "r", 1.).unwrap();
+        }
+        if indexed {
+            db.create_index("kind").unwrap();
+        }
+        for edge in [":r", "e:r"] {
+            for (offset, ids) in [(0, (1, 4)), (1, (2, 3))] {
+                let query = format!(
+                    "MATCH (a)-[{edge}]->(b {{kind:'t'}}) RETURN a, b LIMIT 1 OFFSET {offset}"
+                );
+                let rows = db.tql_values(&query).unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(
+                    (
+                        rows[0]["a"].as_node().unwrap().id,
+                        rows[0]["b"].as_node().unwrap().id
+                    ),
+                    ids
+                );
+            }
+        }
+        db.tql_mut("MATCH (a)-[:r]->(b {kind:'t'}) SET a.side == 'src', b.side == 'dst'")
+            .unwrap();
+        db.close().unwrap();
+        let db = Database::<f32>::open_read_only(file, 1).unwrap();
+        for id in 1..=4 {
+            assert_eq!(db.get(id).unwrap().unwrap().payload["side"], "dst");
+        }
+        assert!(
+            db.tql_values("FIND {kind:'missing'} RETURN typo.x")
+                .is_err()
+        );
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn 单跳分页按需扫描且失败谓词释放端点额度() {
+    use triviumdb::query::{
+        tql_executor::{TqlLimits, TqlValue, execute_tql_values_with_limits},
+        tql_parser::parse_tql,
+    };
+    let mut mt = MemTable::<f32>::new(1);
+    for id in 1..=65 {
+        mt.insert_with_id(id, &[1.], json!({})).unwrap();
+    }
+    for id in 2..=65 {
+        mt.link(1, id, "r".into(), 1.).unwrap();
+    }
+    let before = mt.id_materializations();
+    let page = parse_tql("MATCH (a)-[]->(b) RETURN b LIMIT 1").unwrap();
+    let rows = execute_tql_values_with_limits(&page, &mt, Default::default()).unwrap();
+    assert_eq!(rows[0]["b"].as_node().unwrap().id, 2);
+    assert_eq!(mt.id_materializations(), before);
+    let count =
+        parse_tql("MATCH (a {id:1})-[e:r]->(b) WHERE e.weight > 2 RETURN COUNT(*) AS n").unwrap();
+    let limits = TqlLimits {
+        memory_limit: mt.estimated_memory_bytes() + 64 * 1024,
+        ..Default::default()
+    };
+    let rows = execute_tql_values_with_limits(&count, &mt, limits).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(rows[0]["n"], TqlValue::Int(0)));
+}

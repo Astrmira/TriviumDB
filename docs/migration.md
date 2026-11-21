@@ -91,7 +91,7 @@ python scripts/migrate.py --source /data/legacy.tdb --source-dtype f32 --destina
 
 提交点是将已同步的候选目录原子、排他地重命名为目标目录。候选包含 `database.tdb.migration` 发布标记，普通 SDK 看到它会拒绝打开。目录发布后，工具取得目标数据库共享锁、复核制品清单、移除并同步标记，再用当前 SDK 重开核验。该顺序适配 Windows 目录重命名与文件锁规则。
 
-发布前中断保留来源和归属明确的暂存目录；发布后中断保留已提交目标及发布标记。使用相同来源和目标重新执行原命令，工具重新转换来源副本、核对归属和目标事实后完成确认。已经成功发布且事实相同的重试返回 `reused: true`。
+发布前中断保留来源和归属明确的暂存目录。发布后中断保留已提交目标及发布标记。使用相同来源和目标重新执行原命令时，工具核对归属、目标事实和主文件头中的存储布局。三者一致时返回 `reused: true`。向同一目标请求另一种布局会返回 `TDB_MIGRATION_CONFLICT`。需要另一份 Rom 或 Mmap 库时，指定新的目标目录。
 
 > **重试提醒**：已存在的其他目录、归属不匹配、目标已被业务修改或目标制品损坏均保留现场并返回错误。保留协调锁文件；直接删除正在使用的锁文件会破坏进程间互斥。
 
@@ -108,7 +108,7 @@ python scripts/migrate.py --source /data/legacy.tdb --source-dtype f32 --destina
 | `TDB_MIGRATION_LEASE_REQUIRED` | 检查模式缺少既有来源锁文件 |
 | `TDB_MIGRATION_BUDGET` | 来源数量、字节或工作空间预算不足 |
 | `TDB_MIGRATION_TARGET_EXISTS` | 目标存在且归属不匹配 |
-| `TDB_MIGRATION_CONFLICT` | 来源摘要变化、暂存归属冲突或已交付事实变化 |
+| `TDB_MIGRATION_CONFLICT` | 来源摘要变化、暂存归属冲突、已交付事实变化或请求的存储布局与目标文件头不符 |
 | `TDB_MIGRATION_UNSUPPORTED_SOURCE` | 工具支持范围外的来源格式 |
 | `TDB_MIGRATION_DTYPE_REQUIRED` | 无类型头的旧空检查点需要宿主显式确认 dtype |
 | `TDB_DATABASE_LOCKED` | 来源/目标正在使用或等待发布确认 |

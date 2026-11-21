@@ -182,7 +182,7 @@ fn FIND_带LIMIT_OFFSET() {
 
 #[test]
 fn FIND_带ORDER_BY() {
-    let q = parse_tql(r#"FIND {type: "event"} RETURN * ORDER BY a.score DESC LIMIT 5"#).unwrap();
+    let q = parse_tql(r#"FIND {type: "event"} RETURN * ORDER BY _.score DESC LIMIT 5"#).unwrap();
     assert_eq!(q.order_by.len(), 1);
     assert!(q.order_by[0].descending);
     assert_eq!(q.limit, Some(5));

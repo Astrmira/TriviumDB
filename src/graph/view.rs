@@ -214,6 +214,18 @@ impl ScopedGraph {
                 }
             }
         }
+        // 合并图只排序一次，同时移动来源身份，保留同端点的各条物理边。
+        for (source, edges) in &mut view.outgoing {
+            let identities = view.identities.get_mut(source).expect("每条边都有来源槽位");
+            let mut entries: Vec<_> = edges.drain(..).zip(identities.drain(..)).collect();
+            entries.sort_unstable_by(|(a, ga), (b, gb)| {
+                (a.target_id, &a.label, ga).cmp(&(b.target_id, &b.label, gb))
+            });
+            for (edge, identity) in entries {
+                edges.push(edge);
+                identities.push(identity);
+            }
+        }
         for sources in view.incoming.values_mut() {
             sources.sort_unstable();
             sources.dedup();

@@ -2676,18 +2676,19 @@ fn merge_create_node(
     Ok(())
 }
 
-fn collect_return_kind_vars(kind: &ReturnExprKind, output: &mut Vec<String>) {
+fn collect_return_kind_vars(kind: &ReturnExprKind, output: &mut Vec<String>, bare_fields: bool) {
     match kind {
-        ReturnExprKind::Var(var) if var != "*" => output.push(var.clone()),
+        ReturnExprKind::Var(var) if var != "*" && !bare_fields => output.push(var.clone()),
         ReturnExprKind::Property(var, _) => output.push(var.clone()),
-        ReturnExprKind::Scalar(expr) => collect_expr_vars(expr, output),
-        ReturnExprKind::Aggregate(_, inner) => collect_return_kind_vars(inner, output),
+        ReturnExprKind::Scalar(expr) => collect_expr_vars(expr, output, bare_fields),
+        ReturnExprKind::Aggregate(_, inner) => collect_return_kind_vars(inner, output, bare_fields),
         ReturnExprKind::Var(_) => {}
     }
 }
 
-fn collect_expr_vars(expr: &TqlExpr, output: &mut Vec<String>) {
+fn collect_expr_vars(expr: &TqlExpr, output: &mut Vec<String>, bare_fields: bool) {
     match expr {
+        TqlExpr::Variable(_) if bare_fields => {}
         TqlExpr::Variable(var)
         | TqlExpr::Property { var, .. }
         | TqlExpr::Similarity { var }
@@ -2708,32 +2709,37 @@ fn collect_expr_vars(expr: &TqlExpr, output: &mut Vec<String>) {
         | TqlExpr::PairLeft { var }
         | TqlExpr::PairRight { var } => output.push(var.clone()),
         TqlExpr::Binary { left, right, .. } => {
-            collect_expr_vars(left, output);
-            collect_expr_vars(right, output);
+            collect_expr_vars(left, output, bare_fields);
+            collect_expr_vars(right, output, bare_fields);
         }
         TqlExpr::Coalesce(values) => {
             for value in values {
-                collect_expr_vars(value, output);
+                collect_expr_vars(value, output, bare_fields);
             }
         }
-        TqlExpr::IsNull { expr, .. } => collect_expr_vars(expr, output),
+        TqlExpr::IsNull { expr, .. } => collect_expr_vars(expr, output, bare_fields),
         TqlExpr::Parameter(_) | TqlExpr::Literal(_) => {}
     }
 }
 
-fn predicate_vars(predicate: &Predicate, output: &mut Vec<String>) {
+pub(super) fn predicate_vars(
+    predicate: &Predicate,
+    output: &mut Vec<String>,
+    bare_fields: bool,
+    default_node: Option<&str>,
+) {
     match predicate {
         Predicate::Compare { left, right, .. } => {
-            collect_expr_vars(left, output);
-            collect_expr_vars(right, output);
+            collect_expr_vars(left, output, bare_fields);
+            collect_expr_vars(right, output, bare_fields);
         }
         Predicate::DocFilter { var: Some(var), .. } => output.push(var.clone()),
-        Predicate::DocFilter { var: None, .. } => {}
+        Predicate::DocFilter { var: None, .. } => output.extend(default_node.map(str::to_owned)),
         Predicate::And(left, right) | Predicate::Or(left, right) => {
-            predicate_vars(left, output);
-            predicate_vars(right, output);
+            predicate_vars(left, output, bare_fields, default_node);
+            predicate_vars(right, output, bare_fields, default_node);
         }
-        Predicate::Not(inner) => predicate_vars(inner, output),
+        Predicate::Not(inner) => predicate_vars(inner, output, bare_fields, default_node),
     }
 }
 
@@ -2769,7 +2775,7 @@ fn expression_reference(expr: &TqlExpr, variable: &str) -> Option<SourcePath> {
         }
         _ => {
             let mut variables = Vec::new();
-            collect_expr_vars(expr, &mut variables);
+            collect_expr_vars(expr, &mut variables, false);
             variables.iter().any(|name| name == variable).then(Vec::new)
         }
     }
@@ -2845,6 +2851,14 @@ fn validate_pipeline_scope_origin(
             QueryEntry::Documents { .. } | QueryEntry::Pelorus { .. }
         )
     {
+        if matches!(query.entry, QueryEntry::Find { .. }) {
+            return validate_final_scope(
+                query,
+                ["_".to_owned()].into(),
+                Default::default(),
+                origin,
+            );
+        }
         let pattern = match &query.entry {
             QueryEntry::Match { pattern } | QueryEntry::OptionalMatch { pattern } => pattern,
             _ => return Ok(()),
@@ -2875,7 +2889,7 @@ fn validate_pipeline_scope_origin(
                 for (item_index, item) in with.items.iter().enumerate() {
                     *origin = Some(SourceSelector::WithItem(stage_index, item_index));
                     let mut variables = Vec::new();
-                    collect_expr_vars(&item.expr, &mut variables);
+                    collect_expr_vars(&item.expr, &mut variables, false);
                     if let Some(var) = variables
                         .iter()
                         .find(|var| !scope.contains(*var) && !scalar_aliases.contains(*var))
@@ -3010,7 +3024,7 @@ fn validate_pipeline_scope_origin(
             }
             PipelineStage::Filter(predicate) => {
                 let mut vars = Vec::new();
-                predicate_vars(predicate, &mut vars);
+                predicate_vars(predicate, &mut vars, false, None);
                 if let Some(var) = vars
                     .into_iter()
                     .find(|var| !scope.contains(var) && !scalar_aliases.contains(var))
@@ -3045,6 +3059,7 @@ fn validate_final_scope(
     scalar_aliases: std::collections::BTreeSet<String>,
     origin: &mut Option<SourceSelector>,
 ) -> Result<(), String> {
+    let bare_fields = query.pipeline.is_empty() && matches!(query.entry, QueryEntry::Find { .. });
     if let Some(rank) = &query.rank {
         let edge_variable = match &query.entry {
             QueryEntry::Match { pattern } | QueryEntry::OptionalMatch { pattern } => pattern
@@ -3078,44 +3093,37 @@ fn validate_final_scope(
     };
     if let Some(predicate) = &query.predicate {
         let mut referenced = Vec::new();
-        predicate_vars(predicate, &mut referenced);
+        predicate_vars(predicate, &mut referenced, bare_fields, None);
         check(referenced, SourceSelector::Predicate)?;
     }
     match &query.returns {
         ReturnClause::Variables(vars) => {
-            for (index, var) in vars.iter().enumerate() {
+            for (index, var) in vars.iter().enumerate().filter(|_| !bare_fields) {
                 check(vec![var.clone()], SourceSelector::ReturnItem(index))?;
             }
         }
         ReturnClause::Expressions(expressions) => {
             for (index, expression) in expressions.iter().enumerate() {
                 let mut referenced = Vec::new();
-                match &expression.kind {
-                    ReturnExprKind::Var(var) | ReturnExprKind::Property(var, _) => {
-                        referenced.push(var.clone());
-                    }
-                    ReturnExprKind::Scalar(expr) => collect_expr_vars(expr, &mut referenced),
-                    ReturnExprKind::Aggregate(_, inner) => {
-                        collect_return_kind_vars(inner, &mut referenced);
-                    }
-                }
+                collect_return_kind_vars(&expression.kind, &mut referenced, bare_fields);
                 check(referenced, SourceSelector::ReturnItem(index))?;
             }
         }
         ReturnClause::All => {}
     }
     // RETURN 的别名在排序阶段可见，WHERE 与 RETURN 求值仍使用输入作用域。
-    let return_aliases = match &query.returns {
+    let return_aliases: std::collections::BTreeSet<String> = match &query.returns {
         ReturnClause::Expressions(items) => items
             .iter()
-            .filter_map(|item| item.alias.as_ref())
-            .collect::<std::collections::BTreeSet<_>>(),
-        _ => std::collections::BTreeSet::new(),
+            .map(super::tql_executor::return_column_name)
+            .collect(),
+        ReturnClause::Variables(vars) => vars.iter().cloned().collect(),
+        ReturnClause::All => Default::default(),
     };
     for (index, order) in query.order_by.iter().enumerate() {
         *origin = Some(SourceSelector::Order(index));
         let mut ordered = Vec::new();
-        collect_expr_vars(&order.expr, &mut ordered);
+        collect_expr_vars(&order.expr, &mut ordered, bare_fields);
         if let Some(var) = ordered.into_iter().find(|var| {
             !final_scope.contains(var)
                 && !scalar_aliases.contains(var)

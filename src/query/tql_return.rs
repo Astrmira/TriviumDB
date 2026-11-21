@@ -185,13 +185,7 @@ fn expression<T: VectorType>(
             }
         }
         TqlExpr::Property { var, field } => {
-            let node = nodes.get(var).or_else(|| {
-                if matches!(scope.query.entry, QueryEntry::Find { .. }) {
-                    nodes.get("_")
-                } else {
-                    None
-                }
-            });
+            let node = nodes.get(var);
             node.map_or(RuntimeValue::Null, |node| {
                 if field == "id" {
                     runtime_u64(node.id)

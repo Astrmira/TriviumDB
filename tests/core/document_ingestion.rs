@@ -1260,3 +1260,25 @@ fn 共享JSON入口服从实例配额且拒绝后立即可重试() {
         );
     }
 }
+
+#[test]
+fn 隐藏元素和大指数标量按文档语法提取() {
+    let directory = TestDir::new("parser_scalar_boundaries");
+    let mut db = Database::<f32>::open(&directory.file("db.tdb"), 2).unwrap();
+    for source in ["doc.html", "doc.md"] {
+        for tag in ["script", "template", "style"] {
+            let raw = format!("甲<{tag}/>隐藏</{tag}>乙");
+            let parsed = parse(&mut db, source, &raw);
+            assert_eq!(parsed["text"].as_str().unwrap().trim(), "甲乙");
+        }
+    }
+    for source in ["doc.json", "doc.jsonl"] {
+        assert_eq!(
+            parse(&mut db, source, "[1e400,-1e999]")["text"]
+                .as_str()
+                .unwrap()
+                .trim(),
+            "1e400\n-1e999"
+        );
+    }
+}

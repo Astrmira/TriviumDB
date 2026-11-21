@@ -159,7 +159,8 @@ pub(crate) fn shortest_path_bidirectional_view<T: VectorType>(
                     (&mut backward, &forward)
                 };
                 if let std::collections::hash_map::Entry::Vacant(entry) = own.entry(neighbor) {
-                    if metrics.visited_nodes >= budget.max_visited_nodes {
+                    let newly_visited = !other.contains_key(&neighbor);
+                    if newly_visited && metrics.visited_nodes >= budget.max_visited_nodes {
                         if exhausted(budget, BudgetDimension::VisitedNodes, metrics)? {
                             truncated = true;
                         }
@@ -179,7 +180,7 @@ pub(crate) fn shortest_path_bidirectional_view<T: VectorType>(
                         break;
                     }
                     entry.insert((current_depth + 1, Some(current)));
-                    metrics.visited_nodes += 1;
+                    metrics.visited_nodes += usize::from(newly_visited);
                     metrics.depth_reached = metrics.depth_reached.max(current_depth + 1);
                     next_frontier.push(neighbor);
                     metrics.peak_frontier_size = metrics.peak_frontier_size.max(next_size);
@@ -449,7 +450,7 @@ pub(crate) fn bounded_all_paths_view<T: VectorType>(
         },
         truncated: false,
     };
-    let mut stack = vec![path_frame(mt, src, dst, config, budget, &mut state)?.into_iter()];
+    let mut stack = vec![path_frame(mt, src, dst, config, budget, &mut state)?.iter()];
     while !state.truncated {
         control.check()?;
         let Some(frame) = stack.last_mut() else { break };
@@ -490,7 +491,7 @@ pub(crate) fn bounded_all_paths_view<T: VectorType>(
         state.nodes.push(edge.target_id);
         state.weights.push(edge.weight);
         state.labels.push(edge.label.clone());
-        stack.push(path_frame(mt, edge.target_id, dst, config, budget, &mut state)?.into_iter());
+        stack.push(path_frame(mt, edge.target_id, dst, config, budget, &mut state)?.iter());
     }
     state
         .results
@@ -550,7 +551,7 @@ fn path_frame<'a, T: VectorType>(
     config: &BoundedPathConfig,
     budget: &TraversalBudget,
     state: &mut BoundedPathState,
-) -> Result<Vec<&'a crate::node::Edge>> {
+) -> Result<&'a [crate::node::Edge]> {
     let depth = state.weights.len();
     state.metrics.depth_reached = state.metrics.depth_reached.max(depth);
     if current == dst {
@@ -559,11 +560,11 @@ fn path_frame<'a, T: VectorType>(
             .as_ref()
             .is_some_and(|labels| labels.len() != depth)
         {
-            return Ok(Vec::new());
+            return Ok(&[]);
         }
         if state.results.len() == config.max_paths {
             state.truncated = true;
-            return Ok(Vec::new());
+            return Ok(&[]);
         }
         state.results.push(BoundedPath {
             nodes: state.nodes.clone(),
@@ -580,7 +581,7 @@ fn path_frame<'a, T: VectorType>(
                 sum.into_f32(state.weights.len())
             },
         });
-        return Ok(Vec::new());
+        return Ok(&[]);
     }
     if depth >= config.max_depth
         || config
@@ -588,22 +589,15 @@ fn path_frame<'a, T: VectorType>(
             .as_ref()
             .is_some_and(|labels| labels.len() == depth)
     {
-        return Ok(Vec::new());
+        return Ok(&[]);
     }
     let outgoing = mt.get_edges(current).unwrap_or_default();
     if outgoing.len() > budget.max_frontier_size {
         state.truncated = exhausted(budget, BudgetDimension::FrontierSize, state.metrics)?;
-        return Ok(Vec::new());
+        return Ok(&[]);
     }
     state.metrics.peak_frontier_size = state.metrics.peak_frontier_size.max(outgoing.len());
-    let mut edges = outgoing.iter().collect::<Vec<_>>();
-    edges.sort_by(|left, right| {
-        left.target_id
-            .cmp(&right.target_id)
-            .then_with(|| left.label.cmp(&right.label))
-            .then_with(|| left.weight.total_cmp(&right.weight))
-    });
-    Ok(edges)
+    Ok(outgoing)
 }
 
 /// 全路径枚举：找到从 src 到 dst 的所有路径（不允许环路）

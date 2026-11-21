@@ -296,8 +296,24 @@ pub fn plan_match<T: VectorType>(
     mt: &MemTable<T>,
     optional: bool,
 ) -> MatchPlan {
+    let mut plan = plan_match_scan(pattern, mt, optional, true);
+    if matches!(
+        plan.access_path,
+        AccessPath::FullNodeScan | AccessPath::ColdPayloadScan
+    ) {
+        plan.candidates = mt.all_node_ids();
+    }
+    plan
+}
+
+pub(crate) fn plan_match_scan<T: VectorType>(
+    pattern: &TqlPattern,
+    mt: &MemTable<T>,
+    optional: bool,
+    allow_reverse: bool,
+) -> MatchPlan {
     if optional {
-        let mut forward = if pattern.nodes[0].filter.is_some() {
+        let forward = if pattern.nodes[0].filter.is_some() {
             plan_pattern_start(pattern, mt)
         } else {
             NodeAccessPlan {
@@ -306,7 +322,6 @@ pub fn plan_match<T: VectorType>(
                 candidates: Vec::new(),
             }
         };
-        materialize_full_scan(&mut forward, mt);
         return MatchPlan {
             access_path: forward.access_path,
             estimated_rows: forward.estimated_rows,
@@ -316,7 +331,7 @@ pub fn plan_match<T: VectorType>(
         };
     }
 
-    let mut forward = plan_pattern_start(pattern, mt);
+    let forward = plan_pattern_start(pattern, mt);
     let can_reverse_improve = pattern
         .nodes
         .last()
@@ -330,8 +345,10 @@ pub fn plan_match<T: VectorType>(
             candidates: forward.candidates,
         };
     }
-    if pattern.edges.iter().any(|edge| edge.hop_range.is_some()) || !can_reverse_improve {
-        materialize_full_scan(&mut forward, mt);
+    if pattern.edges.iter().any(|edge| edge.hop_range.is_some())
+        || !can_reverse_improve
+        || !allow_reverse
+    {
         return MatchPlan {
             access_path: forward.access_path,
             estimated_rows: forward.estimated_rows,
@@ -342,12 +359,11 @@ pub fn plan_match<T: VectorType>(
     }
 
     let reversed_pattern = reverse_pattern(pattern);
-    let mut backward = plan_pattern_start(&reversed_pattern, mt);
+    let backward = plan_pattern_start(&reversed_pattern, mt);
     let reverse_is_better = backward.estimated_rows < forward.estimated_rows
         || (backward.estimated_rows == forward.estimated_rows
             && access_path_key(&backward.access_path) < access_path_key(&forward.access_path));
     if reverse_is_better {
-        materialize_full_scan(&mut backward, mt);
         MatchPlan {
             access_path: backward.access_path,
             estimated_rows: backward.estimated_rows,
@@ -356,7 +372,6 @@ pub fn plan_match<T: VectorType>(
             candidates: backward.candidates,
         }
     } else {
-        materialize_full_scan(&mut forward, mt);
         MatchPlan {
             access_path: forward.access_path,
             estimated_rows: forward.estimated_rows,
@@ -409,18 +424,12 @@ pub(crate) fn plan_match_node_filter<T: VectorType>(
         };
     }
     match payload_candidate_filter(filter) {
-        Some(filter) => plan_filter(&filter, mt),
+        Some(filter) => plan_filter_with_limit(&filter, Some(usize::MAX), mt),
         None => NodeAccessPlan {
             access_path: AccessPath::FullNodeScan,
             estimated_rows: mt.node_count(),
             candidates: Vec::new(),
         },
-    }
-}
-
-fn materialize_full_scan<T: VectorType>(plan: &mut NodeAccessPlan, mt: &MemTable<T>) {
-    if matches!(plan.access_path, AccessPath::FullNodeScan) && plan.candidates.is_empty() {
-        plan.candidates = mt.all_node_ids();
     }
 }
 

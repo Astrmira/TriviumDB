@@ -232,6 +232,12 @@ fn header_vector_type(bytes: &[u8]) -> Result<(u16, &'static str, usize)> {
 
 /// 检查当前格式的完整文件头，返回格式版本和维度。
 pub fn read_database_header(path: &str) -> Result<(u16, usize)> {
+    let (version, dimension, _) = read_database_layout(path)?;
+    Ok((version, dimension))
+}
+
+/// 从已校验的主文件头读取实际向量布局。
+pub fn read_database_layout(path: &str) -> Result<(u16, usize, StorageMode)> {
     use std::io::{ErrorKind, Read};
     let mut file = File::open(path)?;
     let mut bytes = [0u8; HEADER_SIZE as usize];
@@ -258,7 +264,16 @@ pub fn read_database_header(path: &str) -> Result<(u16, usize)> {
             "数据库文件头的维度无效 (Invalid dimension in database header)".into(),
         ));
     }
-    Ok((version, dim))
+    let offset = read_u64_le(&bytes, 34, "vector_offset")?;
+    Ok((
+        version,
+        dim,
+        if offset == 0 {
+            StorageMode::Mmap
+        } else {
+            StorageMode::Rom
+        },
+    ))
 }
 
 /// 发布恢复写入前核对可信基础文件的类型；备份向量使用独立路径。
