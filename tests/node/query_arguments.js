@@ -108,7 +108,7 @@ async function runQueryArguments(root, { TriviumDB }) {
       assert.throws(() => db.searchGraphFirst([1, 0], [7], null), invalid('topK'))
       for (const [action, write] of [[value => db.tql(value)], [value => db.prepareTql(value)],
         [value => db.tqlMut(value), { phase: 'validation', outcome: 'not_committed' }]]) {
-        for (const value of [null, undefined, 1, true, {}, [], 1n, Symbol('query')]) {
+        for (const value of [null, undefined, 1, true, {}, [], 1n, Symbol('query'), "CREATE (n {s:'\ud800'})"]) {
           assert.throws(() => action(value), invalid('query', write))
         }
         let coercions = 0

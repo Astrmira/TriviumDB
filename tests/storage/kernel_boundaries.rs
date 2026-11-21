@@ -53,6 +53,41 @@ fn config(mode: StorageMode) -> Config {
     }
 }
 
+#[test]
+fn 检查点写量逐次累计并区分向量追加与不变文件() {
+    let sample = Sample::new();
+    let path = sample.path();
+    let mut db = Database::<f32>::open_with_config(&path, config(StorageMode::Mmap)).unwrap();
+    let size = |suffix: &str| std::fs::metadata(format!("{path}{suffix}")).unwrap().len();
+    for step in 0..3 {
+        if step != 1 {
+            db.insert_with_id(step + 1, &[1., 2.], json!({"n":step}))
+                .unwrap();
+        }
+        let before = db.storage_write_stats();
+        db.flush().unwrap();
+        let after = db.storage_write_stats();
+        let payload = std::fs::read_dir(&sample.0)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .find(|entry| entry.file_name().to_string_lossy().contains(".pld."))
+            .unwrap();
+        let expected = size("")
+            + size(".flush_ok")
+            + payload.metadata().unwrap().len()
+            + if step == 1 { 0 } else { 8 };
+        assert_eq!(after.checkpoint_bytes - before.checkpoint_bytes, expected);
+        assert!(after.sidecar_bytes > before.sidecar_bytes);
+        assert!(after.wal_bytes > before.wal_bytes);
+        assert_eq!(after.logical_bytes, before.logical_bytes);
+    }
+    let before = db.storage_write_stats();
+    db.close().unwrap();
+    assert_eq!(db.storage_write_stats(), before);
+    let db = Database::<f32>::open_read_only(&path, 2).unwrap();
+    assert_eq!(db.storage_write_stats(), Default::default());
+}
+
 fn dtype_case<T: VectorType + serde::Serialize + serde::de::DeserializeOwned>(
     stored: &'static str,
     vector: &[T],

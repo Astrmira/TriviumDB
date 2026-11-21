@@ -1,6 +1,6 @@
 # TriviumDB 测试实践
 
-> 本文说明 TriviumDB `0.9.3-beta.1` 的测试组织、契约设计、故障注入与验收证据。版本记录见[变更说明](changes/0.9.3-beta.1.md)，后续进展见[未发布变更](changes/unreleased.md)。
+> 本文说明 TriviumDB `0.9.3` 的测试组织、契约设计、故障注入与验收证据。版本记录见[变更说明](changes/0.9.3.md)，后续进展见[未发布变更](changes/unreleased.md)。
 
 ---
 
@@ -42,7 +42,7 @@ SDK 应用边界见[正式接口清单](sdk-contract.md)，独立离线转换与
 ```bash
 cargo fmt --manifest-path crates/triviumdb-migrate/Cargo.toml --all -- --check
 cargo clippy --locked --manifest-path crates/triviumdb-migrate/Cargo.toml --target-dir target/migration --all-targets -- -D warnings
-cargo test --locked --manifest-path crates/triviumdb-migrate/Cargo.toml --target-dir target/migration -- --test-threads=1
+cargo test --locked --manifest-path crates/triviumdb-migrate/Cargo.toml --target-dir target/migration --features test-hooks -- --test-threads=1
 ```
 
 `tests/fixtures/release_090` 由不可变 `v0.9.0` 源码生成，记录逐文件 SHA-256 与独立内容预期；`release_091` 使用 `v0.9.1` 源码生成解析文档、来源映射、命名图和持久回执。离线用例核对三种 dtype、Rom/Mmap、已确认 WAL、未提交事务与截断尾帧、文本、唯一约束、边元数据、源文件零写、目标冲突、预算和发布前后进程退出后的重试。当前 SDK 的三端错误契约检查历史身份返回 `TDB_MIGRATION_REQUIRED`，且打开拒绝保留源文件、无需创建锁；混合组件用例在三种访问模式下检查相同准入边界。
@@ -56,6 +56,8 @@ cargo test --locked --manifest-path crates/triviumdb-migrate/Cargo.toml --target
 ---
 
 ## 近期契约验收
+
+命名图预算回归记录默认图邻接表的读取次数，同时核对额度恰好足够时的共享节点和独立边。查询内存套件在堆索引与重新打开的 mmap 索引上执行数值等值过滤，核对完整结果、实际执行的过滤算子及查询线程的峰值分配。
 
 `cargo test --features test-hooks --lib index::quiver::runtime -- --test-threads=1` 验证压缩冷热运行时与 SSD 单文件制品。独立 QVSSD 2／QUIV 2／QDSM 1 样例核对完整元数据、节点和分数，覆盖逐字节损坏、所有截断、重算 CRC 后的恶意字段、完整冷行交换、墓碑 slot 复用、只读字节、并发位置读取、旧 Reader 跨代读取、局部及共享配额、持有行后关闭和 Windows 文件释放。受控 Hook 覆盖读取前后取消、在途额度、发布前取消、写入／同步／重命名失败及目录同步后的未知完成点。提交点强杀父用例显式运行隔离子进程，核对旧制品或完整新制品的查询内容，并再次发布和重新打开；子进程入口按专用环境运行。
 

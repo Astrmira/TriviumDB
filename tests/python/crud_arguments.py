@@ -233,6 +233,11 @@ def run_crud_arguments(root):
             db.link(7, 11)
             db.unlink(7, 11, "related")
             db.upsert_edge(7, 11, "route", metadata={"part": "新增"})
+            db.update_edge(7, 11, "route", weight=0.5)
+            assert db.get_edge(7, 11, "route").metadata == {"part": "新增"}
+            db.update_edge(7, 11, "route", metadata=None)
+            assert db.get_edge(7, 11, "route").metadata is None
+            assert db.get_edge(7, 11, "route").weight == 0.5
             db.update_edge(7, 11, "route", 0.25, {"part": "更新"})
             db.delete(29)
             assert db.delete_many_atomic(tuple(automatic)) == 3

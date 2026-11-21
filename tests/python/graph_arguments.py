@@ -210,6 +210,8 @@ def run_graph_arguments(root):
             assert db.query_subgraph(7) == dict(nodes=subgraph["nodes"][:2], edges=case["edges"][:1],
                 visited_nodes=2, traversed_edges=1, truncated=False)
             assert Path(file + ".wal").read_bytes() == before
+            limited = db.reachable_detailed(11, direction="both", max_frontier_size=1)
+            assert limited["truncated"] and [row["target_id"] for row in limited["results"]] == [7]
             db.update_vector([0, 1], 7)
         finally:
             db.close()

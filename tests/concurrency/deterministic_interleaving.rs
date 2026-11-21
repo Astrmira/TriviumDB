@@ -303,7 +303,7 @@ fn 显式连续视图交错_发布前读取阻塞释放后结果完整() {
         32,
     )
     .unwrap();
-    pool.push(&[33.0, 1.0, 0.0, 0.0]);
+    pool.push(&[33.0, 1.0, 0.0, 0.0]).unwrap();
     let pool = std::sync::Arc::new(std::sync::RwLock::new(pool));
     let writer = std::sync::Arc::clone(&pool);
     let waiter = pause_at(ConcurrencyPoint::BeforeMergedCachePublish);

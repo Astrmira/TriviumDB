@@ -104,20 +104,20 @@ fn mmap直接连续视图零堆副本_混合层按需合并后正确失效和转
     let dir = TestDir::new();
     let path = dir.file("vectors.vec");
     let mut pool = VecPool::<f32>::new(3);
-    pool.push(&[1., 2., 3.]);
-    pool.push(&[4., 5., 6.]);
+    pool.push(&[1., 2., 3.]).unwrap();
+    pool.push(&[4., 5., 6.]).unwrap();
     pool.flush(std::path::Path::new(&path)).unwrap();
     pool.ensure_cache();
     assert_eq!(pool.flat_vectors(), &[1., 2., 3., 4., 5., 6.]);
     assert_eq!(pool.heap_memory_bytes(), 0);
-    pool.push(&[7., 8., 9.]);
+    pool.push(&[7., 8., 9.]).unwrap();
     let (base, delta) = pool.vector_segments();
     assert_eq!(base, &[1., 2., 3., 4., 5., 6.]);
     assert_eq!(delta, &[7., 8., 9.]);
     let delta_heap = pool.heap_memory_bytes();
     pool.ensure_cache();
     assert!(pool.heap_memory_bytes() > delta_heap);
-    pool.update(0, &[9., 2., 3.]);
+    pool.update(0, &[9., 2., 3.]).unwrap();
     assert_eq!(pool.heap_memory_bytes(), delta_heap, "写入应释放已失效副本");
     assert_eq!(pool.vector_segments().0[0], 9.);
     let disk = std::fs::read(&path).unwrap();
@@ -205,7 +205,7 @@ fn 分段映射支持FP16和u64的长度与对齐() {
         let dir = TestDir::new();
         let mut pool = VecPool::<T>::new(65);
         let vector = vec![T::from_f32(1.); 65];
-        pool.push(&vector);
+        pool.push(&vector).unwrap();
         let path = dir.file("typed.vec");
         pool.flush(std::path::Path::new(&path)).unwrap();
         pool.ensure_cache();
@@ -214,7 +214,7 @@ fn 分段映射支持FP16和u64的长度与对齐() {
             bytemuck::cast_slice::<T, u8>(&vector)
         );
         assert_eq!(pool.heap_memory_bytes(), 0);
-        pool.push(&vector);
+        pool.push(&vector).unwrap();
         assert_eq!(pool.vector_segments().0.len(), 65);
         assert_eq!(pool.vector_segments().1.len(), 65);
     }
@@ -227,10 +227,10 @@ fn 未物化混合层直接转Rom保留COW和增量() {
     let dir = TestDir::new();
     let path = dir.file("detach.vec");
     let mut pool = VecPool::<f32>::new(3);
-    pool.push(&[1., 2., 3.]);
+    pool.push(&[1., 2., 3.]).unwrap();
     pool.flush(std::path::Path::new(&path)).unwrap();
-    pool.update(0, &[4., 5., 6.]);
-    pool.push(&[7., 8., 9.]);
+    pool.update(0, &[4., 5., 6.]).unwrap();
+    pool.push(&[7., 8., 9.]).unwrap();
     pool.detach_mmap();
     assert_eq!(pool.flat_vectors(), &[4., 5., 6., 7., 8., 9.]);
     assert!(pool.vector_segments().0.is_empty());
@@ -256,13 +256,13 @@ fn 冷页回收保留COW更新与增量并可落盘重开() {
     let dir = TestDir::new();
     let path = dir.file("cold-pages.vec");
     let mut pool = VecPool::<f32>::new(3);
-    pool.push(&[1., 2., 3.]);
-    pool.push(&[4., 5., 6.]);
+    pool.push(&[1., 2., 3.]).unwrap();
+    pool.push(&[4., 5., 6.]).unwrap();
     pool.flush(std::path::Path::new(&path)).unwrap();
     pool.advise_dontneed();
     assert_eq!(pool.get(0).unwrap(), &[1., 2., 3.]);
-    pool.update(0, &[7., 8., 9.]);
-    pool.push(&[10., 11., 12.]);
+    pool.update(0, &[7., 8., 9.]).unwrap();
+    pool.push(&[10., 11., 12.]).unwrap();
     pool.advise_dontneed();
     assert_eq!(pool.get(0).unwrap(), &[7., 8., 9.]);
     assert_eq!(pool.get(1).unwrap(), &[4., 5., 6.]);
@@ -344,4 +344,22 @@ fn wal与检查点索引恢复从开始遵守禁用解析缓存的配置() {
     check::<f32>();
     check::<half::f16>();
     check::<u64>();
+}
+
+#[test]
+fn 向量池拒绝错误维度后记录边界保持完整() {
+    let mut pool = VecPool::<f32>::new(2);
+    assert!(matches!(
+        pool.push(&[1.]),
+        Err(triviumdb::TriviumError::DimensionMismatch {
+            expected: 2,
+            got: 1
+        })
+    ));
+    pool.push(&[2., 3.]).unwrap();
+    assert!(pool.update(0, &[7., 8., 9.]).is_err());
+    assert!(pool.zero_out(usize::MAX).is_err());
+    assert_eq!(pool.total_count(), 1);
+    assert_eq!(pool.get(0), Some(&[2., 3.][..]));
+    assert_eq!(pool.get(usize::MAX), None);
 }

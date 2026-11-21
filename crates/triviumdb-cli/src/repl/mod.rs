@@ -86,14 +86,20 @@ fn run_tql(input: &str, handle: &mut DbHandle, format: OutputFormat) {
     let start = Instant::now();
 
     // 先做带位置的预校验，错误时渲染 caret 诊断
-    if is_mutation(query) {
-        if let Err(err) = triviumdb::query::tql_parser::parse_tql_statement_with_pos(query) {
+    let statement = match triviumdb::query::tql_parser::parse_tql_statement_with_pos(query) {
+        Ok(statement) => statement,
+        Err(err) => {
             eprint!(
                 "{}",
                 crate::diagnostics::Diagnostic::from_parse_error(query, &err).render_ansi()
             );
             return;
         }
+    };
+    if matches!(
+        statement,
+        triviumdb::query::tql_ast::TqlStatement::Mutation(_)
+    ) {
         match handle.tql_mut(query) {
             Ok(s) => {
                 let flush = handle.flush();
@@ -114,13 +120,6 @@ fn run_tql(input: &str, handle: &mut DbHandle, format: OutputFormat) {
             Err(e) => eprintln!("{} {e}", "错误 / Error:".red()),
         }
     } else {
-        if let Err(err) = triviumdb::query::tql_parser::parse_tql_with_pos(query) {
-            eprint!(
-                "{}",
-                crate::diagnostics::Diagnostic::from_parse_error(query, &err).render_ansi()
-            );
-            return;
-        }
         match handle.tql(query) {
             Ok(rows) => {
                 let n = rows.len();
@@ -133,14 +132,6 @@ fn run_tql(input: &str, handle: &mut DbHandle, format: OutputFormat) {
             Err(e) => eprintln!("{} {e}", "错误 / Error:".red()),
         }
     }
-}
-
-/// 通过首关键词粗判是否为写操作。
-fn is_mutation(query: &str) -> bool {
-    let up = query.trim_start().to_ascii_uppercase();
-    ["CREATE", "SET", "DELETE", "DETACH", "MERGE", "REMOVE"]
-        .iter()
-        .any(|kw| up.starts_with(kw))
 }
 
 /// 处理点号元命令，返回 `true` 表示请求退出。

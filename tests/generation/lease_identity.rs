@@ -177,3 +177,82 @@ fn 默认租约跨进程和构造后工作目录变化仍保护旧代() {
     before.reclaim_generation("generation-1").unwrap();
     assert!(!root.join("generation-1").exists());
 }
+
+#[cfg(windows)]
+#[test]
+fn 文件解除占用后可由新的代际管理器继续回收() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let parent = TestDir::new("generation_reclaim_resume");
+    let store = GenerationStore::new(&parent.0);
+    for generation in ["old", "current"] {
+        publish(&store, generation, 1.);
+        store.publish_current(generation, "data.tdb").unwrap();
+    }
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(3)
+        .open(parent.0.join("old/data.tdb"))
+        .unwrap();
+    assert!(matches!(
+        store.reclaim_generation("old"),
+        Err(TriviumError::Io(_))
+    ));
+    assert!(matches!(
+        store.prepare_generation("old", "data.tdb"),
+        Err(TriviumError::GenerationBusy { .. })
+    ));
+    drop(held);
+    let reopened = GenerationStore::new(&parent.0);
+    reopened.reclaim_generation("old").unwrap();
+    reopened.reclaim_generation("old").unwrap();
+    assert!(!parent.0.join("old").exists());
+    assert_eq!(
+        reopened
+            .open_current::<f32>(2)
+            .unwrap()
+            .get(1)
+            .unwrap()
+            .unwrap()
+            .payload["generation"],
+        "current"
+    );
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn 旧代部分删除后重建管理器可完成回收并复用名称() {
+    let parent = TestDir::new("generation_resume_after_remove");
+    let store = GenerationStore::new(&parent.0);
+    for generation in ["g1", "g2"] {
+        publish(&store, generation, 1.);
+        store.publish_current(generation, "data.tdb").unwrap();
+    }
+    let current = artifacts(&parent.0.join("g2"));
+    {
+        use triviumdb::test_hooks::{IoPoint, fail_io_at};
+        let _fault = fail_io_at(IoPoint::GenerationArtifactRemoved);
+        assert!(matches!(
+            store.reclaim_generation("g1"),
+            Err(TriviumError::Io(_))
+        ));
+    }
+    let reopened = GenerationStore::new(&parent.0);
+    assert!(matches!(
+        reopened.prepare_generation("g1", "data.tdb"),
+        Err(TriviumError::GenerationBusy { .. })
+    ));
+    reopened.reclaim_generation("g1").unwrap();
+    assert_eq!(artifacts(&parent.0.join("g2")), current);
+    publish(&reopened, "g1", 0.);
+    reopened.publish_current("g1", "data.tdb").unwrap();
+    assert_eq!(
+        reopened
+            .open_current::<f32>(2)
+            .unwrap()
+            .get(1)
+            .unwrap()
+            .unwrap()
+            .vector,
+        vec![0., 1.]
+    );
+}

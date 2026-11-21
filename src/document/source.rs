@@ -212,27 +212,44 @@ impl DocumentSource {
         }
         Ok(())
     }
+    // 映射连续且按解析偏移排序，预算和证据内容共享同一组非空交集。
+    fn selected_ranges(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> impl Iterator<
+        Item = (
+            &DocumentSourceMapEntry,
+            std::ops::Range<usize>,
+            std::ops::Range<usize>,
+        ),
+    > {
+        let first = self
+            .mappings
+            .partition_point(|entry| entry.text_end <= start);
+        self.mappings[first..]
+            .iter()
+            .take_while(move |entry| start < end && entry.text_start < end)
+            .map(move |entry| {
+                let text = start.max(entry.text_start)..end.min(entry.text_end);
+                let source = if entry.kind == SourceMapKind::Exact {
+                    entry.source_start + (text.start - entry.text_start)
+                        ..entry.source_start + (text.end - entry.text_start)
+                } else {
+                    entry.source_start..entry.source_end
+                };
+                (entry, text, source)
+            })
+    }
+
     pub(crate) fn span_charge(&self, parsed: &str, start: usize, end: usize) -> Result<usize> {
         check_range(parsed, start, end, "reference")?;
         let source = self.text(parsed);
         let mut bytes = 0usize;
-        for entry in self
-            .mappings
-            .iter()
-            .skip_while(|entry| entry.text_end <= start)
-            .take_while(|entry| entry.text_start < end)
-        {
+        for (entry, _, range) in self.selected_ranges(start, end) {
             crate::request::check_current()?;
-            let (first, last) = if entry.kind == SourceMapKind::Exact {
-                (
-                    entry.source_start + start.max(entry.text_start) - entry.text_start,
-                    entry.source_start + end.min(entry.text_end) - entry.text_start,
-                )
-            } else {
-                (entry.source_start, entry.source_end)
-            };
             let text = source
-                .get(first..last)
+                .get(range)
                 .ok_or_else(|| invalid("source.mappings", "来源范围无效 (Invalid source range)"))?;
             bytes = bytes
                 .saturating_add(512)
@@ -250,31 +267,20 @@ impl DocumentSource {
         end: usize,
     ) -> Result<Vec<DocumentSourceSpan>> {
         check_range(parsed, start, end, "reference")?;
+        if start == end {
+            return Ok(Vec::new());
+        }
         let source = self.text(parsed);
         let mut spans = Vec::new();
         let mut boundaries = std::collections::BTreeSet::new();
-        for entry in self
-            .mappings
-            .iter()
-            .skip_while(|entry| entry.text_end <= start)
-            .take_while(|entry| entry.text_start < end)
-        {
+        for (entry, text, range) in self.selected_ranges(start, end) {
             crate::request::check_current()?;
-            let first = entry.text_start.max(start);
-            let last = entry.text_end.min(end);
-            let (source_start, source_end) = if entry.kind == SourceMapKind::Exact {
-                (
-                    entry.source_start + (first - entry.text_start),
-                    entry.source_start + (last - entry.text_start),
-                )
-            } else {
-                (entry.source_start, entry.source_end)
-            };
+            let (source_start, source_end) = (range.start, range.end);
             boundaries.insert(source_start);
             boundaries.insert(source_end);
             spans.push(DocumentSourceSpan {
-                text_start: first,
-                text_end: last,
+                text_start: text.start,
+                text_end: text.end,
                 source_start,
                 source_end,
                 kind: entry.kind,

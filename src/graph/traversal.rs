@@ -273,7 +273,7 @@ pub(crate) fn expand_graph_checked<T: crate::VectorType, E>(
 
     let bias_scale = diffusion_bias
         .filter(|bias| !bias.is_empty())
-        .map(|bias| 1.0 / (bias.len() as f32).sqrt());
+        .map(|bias| 1.0 / (bias.len() as f64).sqrt());
 
     for depth in 0..max_depth {
         if current_tier.is_empty() {
@@ -329,7 +329,10 @@ pub(crate) fn expand_graph_checked<T: crate::VectorType, E>(
                     for edge in db.get_edges(*source).unwrap_or_default() {
                         metrics.examined_edges = metrics.examined_edges.saturating_add(1);
                         admit(metrics)?;
-                        if edge.target_id == curr_id {
+                        if edge.target_id == curr_id
+                            && !(matches!(edge_direction, EdgeDirection::Both)
+                                && *source == curr_id)
+                        {
                             edges.push(ExpansionEdge {
                                 target_id: *source,
                                 label: &edge.label,
@@ -353,11 +356,6 @@ pub(crate) fn expand_graph_checked<T: crate::VectorType, E>(
                     .total_cmp(&left.weight.abs())
                     .then_with(|| left.target_id.cmp(&right.target_id))
                     .then_with(|| left.label.cmp(right.label))
-            });
-            edges.dedup_by(|left, right| {
-                left.target_id == right.target_id
-                    && left.label == right.label
-                    && left.weight.to_bits() == right.weight.to_bits()
             });
             if max_edges_per_node > 0 {
                 edges.truncate(max_edges_per_node);
@@ -402,10 +400,10 @@ pub(crate) fn expand_graph_checked<T: crate::VectorType, E>(
                     db.facts()
                         .get_vector(edge.target_id)
                         .map(|target_vec| {
-                            let dot: f32 = bias
+                            let dot: f64 = bias
                                 .iter()
                                 .zip(target_vec.iter())
-                                .map(|(b, v)| *b * v.to_f32())
+                                .map(|(b, v)| f64::from(*b) * f64::from(v.to_f32()))
                                 .sum();
                             1.0 / (1.0 + (-dot * scale).exp())
                         })
@@ -422,27 +420,12 @@ pub(crate) fn expand_graph_checked<T: crate::VectorType, E>(
                 let magnitude = raw_magnitude
                     * f64::from(inhibition_factor)
                     * f64::from(fatigue_discount)
-                    * f64::from(attention_gate);
+                    * attention_gate;
+                // 门控只衰减本边的份额，包括衰减至零的情形。
+                normalizer += raw_magnitude;
                 if magnitude > 0.0 && magnitude.is_finite() {
-                    // 原始边权决定预算份额；门控项仅衰减已分配能量，不能在分母中自我抵消。
-                    normalizer += raw_magnitude;
                     weighted_edges.push((edge.target_id, sign, magnitude));
                 }
-            }
-
-            if normalizer <= 0.0 {
-                for (&seed_id, &share) in &seed_distribution {
-                    let injected = spread_budget * share as f32;
-                    activate(
-                        seed_id,
-                        injected,
-                        &mut total_activation,
-                        &mut next_tier,
-                        &mut metrics,
-                        &mut admit,
-                    )?;
-                }
-                continue;
             }
 
             for (target_id, sign, magnitude) in weighted_edges {

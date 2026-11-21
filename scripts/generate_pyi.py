@@ -81,7 +81,7 @@ PARAM_TYPES = {
 }
 # bulk name→type groups (space-separated names sharing one type)
 for _t, _names in {
-    "int": "max_threads max_active_tasks id src dst key depth expand_depth min_depth max_depth max_visited_nodes "
+    "int": "max_threads max_active_tasks id src dst key depth expand_depth min_depth max_depth max_visited_nodes max_frontier_size "
            "max_anchor_nodes parallelism additional mb interval_secs min_community_size "
            "max_iterations dim new_dim memory_limit_mb expected_nodes max_query_rows top_k recall_k rerank_k "
            "max_edges_per_node max_edges max_results seed payload_cache_mb payload_cache_entry_mb",
@@ -226,7 +226,7 @@ def render_params(qual: str, sig: inspect.Signature, receiver: str) -> str:
             parts.append("*")
         piece = f"{p.name}: {param_type(qual, p.name, p.default)}"
         if p.default is not _EMPTY:
-            piece += f" = {p.default!r}"
+            piece += " = ..." if p.default is Ellipsis else f" = {p.default!r}"
         parts.append(piece)
         nxt = params[i + 1] if i + 1 < len(params) else None
         if p.kind == p.POSITIONAL_ONLY and (nxt is None or nxt.kind != p.POSITIONAL_ONLY):

@@ -185,13 +185,7 @@ fn expression<T: VectorType>(
             }
         }
         TqlExpr::Property { var, field } => {
-            let node = nodes.get(var).or_else(|| {
-                if matches!(scope.query.entry, QueryEntry::Find { .. }) {
-                    nodes.get("_")
-                } else {
-                    None
-                }
-            });
+            let node = nodes.get(var);
             node.map_or(RuntimeValue::Null, |node| {
                 if field == "id" {
                     runtime_u64(node.id)
@@ -404,6 +398,9 @@ fn aggregate<T: VectorType>(
     scope: &Scope<'_, T>,
 ) -> Result<TqlValue<T>, TriviumError> {
     let star = matches!(inner,ReturnExprKind::Var(v) if v == "*");
+    if func == AggFunc::Count && star && !distinct {
+        return Ok(json_to_tql_value(serde_json::json!(group.len())));
+    }
     let mut values = Vec::new();
     let mut seen = HashSet::new();
     for &index in group {
@@ -501,9 +498,23 @@ fn order_value<T: VectorType>(
         TqlExpr::IsNull { expr, negated } => RuntimeValue::Bool(
             matches!(order_value(expr, row, inputs, scope)?, RuntimeValue::Null) != *negated,
         ),
-        _ => row.source.map_or(RuntimeValue::Null, |index| {
-            expression(expr, &inputs[index], scope)
-        }),
+        _ => {
+            let Some(index) = row.source else {
+                return Ok(RuntimeValue::Null);
+            };
+            let mut resolved = expr.clone();
+            if let Some(var) = resolved.metric_binding_mut()
+                && let ReturnClause::Expressions(items) = &scope.query.returns
+                && let Some(item) = items.iter().find(|item| column_name(item) == *var)
+            {
+                match &item.kind {
+                    ReturnExprKind::Var(source)
+                    | ReturnExprKind::Scalar(TqlExpr::Variable(source)) => var.clone_from(source),
+                    _ => return Ok(RuntimeValue::Null),
+                }
+            }
+            expression(&resolved, &inputs[index], scope)
+        }
     })
 }
 
@@ -598,15 +609,11 @@ fn finish_inner<T: VectorType>(
             });
         }
     } else {
-        let distinct = expressions
-            .into_iter()
-            .flatten()
-            .filter(|item| item.distinct)
-            .collect::<Vec<_>>();
+        let distinct = expressions.filter(|items| items.iter().any(|item| item.distinct));
         let mut seen = HashSet::new();
         for (index, input) in inputs.iter().enumerate() {
             scope.limits.check_cancelled()?;
-            if !distinct.is_empty() {
+            if let Some(distinct) = distinct {
                 let key = distinct
                     .iter()
                     .map(|item| kind_runtime(&item.kind, input, scope).and_then(runtime_signature))
@@ -689,6 +696,26 @@ pub(super) fn into_nodes<T: VectorType>(
     inputs: &[Input<'_, T>],
     scope: &Scope<'_, T>,
 ) -> Result<TqlResult<T>, TriviumError> {
+    let mut aggregate_keys = Vec::new();
+    if let ReturnClause::Expressions(items) = &scope.query.returns {
+        let mut name_counts = HashMap::new();
+        for item in items {
+            let column = column_name(item);
+            let name = match (&item.kind, &item.alias) {
+                (ReturnExprKind::Aggregate(func, _), None) => format!("{func:?}").to_lowercase(),
+                _ => column.clone(),
+            };
+            *name_counts.entry(name.clone()).or_insert(0usize) += 1;
+            if is_aggregate(&item.kind) {
+                aggregate_keys.push((column, name, item.alias.is_none()));
+            }
+        }
+        for (column, name, _) in &mut aggregate_keys {
+            if name_counts[name] > 1 {
+                name.clone_from(column);
+            }
+        }
+    }
     let mut output = Vec::new();
     for row in rows {
         let mut bindings = match row.source.map(|index| &inputs[index]) {
@@ -748,28 +775,27 @@ pub(super) fn into_nodes<T: VectorType>(
             }
             bindings.retain(|name, _| retained.contains(name));
         }
-        if let ReturnClause::Expressions(items) = &scope.query.returns {
-            for item in items.iter().filter(|item| is_aggregate(&item.kind)) {
-                let column = column_name(item);
-                let value = row.values.get(&column).map(value_json).ok_or_else(|| {
-                    TriviumError::QueryExecution(
-                        "聚合返回列缺失 (Missing aggregate return column)".into(),
-                    )
-                })?;
-                let name = item.alias.clone().unwrap_or_else(|| match &item.kind {
-                    ReturnExprKind::Aggregate(func, _) => format!("{func:?}").to_lowercase(),
-                    _ => column.clone(),
-                });
-                bindings.insert(
-                    name.clone(),
-                    Node {
-                        id: 0,
-                        vector: Vec::new(),
-                        payload: serde_json::json!({name:value}),
-                        edges: Vec::new(),
-                    },
-                );
-            }
+        for (column, preferred, implicit) in &aggregate_keys {
+            let value = row.values.get(column).map(value_json).ok_or_else(|| {
+                TriviumError::QueryExecution(
+                    "聚合返回列缺失 (Missing aggregate return column)".into(),
+                )
+            })?;
+            // 只在短名唯一且未被实体绑定占用时使用兼容名称。
+            let name = if *implicit && bindings.contains_key(preferred) {
+                column
+            } else {
+                preferred
+            };
+            bindings.insert(
+                name.clone(),
+                Node {
+                    id: 0,
+                    vector: Vec::new(),
+                    payload: serde_json::json!({name:value}),
+                    edges: Vec::new(),
+                },
+            );
         }
         output.push(bindings);
     }
@@ -792,9 +818,17 @@ fn admit_return_workspace<T: VectorType>(
         .saturating_add(scope.query.order_by.len().saturating_mul(8))
         .saturating_add(if grouped { 8 } else { 3 });
     let mut bytes = inputs.len().checked_mul(512).ok_or_else(memory::overflow)?;
+    let node_expressions = if matches!(inputs.first(), Some(Input::Nodes(..))) {
+        return_expression_bytes(None, scope)?
+    } else {
+        0
+    };
     for input in inputs {
         match input {
             Input::Nodes(nodes, edge) => {
+                bytes = bytes
+                    .checked_add(node_expressions)
+                    .ok_or_else(memory::overflow)?;
                 for (name, node) in *nodes {
                     bytes = bytes
                         .checked_add(memory::snapshot_bytes(node)?)
@@ -813,7 +847,7 @@ fn admit_return_workspace<T: VectorType>(
             }
             Input::Pipeline(row) => {
                 bytes = bytes
-                    .checked_add(pipeline_return_bytes(row, scope)?)
+                    .checked_add(return_expression_bytes(Some(row), scope)?)
                     .ok_or_else(memory::overflow)?;
             }
         }
@@ -824,11 +858,13 @@ fn admit_return_workspace<T: VectorType>(
 }
 
 fn pipeline_binding_bytes<T: VectorType>(
-    row: &crate::query::pipeline::NodeRow,
+    row: Option<&crate::query::pipeline::NodeRow>,
     var: &str,
     field: Option<&str>,
     scope: &Scope<'_, T>,
 ) -> Result<usize, TriviumError> {
+    // 普通节点及其绑定已按快照计量，此处仅补充表达式自身的工作区。
+    let Some(row) = row else { return Ok(0) };
     let value = row.bindings.as_ref().and_then(|bindings| bindings.get(var));
     let node = match value {
         Some(RuntimeValue::Node(id)) => Some(*id),
@@ -861,26 +897,25 @@ fn pipeline_binding_bytes<T: VectorType>(
     })
 }
 
-fn pipeline_expr_bytes<T: VectorType>(
+fn return_expr_bytes<T: VectorType>(
     expr: &TqlExpr,
-    row: &crate::query::pipeline::NodeRow,
+    row: Option<&crate::query::pipeline::NodeRow>,
     scope: &Scope<'_, T>,
 ) -> Result<usize, TriviumError> {
     match expr {
         TqlExpr::Variable(var) => pipeline_binding_bytes(row, var, None, scope),
         TqlExpr::Property { var, field } => pipeline_binding_bytes(row, var, Some(field), scope),
         TqlExpr::Literal(TqlLiteral::Str(value)) => Ok(value.len().saturating_add(64)),
-        TqlExpr::Binary { left, right, .. } => pipeline_expr_bytes(left, row, scope)?
-            .checked_add(pipeline_expr_bytes(right, row, scope)?)
+        TqlExpr::Binary { left, right, .. } => return_expr_bytes(left, row, scope)?
+            .checked_add(return_expr_bytes(right, row, scope)?)
             .ok_or_else(memory::overflow),
         TqlExpr::Coalesce(items) => items.iter().try_fold(0usize, |sum, item| {
-            sum.checked_add(pipeline_expr_bytes(item, row, scope)?)
+            sum.checked_add(return_expr_bytes(item, row, scope)?)
                 .ok_or_else(memory::overflow)
         }),
-        TqlExpr::IsNull { expr, .. } => pipeline_expr_bytes(expr, row, scope),
+        TqlExpr::IsNull { expr, .. } => return_expr_bytes(expr, row, scope),
         TqlExpr::Path { .. } => Ok(row
-            .path
-            .as_ref()
+            .and_then(|row| row.path.as_ref())
             .map_or(64, |path| path.len().saturating_mul(8).saturating_add(64))),
         TqlExpr::Similarity { .. } => Ok(scope
             .mt
@@ -891,9 +926,9 @@ fn pipeline_expr_bytes<T: VectorType>(
     }
 }
 
-fn pipeline_kind_bytes<T: VectorType>(
+fn return_kind_bytes<T: VectorType>(
     kind: &ReturnExprKind,
-    row: &crate::query::pipeline::NodeRow,
+    row: Option<&crate::query::pipeline::NodeRow>,
     scope: &Scope<'_, T>,
 ) -> Result<usize, TriviumError> {
     match kind {
@@ -902,22 +937,22 @@ fn pipeline_kind_bytes<T: VectorType>(
         ReturnExprKind::Property(var, field) => {
             pipeline_binding_bytes(row, var, Some(field), scope)
         }
-        ReturnExprKind::Scalar(expr) => pipeline_expr_bytes(expr, row, scope),
-        ReturnExprKind::Aggregate(_, inner) => pipeline_kind_bytes(inner, row, scope),
+        ReturnExprKind::Scalar(expr) => return_expr_bytes(expr, row, scope),
+        ReturnExprKind::Aggregate(_, inner) => return_kind_bytes(inner, row, scope),
     }
 }
 
 // 管线只为实际求值的列计量；常量、标量别名和节点 ID 投影保持轻量。
-fn pipeline_return_bytes<T: VectorType>(
-    row: &crate::query::pipeline::NodeRow,
+fn return_expression_bytes<T: VectorType>(
+    row: Option<&crate::query::pipeline::NodeRow>,
     scope: &Scope<'_, T>,
 ) -> Result<usize, TriviumError> {
-    let mut bytes = 256usize;
+    let mut bytes = if row.is_some() { 256usize } else { 0 };
     match &scope.query.returns {
         ReturnClause::Expressions(items) => {
             for item in items {
                 bytes = bytes
-                    .checked_add(pipeline_kind_bytes(&item.kind, row, scope)?)
+                    .checked_add(return_kind_bytes(&item.kind, row, scope)?)
                     .ok_or_else(memory::overflow)?;
             }
         }
@@ -942,13 +977,13 @@ fn pipeline_return_bytes<T: VectorType>(
         let alias = if let (TqlExpr::Variable(name), ReturnClause::Expressions(items)) =
             (&order.expr, &scope.query.returns)
         {
-            items.iter().find(|item| item.alias.as_ref() == Some(name))
+            items.iter().find(|item| column_name(item) == *name)
         } else {
             None
         };
         let cost = match alias {
-            Some(item) => pipeline_kind_bytes(&item.kind, row, scope)?,
-            None => pipeline_expr_bytes(&order.expr, row, scope)?,
+            Some(item) => return_kind_bytes(&item.kind, row, scope)?,
+            None => return_expr_bytes(&order.expr, row, scope)?,
         };
         bytes = bytes.checked_add(cost).ok_or_else(memory::overflow)?;
     }

@@ -5,7 +5,7 @@
 //! Mmap 在索引同步后提交 marker；Rom 使用携带新主文件校验的日志提交。
 
 use super::*;
-use crate::storage::fs::sync_parent_directory;
+use crate::storage::fs::{rename_publication_entry, sync_parent_directory};
 use std::io::Read;
 
 // 魔数(4) + 版本(1) + 目标代(8) + 三个文件的存在标记/长度/CRC(39) + 日志 CRC(4)。
@@ -24,6 +24,25 @@ struct SavedFile {
     present: bool,
     size: u64,
     crc: u32,
+}
+
+fn publish_control_file(from: &str, to: &str) -> std::io::Result<()> {
+    rename_publication_entry(Path::new(from), Path::new(to))?;
+    sync_parent_directory(Path::new(to))
+}
+
+/// 回滚中新代独有的文件必须先退出活动名称，才能退役日志并回收备份。
+fn retire_if_present(path: &str) -> std::io::Result<()> {
+    let temporary = format!("{path}.tmp");
+    match rename_publication_entry(Path::new(path), Path::new(&temporary)) {
+        Ok(()) => {
+            sync_parent_directory(Path::new(path))?;
+            std::fs::remove_file(temporary).ok();
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn journal_path(path: &str) -> String {
@@ -68,7 +87,7 @@ pub(super) fn resume<T: VectorType>(path: &str, preserve_text: bool) -> Result<O
                 output.write_all(&bytes)?;
                 output.sync_all()?;
                 drop(output);
-                robust_rename_and_sync(Path::new(&temporary), Path::new(&journal_path(path)))?;
+                publish_control_file(&temporary, &journal_path(path))?;
             }
             Ok(Some(journal.generation))
         }
@@ -148,7 +167,7 @@ pub(super) fn begin(
     drop(output);
     #[cfg(feature = "test-hooks")]
     crate::test_hooks::io_result(crate::test_hooks::IoPoint::PublicationJournalRename)?;
-    robust_rename_and_sync(Path::new(&temporary), Path::new(&journal))?;
+    publish_control_file(&temporary, &journal)?;
     #[cfg(feature = "test-hooks")]
     crate::test_hooks::hit(crate::test_hooks::ConcurrencyPoint::AfterPublicationPrepared);
     Ok(())
@@ -240,7 +259,7 @@ pub(super) fn commit_rom(path: &str) -> Result<()> {
     #[cfg(feature = "test-hooks")]
     crate::test_hooks::io_result(crate::test_hooks::IoPoint::PublicationCommitRename)?;
     crate::request::check_current()?;
-    robust_rename_and_sync(Path::new(&temporary), Path::new(&target))?;
+    publish_control_file(&temporary, &target)?;
     Ok(())
 }
 
@@ -348,11 +367,7 @@ pub(crate) fn recover<T: VectorType>(path: &str, writable: bool) -> Result<bool>
             crate::test_hooks::io_result(crate::test_hooks::IoPoint::PublicationRestoreCopy)?;
             copy_synced(&backup_path(path, index), &destination)?;
         } else {
-            match std::fs::remove_file(&destination) {
-                Ok(()) => sync_parent_directory(Path::new(&destination))?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
+            retire_if_present(&destination)?;
         }
         #[cfg(feature = "test-hooks")]
         crate::test_hooks::hit(crate::test_hooks::ConcurrencyPoint::AfterPublicationRestore);
@@ -360,11 +375,7 @@ pub(crate) fn recover<T: VectorType>(path: &str, writable: bool) -> Result<bool>
     if !state.rom {
         // 提交标记仍指向上一代，日志中这一代的 Payload 属于尚未发布的候选。
         let payload = payload_path_for_generation(path, generation);
-        match std::fs::remove_file(&payload) {
-            Ok(()) => sync_parent_directory(Path::new(&payload))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+        retire_if_present(&payload)?;
     }
     cleanup(path)?;
     Ok(true)
@@ -372,9 +383,13 @@ pub(crate) fn recover<T: VectorType>(path: &str, writable: bool) -> Result<bool>
 
 pub(super) fn cleanup(path: &str) -> Result<()> {
     let journal = journal_path(path);
-    std::fs::remove_file(&journal)?;
-    // 日志的删除先持久化，才能删除其引用的备份；否则断电可能留下有日志、无备份的状态。
-    sync_parent_directory(Path::new(&journal))?;
+    // 先将活动日志持久重命名到暂存名。Windows 的写穿透移动与 Unix 的目录同步
+    // 构成回收屏障，任何失败都保留备份。暂存名不会触发恢复，可在下次发布时复用。
+    let retired = format!("{journal}.tmp");
+    #[cfg(feature = "test-hooks")]
+    crate::test_hooks::io_result(crate::test_hooks::IoPoint::PublicationRetireJournal)?;
+    publish_control_file(&journal, &retired)?;
+    std::fs::remove_file(retired).ok();
     for index in 0..GROUP_SUFFIXES.len() {
         std::fs::remove_file(backup_path(path, index)).ok();
     }

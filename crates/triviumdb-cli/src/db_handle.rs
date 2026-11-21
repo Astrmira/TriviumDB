@@ -288,19 +288,19 @@ impl DbHandle {
         dispatch!(self, db => db.link(src, dst, label, weight))
     }
 
-    /// 向量相似度检索（query 以 f32 给出，按 dtype 转换）。
+    /// 使用节点的原始向量检索，保留数据库 dtype 的全部有效位。
     ///
     /// 返回按得分降序的 `(id, score, payload)` 列表。
-    pub fn search_f32(
+    pub fn search_by_node(
         &self,
-        vector: &[f32],
+        id: NodeId,
         top_k: usize,
         expand: usize,
         min_score: f32,
     ) -> Result<Vec<(NodeId, f32, Value)>> {
         dispatch!(self, db => {
-            let v: Vec<_> = vector.iter().map(|x| VectorType::from_f32(*x)).collect();
-            let hits = db.search(&v, top_k, expand, min_score)?;
+            let node = db.get(id)?.ok_or(TriviumError::NodeNotFound(id))?;
+            let hits = db.search(&node.vector, top_k, expand, min_score)?;
             Ok(hits.into_iter().map(|h| (h.id, h.score, h.payload)).collect())
         })
     }
@@ -431,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn dbhandle_search_f32_top1() {
+    fn dbhandle_search_by_node_top1() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("t.tdb").to_string_lossy().to_string();
         let mut h = DbHandle::open(&path, 4, DType::F32).unwrap();
@@ -440,9 +440,20 @@ mod tests {
         h.insert_f32(&[0.0, 1.0, 0.0, 0.0], serde_json::json!({"name": "Bob"}))
             .unwrap();
 
-        let hits = h.search_f32(&[1.0, 0.0, 0.0, 0.0], 1, 0, 0.0).unwrap();
+        let hits = h.search_by_node(1, 1, 0, 0.0).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].2["name"], "Alice");
+    }
+
+    #[test]
+    fn 节点检索保留整数指纹相邻位() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("bits.tdb");
+        let mut db = Database::<u64>::open(path.to_str().unwrap(), 1).unwrap();
+        db.insert_with_id(1, &[1 << 24], Value::Null).unwrap();
+        db.insert_with_id(2, &[(1 << 24) + 1], Value::Null).unwrap();
+        let hits = DbHandle::U64(db).search_by_node(2, 1, 1, 0.0).unwrap();
+        assert_eq!(hits[0].0, 2);
     }
 
     #[test]

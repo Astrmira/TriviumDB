@@ -136,7 +136,7 @@ jobs:
       - name: 验证外部迁移与独立发布样本
         shell: bash
         run: |
-          cargo test --locked --manifest-path crates/triviumdb-migrate/Cargo.toml --target-dir target/migration -- --test-threads=1
+          cargo test --locked --manifest-path crates/triviumdb-migrate/Cargo.toml --target-dir target/migration --features test-hooks -- --test-threads=1
           TDB_MIGRATE_TOOL="${{ github.workspace }}/target/migration/debug/triviumdb-migrate${{ runner.os == 'Windows' && '.exe' || '' }}" python -m unittest discover -s tests/tools -p test_migrate.py
 
       - name: 验证 release 小栈解析与图遍历边界

@@ -43,6 +43,11 @@ impl Failure {
             details,
         }
     }
+    fn after_publication(mut self) -> Self {
+        self.phase = "publish";
+        self.outcome = "committed";
+        self
+    }
     fn legacy(error: legacy::database::migration_conversion::ConversionError) -> Self {
         let error = match error {
             legacy::database::migration_conversion::ConversionError::Source(error) => error,
@@ -99,7 +104,7 @@ pub(crate) struct Owner {
     pub files: BTreeMap<String, SourceFile>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Report {
     pub protocol: u32,
     pub tool: String,
@@ -155,6 +160,40 @@ fn inspect_typed(path: &Path, dtype: u16, dim: usize, memory: usize) -> Result<F
     }
 }
 
+fn convert<
+    T: triviumdb::VectorType + legacy::VectorType + Serialize + serde::de::DeserializeOwned,
+>(
+    format: u16,
+    source: &Path,
+    dimension: usize,
+    facts: &Path,
+    target: &Path,
+    mode: triviumdb::database::StorageMode,
+    memory: usize,
+) -> Result<FactFingerprint> {
+    use triviumdb::database::inspection::transfer;
+    let path = utf8(source)?;
+    let expected = if format == triviumdb::storage::file_format::CURRENT_VERSION {
+        transfer::export_current::<T>(path, dimension, memory, facts)?
+    } else {
+        let legacy =
+            legacy::database::migration_conversion::export::<T>(path, dimension, memory, facts)
+                .map_err(Failure::legacy)?;
+        serde_json::from_value(serde_json::to_value(legacy)?)?
+    };
+    let actual = transfer::restore::<T>(facts, utf8(target)?, mode, memory)?;
+    if actual != expected {
+        return Err(Failure {
+            details: serde_json::json!({"expected":expected,"actual":actual}),
+            ..Failure::new(
+                "TDB_CORRUPTED_FILE",
+                "逻辑事实导入不一致 (Imported logical facts differ)",
+            )
+        });
+    }
+    Ok(expected)
+}
+
 pub fn run(options: &Options) -> Result<Report> {
     run_controlled(options, |_| Ok(()))
 }
@@ -164,6 +203,22 @@ pub fn run(options: &Options) -> Result<Report> {
 pub fn run_controlled(
     options: &Options,
     mut checkpoint: impl FnMut(Phase) -> Result<()>,
+) -> Result<Report> {
+    let mut committed = false;
+    let result = migrate(options, &mut checkpoint, &mut committed);
+    result.map_err(|error| {
+        if committed {
+            error.after_publication()
+        } else {
+            error
+        }
+    })
+}
+
+fn migrate(
+    options: &Options,
+    checkpoint: &mut impl FnMut(Phase) -> Result<()>,
+    committed: &mut bool,
 ) -> Result<Report> {
     if options.memory_bytes < 16 * 1024 * 1024
         || options.max_source_bytes == 0
@@ -202,6 +257,7 @@ pub fn run_controlled(
             "目标目录包含源数据库 (Destination contains the source database)",
         ));
     }
+    triviumdb::storage::artifacts::validate_destination(&source, &destination)?;
     let _source_lease = Lease::source(&source, !options.check)?;
     triviumdb::database::inspection::validate_source_path(utf8(&source)?)?;
     let _target_lease = if options.check {
@@ -262,78 +318,72 @@ pub fn run_controlled(
     } else {
         false
     };
-    let stage = Stage::prepare(&parent, leaf, &owner, options.check)?;
-    let staged = stage.database.join("database.tdb");
-    let copied = stage.source.join("database.tdb");
-    files::copy_source(&source, &copied, &owner.files)?;
     let mode = if options.mmap {
         triviumdb::database::StorageMode::Mmap
     } else {
         triviumdb::database::StorageMode::Rom
     };
-    let convert = |dtype| -> Result<FactFingerprint> {
-        let path = utf8(&copied)?;
-        let expected = match dtype {
-            1 => legacy::database::migration_conversion::export::<f32>(
-                path,
-                dimension,
-                options.memory_bytes,
-                &stage.facts,
-            ),
-            2 => legacy::database::migration_conversion::export::<half::f16>(
-                path,
-                dimension,
-                options.memory_bytes,
-                &stage.facts,
-            ),
-            3 => legacy::database::migration_conversion::export::<u64>(
-                path,
-                dimension,
-                options.memory_bytes,
-                &stage.facts,
-            ),
-            _ => {
-                return Err(Failure::new(
-                    "TDB_INVALID_INPUT",
-                    "向量类型无效 (Invalid vector dtype)",
-                ));
-            }
+    let published = destination.join("database.tdb");
+    let previous_lease = if previous {
+        let lease = Lease::published(&published)?;
+        if triviumdb::storage::file_format::read_database_layout(utf8(&published)?)?.2 != mode {
+            return Err(Failure::new(
+                "TDB_MIGRATION_CONFLICT",
+                "已有目标的存储模式与请求不符 (Published storage mode differs from requested mode)",
+            ));
         }
-        .map_err(Failure::legacy)?;
-        let restored = match dtype {
-            1 => triviumdb::database::inspection::transfer::restore::<f32>(
-                &stage.facts,
-                utf8(&staged)?,
-                mode,
-                options.memory_bytes,
-            ),
-            2 => triviumdb::database::inspection::transfer::restore::<half::f16>(
-                &stage.facts,
-                utf8(&staged)?,
-                mode,
-                options.memory_bytes,
-            ),
-            3 => triviumdb::database::inspection::transfer::restore::<u64>(
-                &stage.facts,
-                utf8(&staged)?,
-                mode,
-                options.memory_bytes,
-            ),
-            _ => unreachable!(),
-        }?;
-        let expected: FactFingerprint = serde_json::from_value(serde_json::to_value(expected)?)?;
-        if restored != expected {
-            return Err(Failure {
-                details: serde_json::json!({"expected":expected,"actual":restored}),
-                ..Failure::new(
-                    "TDB_CORRUPTED_FILE",
-                    "逻辑事实导入不一致 (Imported logical facts differ)",
-                )
-            });
+        if !options.check {
+            // 处理重命名已可见、上次父目录同步结果未知的重试。
+            triviumdb::database::inspection::sync_directory(&parent).map_err(|e| Failure {
+                phase: "publish",
+                outcome: "unknown",
+                ..e.into()
+            })?;
+            *committed = true;
         }
-        Ok(expected)
+        Some(lease)
+    } else {
+        None
     };
-    let expected = convert(dtype)?;
+    let stage = Stage::prepare(&parent, leaf, &owner, options.check)?;
+    let staged = stage.database.join("database.tdb");
+    let copied = stage.source.join("database.tdb");
+    files::copy_source(&source, &copied, &owner.files)?;
+    let expected = match dtype {
+        1 => convert::<f32>(
+            format,
+            &copied,
+            dimension,
+            &stage.facts,
+            &staged,
+            mode,
+            options.memory_bytes,
+        ),
+        2 => convert::<half::f16>(
+            format,
+            &copied,
+            dimension,
+            &stage.facts,
+            &staged,
+            mode,
+            options.memory_bytes,
+        ),
+        3 => convert::<u64>(
+            format,
+            &copied,
+            dimension,
+            &stage.facts,
+            &staged,
+            mode,
+            options.memory_bytes,
+        ),
+        _ => {
+            return Err(Failure::new(
+                "TDB_INVALID_INPUT",
+                "向量类型无效 (Invalid vector dtype)",
+            ));
+        }
+    }?;
     checkpoint(Phase::Converted)?;
     let actual = inspect_typed(&staged, dtype, dimension, options.memory_bytes)?;
     if expected != actual {
@@ -370,59 +420,69 @@ pub fn run_controlled(
         facts: actual,
     };
     if options.check {
-        stage.cleanup(&owner)?;
+        if previous {
+            let pending = files::verify_publication(&report, &owner)?;
+            if pending.is_none()
+                && inspect_typed(&report.database, dtype, dimension, options.memory_bytes)?
+                    != expected
+            {
+                return Err(Failure::new(
+                    "TDB_MIGRATION_CONFLICT",
+                    "已有目标事实已改变 (Published destination facts have changed)",
+                ));
+            }
+        }
+        stage.finish_check()?;
         return Ok(report);
     }
-    if previous {
-        let _published_lease = Lease::published(&report.database)?;
-        files::finish_publication(&report.database, &owner)?;
-        if inspect_typed(&report.database, dtype, dimension, options.memory_bytes)? != expected {
-            return Err(Failure::new(
+    if !previous {
+        files::write_json(&stage.database.join("migration-source.json"), &owner)?;
+        // 先同步报告内容，目标父目录同步成功后才公开正式报告。
+        files::write_json(
+            &stage.database.join("migration-report.pending"),
+            &Report {
+                committed: true,
+                ..report.clone()
+            },
+        )?;
+        files::prepare_publication(&staged, &owner)?;
+        checkpoint(Phase::BeforePublish)?;
+        triviumdb::database::inspection::publish_directory(&stage.database, &destination).map_err(
+            |error| {
+                let outcome = match error.info().write.map(|w| w.outcome) {
+                    Some(triviumdb::error::WriteOutcome::Unknown) => "unknown",
+                    _ => "not_committed",
+                };
+                Failure {
+                    phase: "publish",
+                    outcome,
+                    ..error.into()
+                }
+            },
+        )?;
+        *committed = true;
+        checkpoint(Phase::AfterPublish)?;
+    }
+    let _lease = match previous_lease {
+        Some(lease) => lease,
+        None => Lease::published(&report.database)?,
+    };
+    files::finish_publication(&report, &owner)?;
+    if inspect_typed(&report.database, dtype, dimension, options.memory_bytes)? != expected {
+        return Err(if previous {
+            Failure::new(
                 "TDB_MIGRATION_CONFLICT",
                 "已有目标事实已改变 (Previously published destination facts have changed)",
-            ));
-        }
-        report.committed = true;
-        report.reused = true;
-        stage.cleanup(&owner)?;
-        return Ok(report);
-    }
-    files::write_json(&stage.database.join("migration-source.json"), &owner)?;
-    // 此记录随目录提交点同时可见；SDK 准入仍须等待发布标记完成确认。
-    files::write_json(
-        &stage.database.join("migration-report.json"),
-        &Report {
-            committed: true,
-            ..report.clone()
-        },
-    )?;
-    files::prepare_publication(&staged, &owner)?;
-    checkpoint(Phase::BeforePublish)?;
-    // 原子排他重命名是唯一提交点；之后的错误均明确记录目标已经提交。
-    let published =
-        triviumdb::database::inspection::publish_directory(&stage.database, &destination);
-    let committed = destination.is_dir() && !stage.database.exists();
-    let after = || -> Result<()> {
-        published?;
-        checkpoint(Phase::AfterPublish)?;
-        let _published_lease = Lease::published(&report.database)?;
-        files::finish_publication(&report.database, &owner)?;
-        if inspect_typed(&report.database, dtype, dimension, options.memory_bytes)? != expected {
-            return Err(Failure::new(
+            )
+        } else {
+            Failure::new(
                 "TDB_CORRUPTED_FILE",
                 "已发布目标事实校验失败 (Published destination fact validation failed)",
-            ));
-        }
-        stage.cleanup(&owner)?;
-        Ok(())
-    };
-    after().map_err(|mut error| {
-        if committed {
-            error.outcome = "committed";
-            error.phase = "publish";
-        }
-        error
-    })?;
+            )
+        });
+    }
+    stage.cleanup(&owner)?;
     report.committed = true;
+    report.reused = previous;
     Ok(report)
 }

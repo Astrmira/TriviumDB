@@ -232,6 +232,12 @@ fn header_vector_type(bytes: &[u8]) -> Result<(u16, &'static str, usize)> {
 
 /// 检查当前格式的完整文件头，返回格式版本和维度。
 pub fn read_database_header(path: &str) -> Result<(u16, usize)> {
+    let (version, dimension, _) = read_database_layout(path)?;
+    Ok((version, dimension))
+}
+
+/// 从已校验的主文件头读取实际向量布局。
+pub fn read_database_layout(path: &str) -> Result<(u16, usize, StorageMode)> {
     use std::io::{ErrorKind, Read};
     let mut file = File::open(path)?;
     let mut bytes = [0u8; HEADER_SIZE as usize];
@@ -258,7 +264,16 @@ pub fn read_database_header(path: &str) -> Result<(u16, usize)> {
             "数据库文件头的维度无效 (Invalid dimension in database header)".into(),
         ));
     }
-    Ok((version, dim))
+    let offset = read_u64_le(&bytes, 34, "vector_offset")?;
+    Ok((
+        version,
+        dim,
+        if offset == 0 {
+            StorageMode::Mmap
+        } else {
+            StorageMode::Rom
+        },
+    ))
 }
 
 /// 发布恢复写入前核对可信基础文件的类型；备份向量使用独立路径。
@@ -909,11 +924,15 @@ fn save_inner<T: VectorType>(
     crate::storage::graph_blocks::save(memtable, path)?;
 
     let pelorus = crate::index::pelorus::persistence::stage(memtable, path)?;
-    crate::storage::index_container::publish_checkpoint(
+    let index_bytes = crate::storage::index_container::publish_checkpoint(
         path,
         memtable.text_index_is_deferred(),
         pelorus,
     )?;
+    memtable
+        .published_bytes
+        .index
+        .fetch_add(index_bytes, std::sync::atomic::Ordering::Relaxed);
 
     #[cfg(feature = "test-hooks")]
     crate::test_hooks::hit_for_path(
@@ -922,6 +941,10 @@ fn save_inner<T: VectorType>(
     );
     if let Some(marker) = marker {
         publish_mmap_marker(path, &marker)?;
+        memtable.published_bytes.checkpoint.fetch_add(
+            FLUSH_MARKER_SIZE as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     } else {
         crate::request::check_current()?;
         publication::commit_rom(path)?;
@@ -932,7 +955,7 @@ fn save_inner<T: VectorType>(
         crate::test_hooks::ConcurrencyPoint::AfterPublicationCommitted,
         path,
     );
-    publication::cleanup(path).ok();
+    publication::cleanup(path)?;
     crate::storage::index_container::cleanup_components(path)?;
     if generation > 1 {
         std::fs::remove_file(payload_path_for_generation(path, generation - 1)).ok();
@@ -960,7 +983,13 @@ fn save_mmap<T: VectorType>(
         memtable.vec_pool_mut().require_full_rewrite();
     }
     let vec_file_path = vec_path_from_db(path);
-    let vec_count = memtable.vec_pool_mut().flush(Path::new(&vec_file_path))?;
+    let (vec_count, written) = memtable
+        .vec_pool_mut()
+        .flush_measured(Path::new(&vec_file_path))?;
+    memtable
+        .published_bytes
+        .checkpoint
+        .fetch_add(written, std::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "test-hooks")]
     crate::test_hooks::hit(crate::test_hooks::ConcurrencyPoint::AfterVecPersisted);
 
@@ -974,6 +1003,11 @@ fn save_mmap<T: VectorType>(
     crate::test_hooks::io_result(crate::test_hooks::IoPoint::MarkerMetadata)?;
     let payload_path = payload_path_for_generation(path, generation);
     memtable.save_payload_sidecar(Path::new(&payload_path), generation)?;
+    let payload_size = std::fs::metadata(&payload_path)?.len();
+    memtable
+        .published_bytes
+        .checkpoint
+        .fetch_add(payload_size, std::sync::atomic::Ordering::Relaxed);
     let tdb_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let vec_size = std::fs::metadata(&vec_file_path)
         .map(|m| m.len())
@@ -982,7 +1016,7 @@ fn save_mmap<T: VectorType>(
         generation,
         tdb_size,
         vec_size,
-        payload_size: Some(std::fs::metadata(&payload_path)?.len()),
+        payload_size: Some(payload_size),
         tdb_crc32: Some(file_crc32(path)?),
         vec_crc32: Some(file_crc32_or_empty(&vec_file_path)?),
         payload_crc32: None,
@@ -1276,6 +1310,10 @@ fn save_tdb<T: VectorType>(
         .into_inner()
         .map_err(|e| TriviumError::Io(e.into_error()))?;
     file.sync_all()?;
+    memtable
+        .published_bytes
+        .checkpoint
+        .fetch_add(file.metadata()?.len(), std::sync::atomic::Ordering::Relaxed);
     drop(file);
 
     robust_rename_and_sync(Path::new(&tmp_path), Path::new(path))?;
@@ -1717,7 +1755,7 @@ fn load_rom<T: VectorType>(
     if is_aligned {
         let t_slice =
             unsafe { std::slice::from_raw_parts(vec_block.as_ptr() as *const T, vector_elements) };
-        memtable.vec_pool_mut().push(t_slice);
+        memtable.vec_pool_mut().append_records(t_slice)?;
     } else {
         // 不对齐
         let mut v = Vec::new();
@@ -1736,7 +1774,7 @@ fn load_rom<T: VectorType>(
             let elem: T = bytemuck::pod_read_unaligned(chunk);
             v.push(elem);
         }
-        memtable.vec_pool_mut().push(&v);
+        memtable.vec_pool_mut().append_records(&v)?;
     }
 
     load_edges(

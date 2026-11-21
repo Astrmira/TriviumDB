@@ -20,8 +20,7 @@ use memory::QueryMemory;
 
 use super::pipeline::BindingValue as RuntimeValue;
 use super::planner::{
-    AccessPath, NodeAccessPlan, plan_filter, plan_filter_ordered, plan_filter_with_limit,
-    plan_match, plan_match_node_filter,
+    AccessPath, NodeAccessPlan, plan_filter_with_limit, plan_match_node_filter, plan_match_scan,
 };
 use super::tql_ast::*;
 use super::tql_source::{QueryOrigin, SourceSelector, TqlSource};
@@ -281,7 +280,12 @@ impl ExecutionContext {
                         &format!("图作用域配置无效 (Invalid graph scope configuration): {error}"),
                     )
                 })?;
-                crate::graph::view::ScopedGraph::build(mt, &scope, self.memory_limit)
+                crate::graph::view::ScopedGraph::build(
+                    mt,
+                    &scope,
+                    &Default::default(),
+                    self.memory_limit,
+                )
             };
             self.graph = Some(prepare().map_err(|error| {
                 self.error(error, QueryErrorStage::Plan, SourceSelector::GraphScope)
@@ -408,7 +412,11 @@ fn requested_row_limit<T: VectorType>(
         None if query_has_edges(query) => DEFAULT_EDGE_ROW_LIMIT,
         None => usize::MAX,
     };
-    let memory_cap = memory_row_cap(limits.memory_limit, mt);
+    let memory_cap = if limits.memory_limit > 0 && counts_match_rows(query) {
+        limits.memory_limit / 256
+    } else {
+        memory_row_cap(limits.memory_limit, mt)
+    };
     if let Some(limit) = query.limit
         && limit
             .checked_add(query.offset.unwrap_or(0))
@@ -440,6 +448,26 @@ fn requires_full_input(query: &TqlQuery, ordered_find: bool) -> bool {
 
 fn is_aggregate(kind: &ReturnExprKind) -> bool {
     matches!(kind, ReturnExprKind::Aggregate(..))
+}
+
+fn counts_match_rows(query: &TqlQuery) -> bool {
+    let ReturnClause::Expressions(items) = &query.returns else {
+        return false;
+    };
+    matches!(
+        query.entry,
+        QueryEntry::Match { .. } | QueryEntry::OptionalMatch { .. }
+    ) && query.rank.is_none()
+        && query.pipeline.is_empty()
+        && !items.is_empty()
+        && items.iter().all(|item| {
+            matches!(&item.kind, ReturnExprKind::Aggregate(AggFunc::Count, inner)
+            if matches!(inner.as_ref(), ReturnExprKind::Var(v) if v == "*"))
+        })
+        && query.order_by.iter().all(|order| {
+            matches!(&order.expr, TqlExpr::Variable(name)
+            if items.iter().any(|item| item.alias.as_ref() == Some(name)))
+        })
 }
 
 fn admit_input_rows<T: VectorType>(
@@ -576,7 +604,7 @@ fn execute_tql_context_inner<T: VectorType>(
         let find_plan = if query.pipeline.is_empty()
             && let QueryEntry::Find { filter } = &query.entry
         {
-            let ordered = find_ordered_find_plan(query, filter, memtable);
+            let ordered = find_ordered_find_plan(query, memtable);
             let (row_limit, _) = requested_row_limit(
                 query,
                 requires_full_input(query, ordered.is_some()),
@@ -703,7 +731,7 @@ fn execute_binding_rows_inner<T: VectorType>(
 ) -> Result<(TqlResult<T>, bool), TriviumError> {
     let ordered_find = matches!(
         &query.entry,
-        QueryEntry::Find { filter } if find_ordered_find_plan(query, filter, memtable).is_some()
+        QueryEntry::Find { .. } if find_ordered_find_plan(query, memtable).is_some()
     );
     let requires_full_input = requires_full_input(query, ordered_find);
     let (row_limit, user_limited) =
@@ -715,7 +743,11 @@ fn execute_binding_rows_inner<T: VectorType>(
         query.entry,
         QueryEntry::Match { .. } | QueryEntry::OptionalMatch { .. }
     ) {
-        snapshot_query.returns = ReturnClause::All;
+        snapshot_query.returns = if counts_match_rows(query) {
+            ReturnClause::Variables(Vec::new())
+        } else {
+            ReturnClause::All
+        };
     }
     let (mut results, ordered_output) = match &query.entry {
         QueryEntry::Find { filter } => execute_find(
@@ -886,6 +918,7 @@ fn execute_pipeline_set<T: VectorType>(
         .map_or(0, |request| request.query().limits.max_vector_scores);
     let shorthand_search =
         query.pipeline.is_empty() && matches!(query.entry, QueryEntry::Search { .. });
+    let search_filter = shorthand_search_filter(query);
     let plan = crate::query::cascades::optimize_pipeline_scoped(
         query,
         mt,
@@ -901,7 +934,7 @@ fn execute_pipeline_set<T: VectorType>(
                     plan.stages.first().map(|stage| &stage.operator),
                 ) {
                     (QueryEntry::Search { vector, top_k, expand, .. }, _) if shorthand_search => {
-                        lower_shorthand_search(vector, *top_k, expand.as_ref(), query, mt)?
+                        lower_shorthand_search(vector, *top_k, expand.as_ref(), search_filter, mt)?
                     }
                     (
                         QueryEntry::Search {
@@ -986,10 +1019,9 @@ fn execute_pipeline_set<T: VectorType>(
                         source_query.returns = ReturnClause::All;
                         if let QueryEntry::Match { pattern }
                         | QueryEntry::OptionalMatch { pattern } = &mut source_query.entry
-                            && pattern.edges.is_empty()
                             && pattern.nodes.first().is_some_and(|node| node.var.is_none())
                         {
-                            pattern.nodes[0].var = Some("_".into());
+                            pattern.nodes[0].var = Some(MATCH_ANCHOR.into());
                         }
                         // 返回行上限由最终管线执行，来源仍遵守内存、遍历和取消预算。
                         let mut source_limits = limits.clone();
@@ -1070,7 +1102,9 @@ fn execute_pipeline_set<T: VectorType>(
     };
     let mut operator_origins = vec![limits.origin(SourceSelector::Entry); operators.len()];
     if shorthand_search || (pelorus_source.is_some() && query.pipeline.is_empty()) {
-        if let Some(predicate) = &query.predicate {
+        if search_filter.is_none()
+            && let Some(predicate) = &query.predicate
+        {
             operators.push(Box::new(PipelinePredicateFilter {
                 predicate: predicate.clone(),
             }));
@@ -1886,13 +1920,22 @@ struct EdgeBindingRow<T> {
 }
 
 fn scoped_match_plan<T: VectorType>(
+    query: &TqlQuery,
     pattern: &TqlPattern,
     mt: &MemTable<T>,
     optional: bool,
     limits: &ExecutionContext,
 ) -> crate::query::planner::MatchPlan {
     let Some(scope) = &limits.graph else {
-        return plan_match(pattern, mt, optional);
+        let paged = query.limit.is_some()
+            || query.offset.is_some()
+            || matches!(
+                limits.row_overflow,
+                crate::database::RowOverflowPolicy::Break
+            );
+        let mut plan = plan_match_scan(pattern, mt, optional, !paged);
+        plan.candidates.sort_unstable();
+        return plan;
     };
     let graph = limits.graph(mt);
     let mut access = pattern
@@ -1900,7 +1943,7 @@ fn scoped_match_plan<T: VectorType>(
         .first()
         .and_then(|node| node.filter.as_ref())
         .map(|filter| plan_match_node_filter(filter, mt));
-    let candidates = match &mut access {
+    let mut candidates = match &mut access {
         Some(plan)
             if !matches!(
                 plan.access_path,
@@ -1912,6 +1955,7 @@ fn scoped_match_plan<T: VectorType>(
         }
         _ => graph.all_node_ids(),
     };
+    candidates.sort_unstable();
     crate::query::planner::MatchPlan {
         access_path: access
             .map(|plan| plan.access_path)
@@ -1952,7 +1996,7 @@ fn collect_single_edge_rows_inner<T: VectorType>(
     }
     let optional = matches!(query.entry, QueryEntry::OptionalMatch { .. });
     let graph = limits.graph(mt);
-    let plan = scoped_match_plan(pattern, mt, optional, limits);
+    let plan = scoped_match_plan(query, pattern, mt, optional, limits);
     let left = &plan.pattern.nodes[0];
     let right = &plan.pattern.nodes[1];
     let edge_pattern = &plan.pattern.edges[0];
@@ -1976,6 +2020,12 @@ fn collect_single_edge_rows_inner<T: VectorType>(
         limits,
         pipeline: None,
     };
+    let count_only = counts_match_rows(query);
+    let mut predicate_vars = Vec::new();
+    if let Some(predicate) = &query.predicate {
+        let default_node = pattern.nodes.iter().find_map(|node| node.var.as_deref());
+        super::tql_parser::predicate_vars(predicate, &mut predicate_vars, false, default_node);
+    }
     let mut expanded = Vec::new();
     let mut budget = matching::WorkBudget::new(MAX_BUDGET, limits.query_control.as_ref());
     'anchors: for start in candidates {
@@ -1987,34 +2037,13 @@ fn collect_single_edge_rows_inner<T: VectorType>(
         {
             continue;
         }
-        // 与匿名边共享物理边枚举、取消和步数预算；排序保留具名边的确定性。
-        let mut edges = BTreeMap::new();
+        let mut matched = false;
         let mut neighbors = matching::Neighbors::new(&graph, start, edge_pattern.direction);
         while let Some((source, edge)) =
             neighbors.next(&graph, &edge_pattern.labels, &mut budget)?
         {
-            let bytes = edges
-                .len()
-                .saturating_add(1)
-                .saturating_mul(std::mem::size_of::<(NodeId, NodeId, &str)>())
-                .saturating_mul(4);
-            if limits.memory_limit > 0 && bytes > limits.memory_limit {
-                return Err(TriviumError::QueryRowBudgetExceeded {
-                    budget: edges.len(),
-                });
-            }
-            edges.insert(
-                (
-                    source,
-                    edge.target_id,
-                    edge.label.as_str(),
-                    graph.edge_graph_id(source, edge),
-                ),
-                edge,
-            );
-        }
-        let mut matched = false;
-        for ((source, target, _, graph_id), edge) in edges {
+            let target = edge.target_id;
+            let graph_id = graph.edge_graph_id(source, edge);
             let end = if source == start { target } else { source };
             if left.var.is_some() && left.var == right.var && start != end {
                 continue;
@@ -2027,43 +2056,75 @@ fn collect_single_edge_rows_inner<T: VectorType>(
                 continue;
             }
             let mut nodes = HashMap::new();
-            for (pattern, id) in [(left, start), (right, end)] {
-                if let Some(var) = &pattern.var {
-                    nodes.insert(var.clone(), memory.snapshot(id, mt)?);
-                }
-            }
-            memory.retain(
-                edge.label
+            let mut view = None;
+            if query.predicate.is_some() || !count_only {
+                let edge_bytes = edge
+                    .label
                     .len()
+                    .saturating_add(graph_id.map_or(0, str::len))
                     .saturating_add(crate::storage::payload_store::query_clone_peak(
                         &edge.metadata,
                     ))
-                    .saturating_add(256),
-            )?;
-            let view = EdgeView {
-                graph_id: graph_id.map(str::to_owned),
-                source_id: source,
-                target_id: target,
-                label: edge.label.clone(),
-                weight: edge.weight,
-                metadata: edge.metadata.clone(),
-            };
-            let input = returning::Input::Nodes(&nodes, Some((edge_var, &view)));
-            let default_node = pattern
-                .nodes
-                .iter()
-                .filter_map(|node| node.var.as_ref())
-                .find_map(|var| nodes.get(var));
-            if query.predicate.as_ref().is_some_and(|predicate| {
-                !returning::matches_predicate(predicate, &input, &scope, default_node)
-            }) {
-                continue;
+                    .saturating_add(256);
+                let edge_lease = memory.temporary(edge_bytes)?;
+                let candidate = EdgeView {
+                    graph_id: graph_id.map(str::to_owned),
+                    source_id: source,
+                    target_id: target,
+                    label: edge.label.clone(),
+                    weight: edge.weight,
+                    metadata: edge.metadata.clone(),
+                };
+                if let Some(predicate) = &query.predicate {
+                    // 谓词只访问端点身份与属性。候选的凭证随本次判定释放。
+                    let mut leases = Vec::new();
+                    for (endpoint, id) in [(left, start), (right, end)] {
+                        if let Some(var) = &endpoint.var
+                            && predicate_vars.contains(var)
+                        {
+                            leases.push(
+                                memory.temporary(mt.payload_query_peak(id)?.saturating_add(256))?,
+                            );
+                            let payload = mt
+                                .try_get_payload(id)?
+                                .ok_or(TriviumError::NodeNotFound(id))?;
+                            nodes.insert(
+                                var.clone(),
+                                Node {
+                                    id,
+                                    payload: (*payload).clone(),
+                                    vector: Vec::new(),
+                                    edges: Vec::new(),
+                                },
+                            );
+                        }
+                    }
+                    let input = returning::Input::Nodes(&nodes, Some((edge_var, &candidate)));
+                    let default_node = pattern
+                        .nodes
+                        .iter()
+                        .filter_map(|node| node.var.as_ref())
+                        .find_map(|var| nodes.get(var));
+                    if !returning::matches_predicate(predicate, &input, &scope, default_node) {
+                        continue;
+                    }
+                    nodes.clear();
+                }
+                if !count_only {
+                    edge_lease.retain();
+                    view = Some(candidate);
+                    for (endpoint, id) in [(left, start), (right, end)] {
+                        if let Some(var) = &endpoint.var {
+                            nodes.insert(var.clone(), memory.snapshot(id, mt)?);
+                        }
+                    }
+                }
             }
             matched = true;
             expanded.push(EdgeBindingRow {
                 nodes,
-                edge: Some(view),
-                anchor: start,
+                edge: view,
+                anchor: if plan.reversed { end } else { start },
             });
             if expanded.len() > row_limit {
                 break 'anchors;
@@ -2071,7 +2132,7 @@ fn collect_single_edge_rows_inner<T: VectorType>(
         }
         if optional && !matched {
             let mut nodes = HashMap::new();
-            if let Some(var) = &left.var {
+            if !count_only && let Some(var) = &left.var {
                 nodes.insert(var.clone(), memory.snapshot(start, mt)?);
             }
             expanded.push(EdgeBindingRow {
@@ -2147,38 +2208,91 @@ struct TqlScopeProjection {
 const CURRENT_BINDING: &str = "\0current";
 // 关系匹配的每一行在普通投影中保留重数；节点集仍按绑定归一化。
 pub(super) const MATCH_ROW: &str = "\0match_row";
+const MATCH_ANCHOR: &str = "\0anchor";
 
 #[derive(Clone, Copy, Debug)]
 enum BoundMetric {
     Similarity,
-    SimilarityApproximate,
     Path,
     PathStrength,
     PathCount,
     PathRank,
+    Depth,
+    GraphScore,
+    TextScore,
+    DiversityScore,
+    ResidualScore,
+    Topic,
+    TopicScore,
+    Community,
+    PairLeft,
+    PairRight,
+    Graph(crate::query::pipeline::GraphMetric),
 }
 
 impl BoundMetric {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 27] = [
         Self::Similarity,
-        Self::SimilarityApproximate,
         Self::Path,
         Self::PathStrength,
         Self::PathCount,
         Self::PathRank,
+        Self::Depth,
+        Self::GraphScore,
+        Self::TextScore,
+        Self::DiversityScore,
+        Self::ResidualScore,
+        Self::Topic,
+        Self::TopicScore,
+        Self::Community,
+        Self::PairLeft,
+        Self::PairRight,
+        Self::Graph(crate::query::pipeline::GraphMetric::PageRank),
+        Self::Graph(crate::query::pipeline::GraphMetric::Degree),
+        Self::Graph(crate::query::pipeline::GraphMetric::Betweenness),
+        Self::Graph(crate::query::pipeline::GraphMetric::SaPpr),
+        Self::Graph(crate::query::pipeline::GraphMetric::HarmonicCentrality),
+        Self::Graph(crate::query::pipeline::GraphMetric::WeightedDistance),
+        Self::Graph(crate::query::pipeline::GraphMetric::NodeSimilarity),
+        Self::Graph(crate::query::pipeline::GraphMetric::CoreNumber),
+        Self::Graph(crate::query::pipeline::GraphMetric::TriangleCount),
+        Self::Graph(crate::query::pipeline::GraphMetric::ClusteringCoefficient),
+        Self::Graph(crate::query::pipeline::GraphMetric::Authority),
+        Self::Graph(crate::query::pipeline::GraphMetric::Hub),
     ];
 
     fn key(self, var: &str) -> String {
-        format!("\0{self:?}:{var}")
+        format!("\0{var}:{self:?}")
     }
 
     fn clear_snapshot(var: &str, values: &mut BTreeMap<String, RuntimeValue>) {
-        for metric in Self::ALL {
-            values.remove(&metric.key(var));
+        let prefix = format!("\0{var}:");
+        values.retain(|key, _| !key.starts_with(&prefix));
+    }
+
+    fn score(
+        self,
+        row: &crate::query::pipeline::NodeRow,
+    ) -> Option<crate::query::pipeline::ScoreValue> {
+        match self {
+            Self::Similarity => row.similarity,
+            Self::GraphScore => row.graph_score,
+            Self::TextScore => row.text_score,
+            Self::DiversityScore => row.diversity_score,
+            Self::ResidualScore => row.residual_score,
+            Self::TopicScore => row.topic_score,
+            Self::PathStrength => row.path_strength,
+            Self::Graph(metric) => row.graph_metric(metric),
+            _ => None,
         }
     }
 
     fn value(self, row: &crate::query::pipeline::NodeRow, var: &str) -> RuntimeValue {
+        if let Some(bindings) = &row.bindings
+            && !matches!(bindings.get(var), Some(RuntimeValue::Node(_)))
+        {
+            return RuntimeValue::Null;
+        }
         if var != current_binding(row) {
             return row
                 .bindings
@@ -2187,18 +2301,16 @@ impl BoundMetric {
                 .cloned()
                 .unwrap_or(RuntimeValue::Null);
         }
-        use crate::query::pipeline::ScoreKind;
         match self {
-            Self::Similarity => row.similarity.map(|score| RuntimeValue::Float(score.value)),
-            Self::SimilarityApproximate => row
-                .similarity
-                .map(|score| RuntimeValue::Bool(score.kind == ScoreKind::Approximate)),
+            Self::Depth => row.provenance.min_depth.map(|v| runtime_u64(v as u64)),
+            Self::Topic => row.topic_id.map(runtime_u64),
+            Self::Community => row.community_id.map(runtime_u64),
+            Self::PairLeft => row.pair.map(|v| runtime_u64(v.0)),
+            Self::PairRight => row.pair.map(|v| runtime_u64(v.1)),
             Self::Path => row.path.clone().map(RuntimeValue::Path),
-            Self::PathStrength => row
-                .path_strength
-                .map(|score| RuntimeValue::Float(score.value)),
             Self::PathCount => row.path_count.map(|count| runtime_u64(count as u64)),
             Self::PathRank => row.path_rank.map(|rank| runtime_u64(rank as u64)),
+            metric => metric.score(row).map(|s| RuntimeValue::Float(s.value)),
         }
         .unwrap_or(RuntimeValue::Null)
     }
@@ -2209,12 +2321,35 @@ impl BoundMetric {
         to: &str,
         values: &mut BTreeMap<String, RuntimeValue>,
     ) {
+        use crate::query::pipeline::ScoreKind;
+        Self::clear_snapshot(to, values);
+        let source_prefix = format!("\0{from}:");
+        if from != current_binding(row) {
+            if let Some(bindings) = &row.bindings {
+                for (key, value) in bindings
+                    .range(source_prefix.clone()..)
+                    .take_while(|(key, _)| key.starts_with(&source_prefix))
+                {
+                    values.insert(
+                        format!("\0{to}:{}", &key[source_prefix.len()..]),
+                        value.clone(),
+                    );
+                }
+            }
+            return;
+        }
         for metric in Self::ALL {
-            let key = metric.key(to);
             let value = metric.value(row, from);
-            if matches!(value, RuntimeValue::Null) {
-                values.remove(&key);
-            } else {
+            if !matches!(value, RuntimeValue::Null) {
+                let key = metric.key(to);
+                if let Some(score) = metric.score(row)
+                    && score.kind != ScoreKind::Exact
+                {
+                    values.insert(
+                        format!("{key}:approx"),
+                        RuntimeValue::Bool(score.kind == ScoreKind::Approximate),
+                    );
+                }
                 values.insert(key, value);
             }
         }
@@ -2238,34 +2373,54 @@ fn activate_projected_metrics(
     values: &BTreeMap<String, RuntimeValue>,
 ) {
     use crate::query::pipeline::{ScoreKind, ScoreValue};
-    let number = |metric: BoundMetric| match values.get(&metric.key(primary)) {
-        Some(RuntimeValue::Float(value)) => Some(*value),
-        _ => None,
+    let score = |metric: BoundMetric| {
+        let key = metric.key(primary);
+        let Some(RuntimeValue::Float(value)) = values.get(&key) else {
+            return None;
+        };
+        let kind = match values.get(&format!("{key}:approx")) {
+            Some(RuntimeValue::Bool(true)) => ScoreKind::Approximate,
+            Some(RuntimeValue::Bool(false)) => ScoreKind::DepthBounded,
+            _ => ScoreKind::Exact,
+        };
+        Some(ScoreValue {
+            value: *value,
+            kind,
+        })
     };
     let count = |metric: BoundMetric| match values.get(&metric.key(primary)) {
         Some(RuntimeValue::Int(value)) => usize::try_from(*value).ok(),
         Some(RuntimeValue::UInt(value)) => usize::try_from(*value).ok(),
         _ => None,
     };
-    row.similarity = number(BoundMetric::Similarity).map(|value| ScoreValue {
-        value,
-        kind: if matches!(
-            values.get(&BoundMetric::SimilarityApproximate.key(primary)),
-            Some(RuntimeValue::Bool(true))
-        ) {
-            ScoreKind::Approximate
-        } else {
-            ScoreKind::Exact
-        },
-    });
+    row.similarity = score(BoundMetric::Similarity);
     row.path = match values.get(&BoundMetric::Path.key(primary)) {
         Some(RuntimeValue::Path(path)) => Some(path.clone()),
         _ => None,
     };
-    row.path_strength = number(BoundMetric::PathStrength).map(|value| ScoreValue {
-        value,
-        kind: ScoreKind::Exact,
-    });
+    row.path_strength = score(BoundMetric::PathStrength);
+    let unsigned = |metric: BoundMetric| match values.get(&metric.key(primary)) {
+        Some(RuntimeValue::Int(value)) => u64::try_from(*value).ok(),
+        Some(RuntimeValue::UInt(value)) => Some(*value),
+        _ => None,
+    };
+    row.provenance.min_depth = count(BoundMetric::Depth);
+    row.topic_id = unsigned(BoundMetric::Topic);
+    row.community_id = unsigned(BoundMetric::Community);
+    row.pair = unsigned(BoundMetric::PairLeft).zip(unsigned(BoundMetric::PairRight));
+    row.graph_score = score(BoundMetric::GraphScore);
+    row.text_score = score(BoundMetric::TextScore);
+    row.diversity_score = score(BoundMetric::DiversityScore);
+    row.residual_score = score(BoundMetric::ResidualScore);
+    row.topic_score = score(BoundMetric::TopicScore);
+    row.graph_metrics.clear();
+    for metric in BoundMetric::ALL {
+        if let BoundMetric::Graph(name) = metric
+            && let Some(value) = score(metric)
+        {
+            row.graph_metrics.insert(name, value);
+        }
+    }
     row.path_count = count(BoundMetric::PathCount);
     row.path_rank = count(BoundMetric::PathRank);
 }
@@ -2314,7 +2469,6 @@ impl<T: VectorType> crate::query::pipeline::PipelineOperator<T> for TqlMatchSour
                         .and_then(|node| node.var.as_ref())
                         .and_then(|name| nodes.get(name))
                         .map(|node| node.id)
-                        .or_else(|| nodes.values().map(|node| node.id).min())
                         .ok_or_else(|| TriviumError::QueryExecution("MATCH 管线来源缺少锚点身份 (MATCH pipeline source has no anchor identity)".into()))?;
                     Ok(EdgeBindingRow { nodes, edge: None, anchor })
                 })
@@ -2327,7 +2481,9 @@ impl<T: VectorType> crate::query::pipeline::PipelineOperator<T> for TqlMatchSour
                 (MATCH_ROW.into(), BindingValue::Bool(true)),
             ]);
             for node in &pattern.nodes {
-                if let Some(name) = &node.var {
+                if let Some(name) = &node.var
+                    && name != MATCH_ANCHOR
+                {
                     bindings.insert(
                         name.clone(),
                         source
@@ -2588,30 +2744,6 @@ fn collect_predicate_equalities(
     }
 }
 
-fn filter_is_equality_conjunction(filter: &Filter) -> bool {
-    match filter {
-        Filter::Eq(field, _) => field != "id",
-        Filter::And(filters) => {
-            !filters.is_empty() && filters.iter().all(filter_is_equality_conjunction)
-        }
-        _ => false,
-    }
-}
-
-fn collect_filter_equalities(filter: &Filter, output: &mut Vec<(String, serde_json::Value)>) {
-    match filter {
-        Filter::Eq(field, value) if field != "id" => {
-            output.push((field.clone(), value.clone()));
-        }
-        Filter::And(filters) => {
-            for filter in filters {
-                collect_filter_equalities(filter, output);
-            }
-        }
-        _ => {}
-    }
-}
-
 struct PipelinePredicateFilter {
     predicate: Predicate,
 }
@@ -2664,18 +2796,12 @@ impl<T: VectorType> crate::query::pipeline::PipelineOperator<T> for TqlNumericIn
     ) -> Result<crate::query::pipeline::NodeSet, TriviumError> {
         let mut rows = input.into_rows();
         for (field, value) in &self.equalities {
-            let mut allowed = HashSet::new();
-            let mut complete = true;
-            for key in numeric_equality_keys(value) {
-                let Some(ids) = context.memtable.find_by_property_index(field, &key) else {
-                    complete = false;
-                    break;
-                };
-                allowed.extend(ids);
-            }
-            // 只有完整的等价键并集才可缩小候选；最终谓词统一复核。
-            if complete {
-                rows.retain(|row| allowed.contains(&row.id));
+            let postings: Option<Vec<_>> = numeric_equality_keys(value)
+                .iter()
+                .map(|key| context.memtable.property_posting(field, key))
+                .collect();
+            if let Some(postings) = postings {
+                rows.retain(|row| postings.iter().any(|posting| posting.contains(row.id)));
             }
         }
         Ok(crate::query::pipeline::NodeSet::from_rows(rows))
@@ -2736,61 +2862,30 @@ fn eval_pipeline_row_expr<T: VectorType>(
             }
         }
         TqlExpr::Similarity { var } => BoundMetric::Similarity.value(row, var),
-        TqlExpr::GraphScore { .. } => row
-            .graph_score
-            .map(|score| RuntimeValue::Float(score.value))
-            .unwrap_or(RuntimeValue::Null),
-        TqlExpr::GraphMetric { metric, .. } => {
+        TqlExpr::Depth { var } => BoundMetric::Depth.value(row, var),
+        TqlExpr::GraphScore { var } => BoundMetric::GraphScore.value(row, var),
+        TqlExpr::TextScore { var } => BoundMetric::TextScore.value(row, var),
+        TqlExpr::DiversityScore { var } => BoundMetric::DiversityScore.value(row, var),
+        TqlExpr::ResidualScore { var } => BoundMetric::ResidualScore.value(row, var),
+        TqlExpr::Topic { var } => BoundMetric::Topic.value(row, var),
+        TqlExpr::TopicScore { var } => BoundMetric::TopicScore.value(row, var),
+        TqlExpr::Community { var } => BoundMetric::Community.value(row, var),
+        TqlExpr::PairLeft { var } => BoundMetric::PairLeft.value(row, var),
+        TqlExpr::PairRight { var } => BoundMetric::PairRight.value(row, var),
+        TqlExpr::GraphMetric { var, metric } => {
             crate::query::pipeline::graph_metric_from_name(metric)
-                .and_then(|metric| row.graph_metric(metric))
-                .map(|score| RuntimeValue::Float(score.value))
-                .unwrap_or(RuntimeValue::Null)
+                .map_or(RuntimeValue::Null, |metric| {
+                    BoundMetric::Graph(metric).value(row, var)
+                })
         }
-        TqlExpr::TextScore { .. } => row
-            .text_score
-            .map(|score| RuntimeValue::Float(score.value))
-            .unwrap_or(RuntimeValue::Null),
-        TqlExpr::DiversityScore { .. } => row
-            .diversity_score
-            .map(|score| RuntimeValue::Float(score.value))
-            .unwrap_or(RuntimeValue::Null),
-        TqlExpr::ResidualScore { .. } => row
-            .residual_score
-            .map(|score| RuntimeValue::Float(score.value))
-            .unwrap_or(RuntimeValue::Null),
-        TqlExpr::Topic { .. } => row
-            .topic_id
-            .map(|topic| RuntimeValue::Int(topic as i64))
-            .unwrap_or(RuntimeValue::Null),
-        TqlExpr::TopicScore { .. } => row
-            .topic_score
-            .map(|score| RuntimeValue::Float(score.value))
-            .unwrap_or(RuntimeValue::Null),
-        TqlExpr::Depth { .. } => row
-            .provenance
-            .min_depth
-            .map(|depth| RuntimeValue::Int(depth as i64))
-            .unwrap_or(RuntimeValue::Null),
         TqlExpr::PathStrength { var } => BoundMetric::PathStrength.value(row, var),
         TqlExpr::PathCount { var } => BoundMetric::PathCount.value(row, var),
-        TqlExpr::Community { .. } => row
-            .community_id
-            .map(runtime_u64)
-            .unwrap_or(RuntimeValue::Null),
         TqlExpr::Path { var } => BoundMetric::Path.value(row, var),
         TqlExpr::PathLength { var } => match BoundMetric::Path.value(row, var) {
             RuntimeValue::Path(path) => runtime_u64(path.len().saturating_sub(1) as u64),
             _ => RuntimeValue::Null,
         },
         TqlExpr::PathRank { var } => BoundMetric::PathRank.value(row, var),
-        TqlExpr::PairLeft { .. } => row
-            .pair
-            .map(|(left, _)| runtime_u64(left))
-            .unwrap_or(RuntimeValue::Null),
-        TqlExpr::PairRight { .. } => row
-            .pair
-            .map(|(_, right)| runtime_u64(right))
-            .unwrap_or(RuntimeValue::Null),
         TqlExpr::Binary { left, op, right } => eval_binary(
             eval_pipeline_row_expr(left, row, mt),
             *op,
@@ -2828,6 +2923,7 @@ fn eval_pipeline_row_predicate<T: VectorType>(
                 RuntimeValue::Node(id) => mt
                     .get_payload(id)
                     .is_some_and(|payload| filter.matches(&payload)),
+                RuntimeValue::Edge(edge) => filter.matches(&edge_json(&edge)),
                 RuntimeValue::Json(value) => filter.matches(&value),
                 _ => false,
             }
@@ -2950,21 +3046,33 @@ fn execute_find<T: VectorType>(
     memory: &QueryMemory,
 ) -> Result<(TqlResult<T>, bool), TriviumError> {
     let mut results = Vec::new();
-    let ordered_plan = find_ordered_find_plan(query, filter, mt);
-    let ordered_output = ordered_plan.is_some();
-    let access_plan = ordered_plan
-        .clone()
-        .unwrap_or_else(|| plan_find_filter(query, filter, mt, row_limit));
-    let full_scan = matches!(access_plan.access_path, AccessPath::FullNodeScan);
-    let filter_covered = query.predicate.is_none()
-        && matches!(
-            (&access_plan.access_path, filter),
-            (AccessPath::PropertyIndex { field: indexed }, Filter::Eq(field, _)) if indexed == field
-        );
-    let candidate_ids: Box<dyn Iterator<Item = NodeId> + '_> = if full_scan {
-        Box::new(mt.active_node_ids())
+    let cursor = find_ordered_field(query).and_then(|(field, desc)| {
+        let bound = super::planner::ordered_range(filter)
+            .filter(|(name, ..)| *name == field)
+            .map(|(_, op, inclusive, value)| (op, inclusive, value));
+        mt.property_indexes().ordered_cursor(field, desc, bound)
+    });
+    let ordered_output = cursor.is_some();
+    let mut filter_covered = false;
+    let candidate_ids: Box<dyn Iterator<Item = NodeId> + '_> = if let Some(cursor) = cursor {
+        Box::new(cursor)
     } else {
-        Box::new(access_plan.candidates.into_iter())
+        let mut plan = plan_find_filter(query, filter, mt, row_limit);
+        filter_covered = query.predicate.is_none()
+            && matches!(
+                (&plan.access_path, filter),
+                (AccessPath::PropertyIndex { field: indexed }, Filter::Eq(field, _)) if indexed == field
+            );
+        if matches!(
+            plan.access_path,
+            AccessPath::FullNodeScan | AccessPath::ColdPayloadScan
+        ) {
+            Box::new(mt.active_node_ids())
+        } else {
+            // 未指定顺序时，所有访问路径统一按实体身份分页。
+            plan.candidates.sort_unstable();
+            Box::new(plan.candidates.into_iter())
+        }
     };
     for (scanned, id) in candidate_ids.enumerate() {
         if scanned & 0xff == 0
@@ -3013,8 +3121,12 @@ fn plan_find_filter<T: VectorType>(
     mt: &MemTable<T>,
     row_limit: usize,
 ) -> NodeAccessPlan {
-    let candidate_limit = query.predicate.is_none().then_some(row_limit);
-    plan_filter_with_limit(filter, candidate_limit, mt)
+    let candidate_limit = if query.predicate.is_none() {
+        row_limit
+    } else {
+        usize::MAX
+    };
+    plan_filter_with_limit(filter, Some(candidate_limit), mt)
 }
 
 fn find_ordered_field(query: &TqlQuery) -> Option<(&str, bool)> {
@@ -3026,9 +3138,18 @@ fn find_ordered_field(query: &TqlQuery) -> Option<(&str, bool)> {
         return None;
     };
     // 返回别名先在投影作用域求值，事实字段的索引须先证明排序等价。
-    if let ReturnClause::Expressions(items) = &query.returns
-        && items.iter().any(|item| item.alias.as_ref() == Some(var))
-    {
+    let projected = match &query.returns {
+        ReturnClause::Expressions(items) => items
+            .iter()
+            .rev()
+            .find(|item| return_column_name(item) == *var),
+        _ => None,
+    };
+    let is_node = projected.map_or(
+        var == "_",
+        |item| matches!(&item.kind, ReturnExprKind::Var(name) if name == "_"),
+    );
+    if !is_node {
         return None;
     }
     if field == "id" {
@@ -3039,13 +3160,19 @@ fn find_ordered_field(query: &TqlQuery) -> Option<(&str, bool)> {
 
 fn find_ordered_find_plan<T: VectorType>(
     query: &TqlQuery,
-    filter: &Filter,
     mt: &MemTable<T>,
 ) -> Option<super::planner::NodeAccessPlan> {
     let (field, descending) = find_ordered_field(query)?;
-    // ORDER BY 索引只能提供候选顺序；入口 Filter 和 WHERE 都可能继续淘汰候选。
-    // 在过滤前按 OFFSET + LIMIT 截断会造成分页缺行，因此这里必须读取完整有序候选。
-    plan_filter_ordered(filter, field, descending, None, mt)
+    mt.property_indexes()
+        .has_exact_ordered_index(field)
+        .then(|| NodeAccessPlan {
+            access_path: AccessPath::OrderedPropertyIndex {
+                field: field.into(),
+                descending,
+            },
+            estimated_rows: mt.node_count(),
+            candidates: Vec::new(),
+        })
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -3083,7 +3210,7 @@ fn execute_match<T: VectorType>(
     }
 
     let graph = limits.graph(mt);
-    let match_plan = scoped_match_plan(pattern, mt, optional, limits);
+    let match_plan = scoped_match_plan(query, pattern, mt, optional, limits);
     let planned_pattern = &match_plan.pattern;
     let full_scan = matches!(
         match_plan.access_path,
@@ -3163,50 +3290,52 @@ fn execute_match<T: VectorType>(
 //  SEARCH 执行路径 (桥接到向量管线)
 // ═══════════════════════════════════════════════════════════════════════
 
+fn shorthand_search_filter(query: &TqlQuery) -> Option<&Filter> {
+    match (&query.entry, &query.predicate) {
+        (QueryEntry::Search { expand: None, .. }, Some(Predicate::DocFilter { var, filter }))
+            if query.pipeline.is_empty() && var.as_deref().is_none_or(|name| name == "_") =>
+        {
+            Some(filter)
+        }
+        _ => None,
+    }
+}
+
 fn lower_shorthand_search<T: VectorType>(
     vector: &[serde_json::Number],
     top_k: usize,
     expand: Option<&ExpandClause>,
-    query: &TqlQuery,
+    search_filter: Option<&Filter>,
     mt: &MemTable<T>,
 ) -> Result<Vec<Box<dyn crate::query::pipeline::PipelineOperator<T>>>, TriviumError> {
-    let indexed_filter = if expand.is_none() {
-        query
-            .predicate
-            .as_ref()
-            .and_then(|predicate| match predicate {
-                Predicate::DocFilter { var, filter }
-                    if var.as_deref().is_none_or(|var| var == "_")
-                        && filter_is_equality_conjunction(filter) =>
-                {
-                    let mut equalities = Vec::new();
-                    collect_filter_equalities(filter, &mut equalities);
-                    let candidates = if equalities.len() == 1 {
-                        mt.find_by_property_index(&equalities[0].0, &equalities[0].1)
-                    } else {
-                        mt.find_by_composite_property_index(&equalities)
-                            .map(|(_, ids)| ids)
-                            .or_else(|| mt.find_by_bitmap_intersection(&equalities))
-                    }?;
-                    Some((filter.clone(), candidates))
-                }
-                _ => None,
-            })
-    } else {
-        None
-    };
-    if let Some((filter, candidates)) = indexed_filter {
-        return Ok(vec![
-            Box::new(crate::query::pipeline::NodeIdsSource { ids: candidates }),
-            Box::new(crate::query::pipeline::PayloadFilter { filter }),
-            Box::new(crate::query::pipeline::ExactRerank {
-                query: vector
-                    .iter()
-                    .map(T::from_json_number)
-                    .collect::<Result<Vec<_>, _>>()?,
-                top_k: Some(top_k),
-            }),
-        ]);
+    if let Some(filter) = search_filter {
+        use crate::query::pipeline::{
+            ExactRerank, FilteredNodeScanSource, NodeIdsSource, PayloadFilter, PipelineOperator,
+        };
+        let plan = plan_filter_with_limit(filter, Some(usize::MAX), mt);
+        let mut stages: Vec<Box<dyn PipelineOperator<T>>> = match plan.access_path {
+            AccessPath::FullNodeScan | AccessPath::ColdPayloadScan => {
+                vec![Box::new(FilteredNodeScanSource {
+                    filter: filter.clone(),
+                })]
+            }
+            _ => vec![
+                Box::new(NodeIdsSource {
+                    ids: plan.candidates,
+                }),
+                Box::new(PayloadFilter {
+                    filter: filter.clone(),
+                }),
+            ],
+        };
+        stages.push(Box::new(ExactRerank {
+            query: vector
+                .iter()
+                .map(T::from_json_number)
+                .collect::<Result<_, _>>()?,
+            top_k: Some(top_k),
+        }));
+        return Ok(stages);
     }
     crate::query::pipeline::lower_search_entry(vector, top_k, expand)
 }
@@ -4009,13 +4138,15 @@ fn generate_explain_plan<T: VectorType>(
     plan.insert("entry".into(), serde_json::json!(entry_type));
     plan.insert("detail".into(), serde_json::json!(entry_detail));
 
+    let search_filter = shorthand_search_filter(query);
     let (access_path, estimated_rows, reversed) = match &query.entry {
         QueryEntry::Find { filter } => {
-            let planned = find_plan.unwrap_or_else(|| plan_filter(filter, mt));
+            let planned =
+                find_plan.unwrap_or_else(|| plan_filter_with_limit(filter, Some(usize::MAX), mt));
             (planned.access_path, planned.estimated_rows, false)
         }
         QueryEntry::Match { pattern } => {
-            let planned = scoped_match_plan(pattern, mt, false, limits);
+            let planned = scoped_match_plan(query, pattern, mt, false, limits);
             (
                 planned.access_path,
                 planned.estimated_rows,
@@ -4023,13 +4154,19 @@ fn generate_explain_plan<T: VectorType>(
             )
         }
         QueryEntry::OptionalMatch { pattern } => {
-            let planned = scoped_match_plan(pattern, mt, true, limits);
+            let planned = scoped_match_plan(query, pattern, mt, true, limits);
             (planned.access_path, planned.estimated_rows, false)
         }
-        QueryEntry::Search { .. }
-        | QueryEntry::Text { .. }
-        | QueryEntry::Documents { .. }
-        | QueryEntry::Pelorus { .. } => (AccessPath::FullNodeScan, mt.node_count(), false),
+        QueryEntry::Search { .. } => search_filter.map_or_else(
+            || (AccessPath::FullNodeScan, mt.node_count(), false),
+            |filter| {
+                let planned = plan_filter_with_limit(filter, Some(usize::MAX), mt);
+                (planned.access_path, planned.estimated_rows, false)
+            },
+        ),
+        QueryEntry::Text { .. } | QueryEntry::Documents { .. } | QueryEntry::Pelorus { .. } => {
+            (AccessPath::FullNodeScan, mt.node_count(), false)
+        }
     };
     plan.insert(
         "access_path".into(),
@@ -4059,6 +4196,7 @@ fn generate_explain_plan<T: VectorType>(
         AccessPath::EdgeLabelIndex { labels } => {
             format!("label_index pushdown (labels: [{}])", labels.join(", "))
         }
+        AccessPath::EmptyResult => "empty_result".to_owned(),
         AccessPath::ColdPayloadScan => "cold_payload_scan".to_owned(),
         AccessPath::FullNodeScan => "full_scan".to_owned(),
     };
@@ -4134,7 +4272,15 @@ fn generate_explain_plan<T: VectorType>(
         );
     }
     if let QueryEntry::Search { vector, top_k, .. } = &query.entry {
-        let estimated_candidates = top_k.saturating_mul(8).max(64).min(mt.node_count());
+        let estimated_candidates = if search_filter.is_some() {
+            estimated_rows
+        } else {
+            top_k.saturating_mul(8).max(64).min(mt.node_count())
+        };
+        plan.insert(
+            "filter_before_top_k".into(),
+            serde_json::json!(search_filter.is_some()),
+        );
         let estimated_temp_bytes =
             estimated_candidates.saturating_mul(std::mem::size_of::<(NodeId, f32)>());
         let estimated_vector_page_reads = estimated_candidates
@@ -4143,7 +4289,7 @@ fn generate_explain_plan<T: VectorType>(
             .div_ceil(4096);
         plan.insert(
             "vector_access_path".into(),
-            serde_json::json!(if mt.quiver().is_some() {
+            serde_json::json!(if search_filter.is_none() && mt.quiver().is_some() {
                 "ann_post_filter"
             } else {
                 "exact_fallback"
@@ -4676,6 +4822,25 @@ fn execute_create<T: VectorType>(
     limits: &ExecutionContext,
     memory: &QueryMemory,
 ) -> Result<Vec<MutationOp<T>>, TriviumError> {
+    if let Some(source) = source {
+        for node in &create.nodes {
+            if node
+                .payload
+                .as_object()
+                .is_some_and(|fields| !fields.is_empty())
+                && let Some(var) = &node.var
+                && source
+                    .pattern
+                    .nodes
+                    .iter()
+                    .any(|bound| bound.var.as_ref() == Some(var))
+            {
+                return Err(TriviumError::QueryExecution(format!(
+                    "请使用 SET 修改已绑定节点 {var} (Use SET to modify bound node {var})"
+                )));
+            }
+        }
+    }
     let matches = if let Some(source) = source {
         let query = build_match_query(&source.pattern, source.predicate.as_ref());
         execute_tql_context(&query, mt, limits.for_entry())?
@@ -4763,11 +4928,18 @@ fn execute_set_vector<T: VectorType>(
         .iter()
         .map(T::from_json_number)
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(results
+    let ids: BTreeSet<_> = results
         .iter()
-        .filter_map(|row| row.get(var))
-        .map(|node| MutationOp::UpdateVector {
-            id: node.id,
+        .filter_map(|row| row.get(var).map(|node| node.id))
+        .collect();
+    memory.retain(
+        ids.len()
+            .saturating_mul(std::mem::size_of_val(converted.as_slice())),
+    )?;
+    Ok(ids
+        .into_iter()
+        .map(|id| MutationOp::UpdateVector {
+            id,
             vector: converted.clone(),
         })
         .collect())
@@ -4820,8 +4992,8 @@ fn execute_set<T: VectorType>(
 
     // 同一节点的多字段及重复字段赋值按文本顺序合并，只生成一次替换。
     let mut payloads = BTreeMap::new();
-    for row in &results {
-        for (index, assign) in assignments.iter().enumerate() {
+    for (index, assign) in assignments.iter().enumerate() {
+        for row in &results {
             (|| {
                 let node = row.get(&assign.var).ok_or_else(|| {
                     TriviumError::QueryExecution(format!(

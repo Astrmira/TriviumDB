@@ -114,6 +114,77 @@ fn u64_jsonl往返保留全部整数位模式与边元数据() {
 }
 
 #[test]
+fn 跨库导入归档指针整批拒绝并保留原文档检索() {
+    use triviumdb::document::{
+        DocumentNode, DocumentSearchLevel, DocumentSearchQuery, parsing::DocumentParseInput,
+    };
+    let root = TempDir::new().unwrap();
+    let path = |name| root.path().join(name).to_str().unwrap().to_owned();
+    let (source, target, dump) = (path("source.tdb"), path("target.tdb"), path("data.jsonl"));
+    for (file, id, content) in [
+        (&source, 3, "exported archive"),
+        (&target, 2, "independent original"),
+    ] {
+        let mut db = Database::<f32>::open(file, 1).unwrap();
+        if id == 3 {
+            db.insert_with_id(1, &[1.], json!({"ordinary":true}))
+                .unwrap();
+        }
+        let input = DocumentParseInput {
+            source_id: "source.txt".into(),
+            source_revision: "1".into(),
+            content: content.into(),
+            format: Default::default(),
+            media_type: None,
+            config: Default::default(),
+        };
+        db.ingest_document(
+            &input,
+            DocumentNode {
+                id,
+                vector: vec![1.],
+                payload: Default::default(),
+            },
+            vec![],
+            None,
+        )
+        .unwrap();
+        db.close().unwrap();
+    }
+    tdb().args(["export", &source, &dump]).assert().success();
+    let before = files(Path::new(&target));
+    let output = tdb()
+        .args(["--format=json", "import", &target, &dump])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["code"], "TDB_INVALID_INPUT");
+    assert_eq!(files(Path::new(&target)), before);
+    let db = Database::<f32>::open_read_only(&target, 1).unwrap();
+    assert_eq!(db.all_node_ids().unwrap(), [2]);
+    assert_eq!(
+        db.get_document(2).unwrap().unwrap().content,
+        "independent original"
+    );
+    let query = DocumentSearchQuery {
+        text: "independent".into(),
+        level: DocumentSearchLevel::Document,
+        document_ids: vec![2],
+        ..Default::default()
+    };
+    let result = db.search_documents(&query).unwrap();
+    assert_eq!(
+        result
+            .groups
+            .iter()
+            .map(|group| group.document_id)
+            .collect::<Vec<_>>(),
+        [2]
+    );
+}
+
+#[test]
 fn 浮点jsonl往返保留向量payload与边元数据() {
     roundtrip(
         "f32",
@@ -450,4 +521,52 @@ fn 导出保护所有制品名称族及文本硬链接并保留可检索正文()
     ));
     assert_eq!(db.get_payload(1).unwrap(), Some(json!({"fact":"alpha"})));
     db.close().unwrap();
+}
+
+#[test]
+fn 导入预算按原始字节及节点与边合计且拒绝保留原库() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("data.tdb");
+    let input = root.path().join("import.jsonl");
+    let mut db = Database::<f32>::open(path.to_str().unwrap(), 1).unwrap();
+    db.insert_with_id(1, &[1.], json!("existing")).unwrap();
+    db.close().unwrap();
+    let batch = r#"{"id":2,"vector":[2],"edges":[{"target":1,"label":"r","weight":0.5}]}
+{"id":3,"vector":[3],"payload":"新"}
+"#;
+    std::fs::write(&input, batch).unwrap();
+    for (bytes, ops, accept) in [
+        (batch.len() - 1, 3, false),
+        (batch.len(), 2, false),
+        (batch.len(), 3, true),
+    ] {
+        let cmd = tdb()
+            .args([
+                "import",
+                path.to_str().unwrap(),
+                input.to_str().unwrap(),
+                "--dim",
+                "1",
+                "--max-input-bytes",
+                &bytes.to_string(),
+                "--max-operations",
+                &ops.to_string(),
+            ])
+            .assert();
+        if accept {
+            cmd.success();
+        } else {
+            cmd.failure();
+        }
+        let mut db = Database::<f32>::open_read_only(path.to_str().unwrap(), 1).unwrap();
+        assert_eq!(db.get_payload(1).unwrap(), Some(json!("existing")));
+        if accept {
+            assert_eq!(db.all_node_ids().unwrap(), [1, 2, 3]);
+            assert_eq!(db.get_payload(3).unwrap(), Some(json!("新")));
+            assert_eq!(db.get_edge(2, 1, "r").unwrap().unwrap().weight, 0.5);
+        } else {
+            assert_eq!(db.all_node_ids().unwrap(), [1]);
+        }
+        db.close().unwrap();
+    }
 }

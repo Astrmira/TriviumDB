@@ -8,7 +8,7 @@
 use crate::VectorType;
 use crate::database::DatabaseReader;
 use crate::error::{Result, TriviumError};
-use crate::storage::fs::robust_rename_and_sync;
+use crate::storage::fs::{rename_publication_entry, sync_parent_directory};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
@@ -23,6 +23,15 @@ pub struct CurrentGeneration {
     pub format_version: u16,
     pub generation_id: String,
     pub database_file: String,
+}
+
+const RECLAIM_PREFIX: &str = ".tdb-reclaim-";
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+struct ReclaimRecord {
+    generation: String,
+    database_file: String,
+    files: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +122,8 @@ impl GenerationStore {
             .parent()
             .ok_or_else(|| TriviumError::InvalidInput("generation 数据库路径缺少父目录".into()))?;
         std::fs::create_dir_all(&self.root)?;
+        let _management = self.lock_management_exclusive()?;
+        self.ensure_not_reclaiming(generation_id)?;
         match std::fs::create_dir(directory) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -137,6 +148,13 @@ impl GenerationStore {
         let database_path = self
             .canonical_generation_dir(generation_id)?
             .join(database_file);
+        self.ensure_not_reclaiming(
+            database_path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|s| s.to_str())
+                .unwrap_or(generation_id),
+        )?;
         validate_generation_database(&database_path, generation_id)?;
         let current = CurrentGeneration {
             format_version: CURRENT_VERSION,
@@ -154,13 +172,27 @@ impl GenerationStore {
                 reason: error.to_string(),
             }
         })?;
-        {
+        let result = crate::error::WriteErrorInfo::capture(|write| {
             use std::io::Write;
+            write.phase = crate::error::WritePhase::Publish;
             let mut file = std::fs::File::create(&temporary)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
+            drop(file);
+            rename_publication_entry(&temporary, &target)?;
+            // 指针已对读者可见，后续同步失败需由调用方核对发布结果。
+            write.outcome = crate::error::WriteOutcome::Unknown;
+            #[cfg(feature = "test-hooks")]
+            crate::test_hooks::io_result(
+                crate::test_hooks::IoPoint::GenerationPointerDirectorySync,
+            )?;
+            sync_parent_directory(&target)?;
+            Ok(())
+        });
+        if result.is_err() {
+            std::fs::remove_file(&temporary).ok();
         }
-        robust_rename_and_sync(&temporary, &target)?;
+        result?;
         Ok(current)
     }
 
@@ -239,6 +271,17 @@ impl GenerationStore {
         }
         let directory = match self.canonical_generation_dir(generation_id) {
             Err(TriviumError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                let marker = self.reclaim_marker(generation_id);
+                if marker.try_exists()? {
+                    let current_directory =
+                        self.canonical_generation_dir(&current.generation_id)?;
+                    validate_generation_database(
+                        &current_directory.join(&current.database_file),
+                        &current.generation_id,
+                    )?;
+                    let record = Self::read_reclaim_record(&marker, generation_id)?;
+                    Self::finish_reclaim(&marker, &record)?;
+                }
                 return Ok(());
             }
             result => result?,
@@ -267,9 +310,124 @@ impl GenerationStore {
             &current_directory.join(&current.database_file),
             &current.generation_id,
         )?;
-        validate_reclaim_target(&directory)?;
-        std::fs::remove_dir_all(&directory)?;
+        let name = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                TriviumError::InvalidInput("代际名称无效 (Invalid generation name)".into())
+            })?;
+        let marker = self.reclaim_marker(name);
+        // 只有完整校验过的原目录可以进入回收区。残留记录不能授权删除同名替代目录。
+        let record = validate_reclaim_target(&directory)?;
+        if marker.try_exists()? {
+            if Self::read_reclaim_record(&marker, name)? != record {
+                return Err(TriviumError::GenerationBusy {
+                    generation_id: name.to_owned(),
+                });
+            }
+        } else {
+            let mut temporary = tempfile::NamedTempFile::new_in(&self.root)?;
+            serde_json::to_writer(temporary.as_file_mut(), &record)
+                .map_err(std::io::Error::other)?;
+            temporary.as_file().sync_all()?;
+            let temporary = temporary.into_temp_path();
+            super::fs::rename_new(&temporary, &marker)?;
+            sync_parent_directory(&marker)?;
+        }
+        let retired = marker.with_extension("retired");
+        super::fs::rename_new(&directory, &retired)?;
+        sync_parent_directory(&retired)?;
+        Self::finish_reclaim(&marker, &record)
+    }
+
+    fn finish_reclaim(marker: &Path, record: &ReclaimRecord) -> Result<()> {
+        let directory = marker.with_extension("retired");
+        match directory.symlink_metadata() {
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(TriviumError::ImmutableArtifactInvalid {
+                    reason: "回收区须为实际目录 (Retired generation must be a physical directory)"
+                        .into(),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::remove_file(marker)?;
+                sync_parent_directory(marker)?;
+                return Ok(());
+            }
+            result => {
+                result?;
+            }
+        }
+        // 只删除初次校验过的普通文件，重试时允许其中部分文件已经移除。
+        let mut remaining = Vec::new();
+        for entry in std::fs::read_dir(&directory)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file()
+                || !record
+                    .files
+                    .iter()
+                    .any(|name| entry.file_name() == name.as_str())
+            {
+                return Err(TriviumError::ImmutableArtifactInvalid {
+                    reason: "回收目录含未登记制品 (Unregistered reclamation artifact)".into(),
+                });
+            }
+            remaining.push(entry.path());
+        }
+        for file in remaining {
+            std::fs::remove_file(file)?;
+            #[cfg(feature = "test-hooks")]
+            crate::test_hooks::io_result(crate::test_hooks::IoPoint::GenerationArtifactRemoved)?;
+        }
+        std::fs::remove_dir(&directory)?;
+        sync_parent_directory(&directory)?;
+        std::fs::remove_file(marker)?;
+        sync_parent_directory(marker)?;
         Ok(())
+    }
+
+    fn reclaim_marker(&self, generation: &str) -> PathBuf {
+        self.root.join(format!("{RECLAIM_PREFIX}{generation}.json"))
+    }
+
+    fn ensure_not_reclaiming(&self, generation: &str) -> Result<()> {
+        if self.reclaim_marker(generation).try_exists()? {
+            return Err(TriviumError::GenerationBusy {
+                generation_id: generation.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn read_reclaim_record(path: &Path, generation: &str) -> Result<ReclaimRecord> {
+        let invalid = || TriviumError::ImmutableArtifactInvalid {
+            reason: "代际回收记录无效 (Invalid generation reclamation record)".into(),
+        };
+        if !path.symlink_metadata()?.is_file() {
+            return Err(invalid());
+        }
+        let record: ReclaimRecord =
+            serde_json::from_slice(&super::snapshot::read_bounded_metadata(path)?)
+                .map_err(|_| invalid())?;
+        if !super::artifacts::names_equal(&record.generation, generation) {
+            return Err(invalid());
+        }
+        validate_component(&record.database_file, "database_file")?;
+        if !record.files.contains(&record.database_file)
+            || record.files.iter().any(|name| {
+                name.strip_prefix(&record.database_file)
+                    .is_none_or(|suffix| {
+                        !super::artifacts::CHECKPOINT_SUFFIXES.contains(&suffix)
+                            && !matches!(suffix, ".manifest.json" | ".lock" | ".wal")
+                            && !suffix
+                                .strip_prefix(".pld.")
+                                .is_some_and(|n| n.parse::<u64>().is_ok())
+                    })
+            })
+        {
+            return Err(invalid());
+        }
+        Ok(record)
     }
 
     fn lock_management_shared(&self) -> Result<std::fs::File> {
@@ -367,7 +525,7 @@ fn validate_generation_database(path: &Path, generation_id: &str) -> Result<()> 
     Ok(())
 }
 
-fn validate_reclaim_target(directory: &Path) -> Result<()> {
+fn validate_reclaim_target(directory: &Path) -> Result<ReclaimRecord> {
     let invalid = || {
         TriviumError::ImmutableArtifactInvalid {
         reason: "回收目标须只包含一个代际的数据库制品 (Reclamation target must contain artifacts for exactly one generation database)".into(),
@@ -405,7 +563,13 @@ fn validate_reclaim_target(directory: &Path) -> Result<()> {
     }) {
         return Err(invalid());
     }
-    validate_generation_database(&database_path, generation_id)
+    validate_generation_database(&database_path, generation_id)?;
+    names.sort_unstable();
+    Ok(ReclaimRecord {
+        generation: generation_id.to_owned(),
+        database_file,
+        files: names,
+    })
 }
 
 pub struct GenerationReader<T: VectorType> {
@@ -454,10 +618,17 @@ fn validate_component(value: &str, field: &str) -> Result<()> {
 fn validate_generation_name(value: &str) -> Result<()> {
     validate_component(value, "generation_id")?;
     #[cfg(windows)]
-    let value = value.trim_end_matches(['.', ' ']);
-    if super::artifacts::names_equal(value, "current.json") {
+    if value.ends_with(['.', ' ']) {
         return Err(TriviumError::InvalidInput(
-            "代际名称占用当前指针路径 (Generation name conflicts with the current pointer)".into(),
+            "代际名不得以点或空格结尾 (Generation names cannot end in a dot or space)".into(),
+        )
+        .at_field("generation_id"));
+    }
+    if super::artifacts::names_equal(value, "current.json")
+        || value.to_ascii_lowercase().starts_with(RECLAIM_PREFIX)
+    {
+        return Err(TriviumError::InvalidInput(
+            "代际名称占用管理路径 (Generation name conflicts with a management path)".into(),
         )
         .at_field("generation_id"));
     }

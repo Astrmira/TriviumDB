@@ -57,6 +57,52 @@ fn insert_candidate(heap: &mut BinaryHeap<Candidate>, candidate: Candidate, top_
     }
 }
 
+// 精确扫描只扩宽一次半精度查询，所有分片借用同一份已经准入的只读数据。
+struct QueryScorer<'a, T> {
+    query: &'a [T],
+    half: Option<(Vec<f32>, f64)>,
+}
+
+impl<'a, T: VectorType> QueryScorer<'a, T> {
+    fn uses_half() -> bool {
+        std::any::TypeId::of::<T>() == std::any::TypeId::of::<half::f16>()
+    }
+
+    fn workspace_bytes(query: &[T]) -> usize {
+        if Self::uses_half() {
+            query.len().saturating_mul(size_of::<f32>())
+        } else {
+            0
+        }
+    }
+
+    fn new(query: &'a [T]) -> Self {
+        let half = Self::uses_half().then(|| {
+            let components: Vec<_> = query.iter().map(|v| v.to_f32()).collect();
+            let norm = components
+                .iter()
+                .map(|&v| f64::from(v) * f64::from(v))
+                .sum();
+            (components, norm)
+        });
+        Self { query, half }
+    }
+
+    fn score(&self, vector: &[T]) -> f32 {
+        let Some((query, query_norm)) = &self.half else {
+            return T::similarity(self.query, vector);
+        };
+        let mut dot = crate::vector::CompensatedDot::default();
+        let mut norm = 0.;
+        for (&a, &b) in query.iter().zip(vector) {
+            let b = f64::from(b.to_f32());
+            dot.add(f64::from(a) * b);
+            norm += b * b;
+        }
+        crate::vector::normalized_cosine(dot.value(), *query_norm, norm)
+    }
+}
+
 pub fn search<T: VectorType>(
     db: &MemTable<T>,
     query: &[T],
@@ -64,18 +110,29 @@ pub fn search<T: VectorType>(
 ) -> Result<Vec<SearchHit>> {
     db.ensure_readable()?;
     crate::vector::validate_query_vector(query, db.dim())?;
+    let control = crate::request::control().unwrap_or_default();
+    control.check()?;
+    if top_k == 0 {
+        return Err(TriviumError::InvalidInput(
+            "search_exact 的 top_k 必须大于 0 (search_exact requires positive top_k)".into(),
+        ));
+    }
+
+    let top_k = top_k.min(db.internal_slot_count());
+    if top_k == 0 {
+        return Ok(Vec::new());
+    }
+
     let runtime = db.resource_runtime();
     let estimate = top_k
-        .min(db.internal_slot_count())
         .checked_mul(std::mem::size_of::<Candidate>())
         .and_then(|bytes| bytes.checked_mul(runtime.parallelism().saturating_add(1)))
         .and_then(|bytes| bytes.checked_mul(2))
+        .and_then(|bytes| bytes.checked_add(QueryScorer::workspace_bytes(query)))
         .ok_or_else(|| TriviumError::CapacityAllocationFailed {
             reason: "精确查询工作区估算溢出".into(),
         })?;
-    let _workspace = runtime.reserve_workspace(estimate)?;
-    let control = crate::request::control().unwrap_or_default();
-    control.check()?;
+    let _workspace = db.reserve_instance_workspace(estimate)?;
     runtime
         .pool(runtime.parallelism())?
         .install(|| search_inner(db, query, top_k, &control))
@@ -88,17 +145,7 @@ fn search_inner<T: VectorType>(
     control: &crate::query::tql_executor::QueryControl,
 ) -> Result<Vec<SearchHit>> {
     control.check()?;
-    if top_k == 0 {
-        return Err(TriviumError::InvalidInput(
-            "search_exact 的 top_k 必须大于 0".into(),
-        ));
-    }
-
-    let top_k = top_k.min(db.internal_slot_count());
-    if top_k == 0 {
-        return Ok(Vec::new());
-    }
-
+    let scorer = QueryScorer::new(query);
     let candidates = (0..db.internal_slot_count())
         .into_par_iter()
         .try_fold(
@@ -108,7 +155,7 @@ fn search_inner<T: VectorType>(
                 crate::test_hooks::hit(crate::test_hooks::ConcurrencyPoint::ExactScanStep);
                 control.check()?;
                 if let Some((id, vector)) = db.active_vector_at_slot(slot)? {
-                    let score = T::similarity(query, vector);
+                    let score = scorer.score(vector);
                     if score.is_finite() {
                         insert_candidate(&mut heap, Candidate { id, score }, top_k);
                     }
@@ -144,18 +191,22 @@ pub(crate) fn rank_unique_ids<T: VectorType>(
     }
     let bytes = k
         .checked_mul(std::mem::size_of::<Candidate>() * 2)
+        .and_then(|bytes| bytes.checked_add(QueryScorer::workspace_bytes(query)))
         .ok_or_else(|| TriviumError::CapacityAllocationFailed {
             reason: "候选堆工作区溢出 (Candidate heap workspace overflowed)".into(),
         })?;
-    let _workspace = db.resource_runtime().reserve_workspace(bytes)?;
+    let _workspace = db.reserve_instance_workspace(bytes)?;
+    let scorer = QueryScorer::new(query);
     let mut heap = BinaryHeap::with_capacity(k);
     let control = crate::request::control().unwrap_or_default();
     for &id in ids {
+        #[cfg(feature = "test-hooks")]
+        crate::test_hooks::hit(crate::test_hooks::ConcurrencyPoint::ExactScanStep);
         control.check()?;
         if let Some(slot) = db.internal_slot_of(id)
             && let Some((_, vector)) = db.active_vector_at_slot(slot)?
         {
-            let score = T::similarity(query, vector);
+            let score = scorer.score(vector);
             if score.is_finite() {
                 insert_candidate(&mut heap, Candidate { id, score }, k);
             }
@@ -189,7 +240,7 @@ fn hydrate_candidates<T: VectorType>(
                 })
         },
     )?;
-    let _payload_workspace = db.resource_runtime().reserve_workspace(bytes)?;
+    let _payload_workspace = db.reserve_instance_workspace(bytes)?;
     candidates
         .into_iter()
         .map(|candidate| {

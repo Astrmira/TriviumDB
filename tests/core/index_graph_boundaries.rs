@@ -526,3 +526,66 @@ fn 所有dtype在wal前拒绝保留id并保留合法完整u64范围() {
     id_endpoints::<half::f16>();
     id_endpoints::<u64>();
 }
+
+#[test]
+fn 边分页保持双向顺序且自环只出现一次() {
+    use triviumdb::graph::reachability::ReachabilityDirection::{Both, Incoming, Outgoing};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("edge-page.tdb");
+    let path = path.to_str().unwrap();
+    let mut db = triviumdb::Database::<f32>::open(path, 1).unwrap();
+    for id in 1..=3 {
+        db.insert_with_id(id, &[1.], serde_json::json!({})).unwrap();
+    }
+    for (src, dst, label) in [
+        (3, 2, "a"),
+        (2, 3, "b"),
+        (2, 2, "a"),
+        (1, 2, "a"),
+        (2, 1, "a"),
+    ] {
+        db.upsert_edge(src, dst, label, 1., serde_json::json!([src, dst, label]))
+            .unwrap();
+    }
+    for pass in 0..2 {
+        if pass == 1 {
+            db.close().unwrap();
+            db = triviumdb::Database::<f32>::open(path, 1).unwrap();
+        }
+        for (direction, label, expected) in [
+            (
+                Both,
+                None,
+                vec![
+                    (1, 2, "a"),
+                    (2, 1, "a"),
+                    (2, 2, "a"),
+                    (2, 3, "b"),
+                    (3, 2, "a"),
+                ],
+            ),
+            (Incoming, None, vec![(1, 2, "a"), (2, 2, "a"), (3, 2, "a")]),
+            (Outgoing, Some("a"), vec![(2, 1, "a"), (2, 2, "a")]),
+        ] {
+            for (offset, &(src, dst, label_name)) in expected.iter().enumerate() {
+                let (page, total) = db.edge_page(2, direction, label, offset, 1).unwrap();
+                assert_eq!(total, expected.len());
+                assert_eq!(page.len(), 1);
+                let edge = &page[0];
+                assert_eq!(
+                    (edge.source_id, edge.target_id, edge.label.as_str()),
+                    (src, dst, label_name)
+                );
+                assert_eq!(edge.metadata, serde_json::json!([src, dst, label_name]));
+            }
+            let (page, total) = db.edge_page(2, direction, label, usize::MAX, 1).unwrap();
+            assert!(page.is_empty());
+            assert_eq!(total, expected.len());
+        }
+        assert_eq!(
+            db.edge_page(4, Both, None, 0, 1).unwrap_err().code(),
+            "TDB_NODE_NOT_FOUND"
+        );
+    }
+    db.close().unwrap();
+}

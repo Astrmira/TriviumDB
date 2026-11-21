@@ -433,12 +433,16 @@ fn 二进制向量以字符串保留完整位宽() {
 #[test]
 fn 半精度协议使用数值且不把存储位模式当作浮点值() {
     let root = TestDir::new("console_half");
-    let mut db = Database::<half::f16>::open(&root.file("半精度.tdb"), 2).unwrap();
+    let path = root.file("半精度.tdb");
+    let mut db = Database::<half::f16>::open(&path, 2).unwrap();
     let session = ConsoleSession::from_json(r#"{"readOnly":false}"#).unwrap();
-    db.console_request(&session,&request(json!({"operation":"importNodes","records":[{"id":"1","vector":[1.0007,1.0004882812500002],"payload":{}}]}))).unwrap();
-    // 入站先取 f32，再按 half 最近偶数舍入：普通上侧值取 0x3c01，f32 中点取 0x3c00。
-    assert_eq!(db.get(1).unwrap().unwrap().vector[0].to_bits(), 0x3c01);
-    assert_eq!(db.get(1).unwrap().unwrap().vector[1].to_bits(), 0x3c00);
+    db.console_request(&session,&request(json!({"operation":"importNodes","records":[{"id":"1","vector":[1.00048828125,1.0004882812501],"payload":{}}]}))).unwrap();
+    db.close().unwrap();
+    let mut db = Database::<half::f16>::open(&path, 2).unwrap();
+    // 精确中点取偶数，略大于中点取上侧的相邻 half。
+    let session = ConsoleSession::new(ConsoleOptions::default()).unwrap();
+    assert_eq!(db.get(1).unwrap().unwrap().vector[0].to_bits(), 0x3c00);
+    assert_eq!(db.get(1).unwrap().unwrap().vector[1].to_bits(), 0x3c01);
     let result: Value = serde_json::from_str(
         &db.console_request(
             &session,
@@ -449,7 +453,7 @@ fn 半精度协议使用数值且不把存储位模式当作浮点值() {
     .unwrap();
     assert_eq!(
         result["data"]["nodes"][0]["vector"],
-        json!([1.0009765625, 1.0])
+        json!([1.0, 1.0009765625])
     );
     db.close().unwrap();
 }
@@ -626,4 +630,53 @@ fn 宿主关闭失败保留同一文件锁且允许原会话重试() {
         Some(json!({"kind":"alpha"}))
     );
     reopened.close().unwrap();
+}
+
+#[test]
+fn 图读取在过滤和复制之前按会话预算计费() {
+    let root = TestDir::new("console-graph-budget");
+    let mut db = seed(root.file("data.tdb").as_str());
+    db.insert_with_id(3, &[0., 1.], json!({})).unwrap();
+    db.link(1, 2, "first", 1.).unwrap();
+    db.link(1, 3, "last", 1.).unwrap();
+    let small = ConsoleSession::from_json(r#"{"maxOperations":1}"#).unwrap();
+    let enough = ConsoleSession::from_json(r#"{"maxOperations":3}"#).unwrap();
+    for cmd in [
+        json!({"operation":"edges","node":"1"}),
+        json!({"operation":"edges","node":"3","incoming":true}),
+        json!({"operation":"path","source":"1","target":"3","maxDepth":2,"label":"missing"}),
+    ] {
+        let err = db.console_request(&small, &request(cmd)).unwrap_err();
+        assert_eq!(err.code(), "QueueFull");
+        assert_eq!(err.details()["resource"], "console_operations");
+    }
+    assert_eq!(
+        call(
+            &mut db,
+            &enough,
+            json!({"operation":"path","source":"1","target":"3","maxDepth":2,"label":"last"})
+        ),
+        json!({"path":["1","3"]})
+    );
+    db.close().unwrap();
+}
+
+#[test]
+fn 控制台显式行数上限由会话准入() {
+    let root = TestDir::new("console-explicit-limit");
+    let mut db = seed(root.file("data.tdb").as_str());
+    let session = ConsoleSession::from_json(r#"{"maxOperations":1}"#).unwrap();
+    for (query, count) in [
+        ("MATCH (n) RETURN n LIMIT 2", 2),
+        ("MATCH (n) RETURN n LIMIT 1 OFFSET 1", 1),
+    ] {
+        assert_eq!(db.tql_values(query).unwrap().len(), count);
+        let error = db
+            .console_request(
+                &session,
+                &request(json!({"operation":"query","query":query})),
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), "TDB_QUERY_BUDGET");
+    }
 }

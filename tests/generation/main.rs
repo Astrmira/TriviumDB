@@ -456,3 +456,33 @@ fn 真实跨进程reader阻止回收且异常退出后租约自动释放() {
     std::fs::remove_dir_all(root).unwrap();
     std::fs::remove_dir_all(runtime).unwrap();
 }
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn 指针替换后同步失败交回未知结果并可按当前代确认() {
+    let root = tempfile::tempdir().unwrap();
+    let store = GenerationStore::new(root.path());
+    publish(&store, "one", 1.);
+    publish(&store, "two", 0.);
+    store.publish_current("one", "data.tdb").unwrap();
+    let old = store.open_current::<f32>(2).unwrap();
+    {
+        use triviumdb::test_hooks::{IoPoint, fail_io_at};
+        let _failure = fail_io_at(IoPoint::GenerationPointerDirectorySync);
+        let err = store.publish_current("two", "data.tdb").unwrap_err();
+        let write = err.info().write.unwrap();
+        assert_eq!(write.phase, triviumdb::error::WritePhase::Publish);
+        assert_eq!(write.outcome, triviumdb::error::WriteOutcome::Unknown);
+    }
+    assert_eq!(store.resolve_current().unwrap().generation_id, "two");
+    let current = store.open_current::<f32>(2).unwrap();
+    assert_eq!(
+        old.get(1).unwrap().unwrap().payload,
+        json!({"generation":"one"})
+    );
+    assert_eq!(
+        current.get(1).unwrap().unwrap().payload,
+        json!({"generation":"two"})
+    );
+    store.publish_current("two", "data.tdb").unwrap();
+}

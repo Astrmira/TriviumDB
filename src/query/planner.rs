@@ -16,6 +16,7 @@ use std::collections::HashSet;
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AccessPath {
+    EmptyResult,
     NamedGraphMembers { graph_ids: Vec<String> },
     PrimaryKey { id: NodeId },
     PropertyIndex { field: String },
@@ -42,6 +43,7 @@ impl AccessPath {
             Self::PropertyIndexIntersection { .. } => "property_index_intersection",
             Self::EdgeLabelIndex { .. } => "edge_label_index",
             Self::ColdPayloadScan => "cold_payload_scan",
+            Self::EmptyResult => "empty_result",
             Self::FullNodeScan => "full_node_scan",
         }
     }
@@ -107,6 +109,9 @@ pub fn plan_filter_with_limit<T: VectorType>(
     limit: Option<usize>,
     mt: &MemTable<T>,
 ) -> NodeAccessPlan {
+    if let Some(plan) = constant_filter_plan(filter, mt, limit.is_none()) {
+        return plan;
+    }
     if let Filter::Eq(field, value) = filter
         && let Some(candidates) = mt.find_by_property_index_limit(field, value, limit)
     {
@@ -136,18 +141,14 @@ pub fn plan_filter_with_limit<T: VectorType>(
         };
     }
     if let Some((field, op, inclusive, value)) = ordered_range(filter)
-        && let Some(candidates) = mt.find_by_property_range(
-            field,
-            op,
-            inclusive,
-            &value,
-            false,
-            if is_single_ordered_range(filter) {
-                limit
-            } else {
-                None
-            },
-        )
+        && let Some(candidates) = if let Some(limit) =
+            limit.filter(|&count| count != usize::MAX && is_single_ordered_range(filter))
+        {
+            mt.property_indexes()
+                .range_ids_by_identity(field, op, inclusive, &value, limit)
+        } else {
+            mt.find_by_property_range(field, op, inclusive, &value, false, None)
+        }
     {
         return NodeAccessPlan {
             access_path: AccessPath::OrderedPropertyIndex {
@@ -163,7 +164,7 @@ pub fn plan_filter_with_limit<T: VectorType>(
 }
 
 pub fn plan_filter<T: VectorType>(filter: &Filter, mt: &MemTable<T>) -> NodeAccessPlan {
-    plan_filter_impl(filter, mt, true)
+    constant_filter_plan(filter, mt, true).unwrap_or_else(|| plan_filter_impl(filter, mt, true))
 }
 
 fn plan_filter_impl<T: VectorType>(
@@ -295,8 +296,24 @@ pub fn plan_match<T: VectorType>(
     mt: &MemTable<T>,
     optional: bool,
 ) -> MatchPlan {
+    let mut plan = plan_match_scan(pattern, mt, optional, true);
+    if matches!(
+        plan.access_path,
+        AccessPath::FullNodeScan | AccessPath::ColdPayloadScan
+    ) {
+        plan.candidates = mt.all_node_ids();
+    }
+    plan
+}
+
+pub(crate) fn plan_match_scan<T: VectorType>(
+    pattern: &TqlPattern,
+    mt: &MemTable<T>,
+    optional: bool,
+    allow_reverse: bool,
+) -> MatchPlan {
     if optional {
-        let mut forward = if pattern.nodes[0].filter.is_some() {
+        let forward = if pattern.nodes[0].filter.is_some() {
             plan_pattern_start(pattern, mt)
         } else {
             NodeAccessPlan {
@@ -305,7 +322,6 @@ pub fn plan_match<T: VectorType>(
                 candidates: Vec::new(),
             }
         };
-        materialize_full_scan(&mut forward, mt);
         return MatchPlan {
             access_path: forward.access_path,
             estimated_rows: forward.estimated_rows,
@@ -315,7 +331,7 @@ pub fn plan_match<T: VectorType>(
         };
     }
 
-    let mut forward = plan_pattern_start(pattern, mt);
+    let forward = plan_pattern_start(pattern, mt);
     let can_reverse_improve = pattern
         .nodes
         .last()
@@ -329,8 +345,10 @@ pub fn plan_match<T: VectorType>(
             candidates: forward.candidates,
         };
     }
-    if pattern.edges.iter().any(|edge| edge.hop_range.is_some()) || !can_reverse_improve {
-        materialize_full_scan(&mut forward, mt);
+    if pattern.edges.iter().any(|edge| edge.hop_range.is_some())
+        || !can_reverse_improve
+        || !allow_reverse
+    {
         return MatchPlan {
             access_path: forward.access_path,
             estimated_rows: forward.estimated_rows,
@@ -341,12 +359,11 @@ pub fn plan_match<T: VectorType>(
     }
 
     let reversed_pattern = reverse_pattern(pattern);
-    let mut backward = plan_pattern_start(&reversed_pattern, mt);
+    let backward = plan_pattern_start(&reversed_pattern, mt);
     let reverse_is_better = backward.estimated_rows < forward.estimated_rows
         || (backward.estimated_rows == forward.estimated_rows
             && access_path_key(&backward.access_path) < access_path_key(&forward.access_path));
     if reverse_is_better {
-        materialize_full_scan(&mut backward, mt);
         MatchPlan {
             access_path: backward.access_path,
             estimated_rows: backward.estimated_rows,
@@ -355,7 +372,6 @@ pub fn plan_match<T: VectorType>(
             candidates: backward.candidates,
         }
     } else {
-        materialize_full_scan(&mut forward, mt);
         MatchPlan {
             access_path: forward.access_path,
             estimated_rows: forward.estimated_rows,
@@ -408,18 +424,12 @@ pub(crate) fn plan_match_node_filter<T: VectorType>(
         };
     }
     match payload_candidate_filter(filter) {
-        Some(filter) => plan_filter(&filter, mt),
+        Some(filter) => plan_filter_with_limit(&filter, Some(usize::MAX), mt),
         None => NodeAccessPlan {
             access_path: AccessPath::FullNodeScan,
             estimated_rows: mt.node_count(),
             candidates: Vec::new(),
         },
-    }
-}
-
-fn materialize_full_scan<T: VectorType>(plan: &mut NodeAccessPlan, mt: &MemTable<T>) {
-    if matches!(plan.access_path, AccessPath::FullNodeScan) && plan.candidates.is_empty() {
-        plan.candidates = mt.all_node_ids();
     }
 }
 
@@ -450,7 +460,7 @@ fn is_single_ordered_range(filter: &Filter) -> bool {
     )
 }
 
-fn ordered_range(filter: &Filter) -> Option<(&str, Ordering, bool, serde_json::Value)> {
+pub(super) fn ordered_range(filter: &Filter) -> Option<(&str, Ordering, bool, serde_json::Value)> {
     fn exact_ordered_bound(value: serde_json::Value) -> Option<serde_json::Value> {
         const MAX_EXACT_INTEGER: u64 = 1u64 << 53;
         let precise = value
@@ -496,6 +506,47 @@ fn ordered_range(filter: &Filter) -> Option<(&str, Ordering, bool, serde_json::V
     }
 }
 
+fn constant_filter_plan<T: VectorType>(
+    filter: &Filter,
+    mt: &MemTable<T>,
+    materialize_scan: bool,
+) -> Option<NodeAccessPlan> {
+    let value = constant_filter(filter)?;
+    Some(NodeAccessPlan {
+        access_path: if value {
+            AccessPath::FullNodeScan
+        } else {
+            AccessPath::EmptyResult
+        },
+        estimated_rows: if value { mt.node_count() } else { 0 },
+        candidates: if value && materialize_scan {
+            mt.all_node_ids()
+        } else {
+            Vec::new()
+        },
+    })
+}
+
+fn constant_filter(filter: &Filter) -> Option<bool> {
+    match filter {
+        Filter::In(_, values) if values.is_empty() => Some(false),
+        Filter::Nin(_, values) if values.is_empty() => Some(true),
+        Filter::And(parts) | Filter::Or(parts) => {
+            let identity = matches!(filter, Filter::And(_));
+            let mut result = Some(identity);
+            for part in parts {
+                match constant_filter(part) {
+                    Some(value) if value != identity => return Some(value),
+                    None => result = None,
+                    _ => {}
+                }
+            }
+            result
+        }
+        _ => None,
+    }
+}
+
 fn bitmap_filter_candidates<T: VectorType>(
     filter: &Filter,
     mt: &MemTable<T>,
@@ -510,7 +561,7 @@ fn bitmap_filter_candidates<T: VectorType>(
                 HashSet::from([field.clone()]),
                 mt.find_by_bitmap_property_index(field, value)?,
             )),
-            Filter::In(field, values) => {
+            Filter::In(field, values) if !values.is_empty() => {
                 let mut union = Vec::new();
                 for value in values {
                     union.extend(mt.find_by_bitmap_property_index(field, value)?);
@@ -527,7 +578,7 @@ fn bitmap_filter_candidates<T: VectorType>(
                     difference_sorted(universe, &excluded),
                 ))
             }
-            Filter::Nin(field, values) => {
+            Filter::Nin(field, values) if !values.is_empty() => {
                 let mut excluded = Vec::new();
                 for value in values {
                     excluded.extend(mt.find_by_bitmap_property_index(field, value)?);
@@ -708,6 +759,7 @@ fn access_path_key(path: &AccessPath) -> (u8, String) {
         AccessPath::PropertyIndexIntersection { fields } => (6, fields.join("\0")),
         AccessPath::EdgeLabelIndex { labels } => (7, labels.join("\0")),
         AccessPath::ColdPayloadScan => (8, String::new()),
+        AccessPath::EmptyResult => (0, String::new()),
         AccessPath::FullNodeScan => (9, String::new()),
     }
 }

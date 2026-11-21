@@ -1,10 +1,9 @@
 //! TQL、Prepared 参数与查询结果的语言适配。
 
-use super::arguments::{parse_management_string, parse_string_argument};
+use super::arguments::{read_string, write_string};
 use super::database::{DbBackend, TriviumDB};
 use super::errors::to_napi_error;
 use super::json::{NodeJson, enumerable_own_keys, string_from_js};
-use napi::bindgen_prelude::Either;
 use napi::{Env, JsObject, JsUnknown, ValueType};
 use napi_derive::napi;
 
@@ -160,8 +159,8 @@ impl TriviumDB {
     /// const rows = db.tql('FIND {type: "event", heat: {$gte: 0.7}} RETURN *')
     /// ```
     #[napi]
-    pub fn tql(&self, env: Env, query: Either<String, JsUnknown>) -> napi::Result<Vec<NodeJson>> {
-        let query = parse_string_argument(env, query, "query", None)?;
+    pub fn tql(&self, env: Env, query: JsUnknown) -> napi::Result<Vec<NodeJson>> {
+        let query = read_string(env, query, "query")?;
         match &self.inner {
             DbBackend::F32(db) => db
                 .tql_values(&query)
@@ -179,12 +178,8 @@ impl TriviumDB {
     }
 
     #[napi]
-    pub fn prepare_tql(
-        &self,
-        env: Env,
-        query: Either<String, JsUnknown>,
-    ) -> napi::Result<PreparedTql> {
-        let query = parse_string_argument(env, query, "query", None)?;
+    pub fn prepare_tql(&self, env: Env, query: JsUnknown) -> napi::Result<PreparedTql> {
+        let query = read_string(env, query, "query")?;
         dispatch!(self, db => db.prepare_tql(&query))
             .map(|inner| PreparedTql { inner })
             .map_err(|error| to_napi_error(env, error))
@@ -226,12 +221,8 @@ impl TriviumDB {
     /// ```
     /// 执行内核 TQL 写操作。
     #[napi]
-    pub fn tql_mut(
-        &mut self,
-        env: Env,
-        query: Either<String, JsUnknown>,
-    ) -> napi::Result<NodeJson> {
-        let query = parse_management_string(env, query, "query")?;
+    pub fn tql_mut(&mut self, env: Env, query: JsUnknown) -> napi::Result<NodeJson> {
+        let query = write_string(env, query, "query")?;
         let result =
             dispatch!(self, mut db => db.tql_mut_with_id_limit(&query,9_007_199_254_740_991))
                 .map_err(|error| to_napi_error(env, error))?;

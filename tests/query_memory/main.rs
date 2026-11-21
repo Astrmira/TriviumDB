@@ -95,6 +95,109 @@ fn measured<T>(action: impl FnOnce() -> T) -> (T, usize) {
     (result, peak)
 }
 
+#[test]
+fn 有序小分页在游标上跳过不合格记录且查询峰值小于一份候选目录() {
+    use triviumdb::query::{tql_executor::execute_tql, tql_parser::parse_tql};
+    use triviumdb::storage::memtable::MemTable;
+    let mut mt = MemTable::<f32>::new(1);
+    mt.set_auto_build_quiver(false);
+    const N: u64 = 16_384;
+    for id in 1..=N {
+        mt.insert_with_id(id, &[1.], serde_json::json!({"x":id,"keep":id % 3 == 1}))
+            .unwrap();
+    }
+    mt.register_ordered_property_index("x");
+    let query = parse_tql("FIND {keep:true} RETURN _ ORDER BY _.x DESC LIMIT 1 OFFSET 1").unwrap();
+    let (rows, peak) = measured(|| execute_tql(&query, &mt).unwrap());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["_"].id, 16_381);
+    assert!(peak < N as usize * size_of::<u64>(), "查询分配峰值 {peak}");
+}
+
+#[test]
+fn 数值索引过滤小候选集时峰值小于一份高频倒排表() {
+    use serde_json::json;
+    use triviumdb::query::{tql_executor::execute_tql, tql_parser::parse_tql};
+    use triviumdb::storage::memtable::MemTable;
+
+    const N: u64 = 32_768;
+    const CANDIDATES: u64 = 32;
+    let mut mt = MemTable::<f32>::new(1);
+    mt.set_auto_build_quiver(false);
+    for id in 1..=N {
+        let rank = match (id <= CANDIDATES, id % 4) {
+            (true, 0) => json!(2),
+            (true, 1) => json!(1.0),
+            _ => json!(1),
+        };
+        mt.insert_with_id(id, &[1.], json!({"seed":id <= CANDIDATES, "rank":rank}))
+            .unwrap();
+    }
+    mt.register_property_index("seed");
+    mt.register_property_index("rank");
+    let source = "FIND {seed:true} AS n WITH n WHERE n.rank == 1 RETURN n ORDER BY n.id";
+    let query = parse_tql(source).unwrap();
+    let profile = parse_tql(&format!("EXPLAIN ANALYZE {source}")).unwrap();
+    let expected: Vec<_> = (1..=CANDIDATES).filter(|id| id % 4 != 0).collect();
+    let check = |mt: &MemTable<f32>| {
+        let (rows, peak) = measured(|| execute_tql(&query, mt).unwrap());
+        assert_eq!(
+            rows.iter().map(|row| row["n"].id).collect::<Vec<_>>(),
+            expected
+        );
+        // 候选集外的每个节点都在整数 1 的倒排表内。
+        assert!(
+            peak < (N - CANDIDATES) as usize * size_of::<u64>(),
+            "查询分配峰值 {peak}"
+        );
+        let plan = execute_tql(&profile, mt).unwrap();
+        let stages = plan[0]["plan"].payload["pipeline_stage_actuals"]
+            .as_array()
+            .unwrap();
+        let filter = stages
+            .iter()
+            .find(|stage| stage["operator"] == "tql_numeric_index_filter")
+            .expect("查询应执行数值索引过滤");
+        assert_eq!(filter["input_rows"], CANDIDATES);
+        assert_eq!(filter["actual_rows"], expected.len());
+    };
+    check(&mt);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("numeric.tdb");
+    let path = path.to_str().unwrap();
+    use triviumdb::storage::file_format::{load, save};
+    save(&mut mt, path, StorageMode::Mmap).unwrap();
+    drop(mt);
+    let mapped = load(
+        path,
+        StorageMode::Mmap,
+        false,
+        false,
+        triviumdb::database::MissingIndexPolicy::Fallback,
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        mapped.property_indexes().mapped_posting_entries(),
+        2 * N as usize
+    );
+    check(&mapped);
+}
+
+#[test]
+fn 三元字符索引按字符上限准入且拒绝长值时分配有界() {
+    use triviumdb::index::property::PropertyIndexRegistry;
+    let mut registry = PropertyIndexRegistry::default();
+    // 4,098 个字符恰好有 4,096 个三元组，UTF-8 字节数不参与计数。
+    let accepted = serde_json::json!({"s":"甲".repeat(4098)});
+    registry.register_ngram("s", [(1, &accepted)]).unwrap();
+    assert_eq!(registry.ngram_lookup("s", "甲甲甲").unwrap(), Some(vec![1]));
+    let rejected = "乙".repeat(100_000);
+    let (error, peak) = measured(|| registry.ngram_lookup("s", &rejected).unwrap_err());
+    assert_eq!(error.code(), "TDB_INVALID_INPUT");
+    assert!(peak < rejected.len(), "拒绝输入时的分配峰值 {peak}");
+}
+
 fn sample(path: &str, mode: StorageMode) -> Database<f32> {
     let mut db = Database::open_with_config(
         path,
@@ -188,5 +291,54 @@ fn 多变量快照和写匹配在复制前拒绝并限制实际分配峰值() {
             assert_eq!(reopened.get_payload(id).unwrap().unwrap()["touched"], true);
         }
         reopened.close().unwrap();
+    }
+}
+
+#[test]
+fn 长字面量按投影行数计入内存准入() {
+    let root = support::TestDir::new("return_literal_budget");
+    let mut db = Database::<f32>::open(&root.file("query.tdb"), 1).unwrap();
+    for id in 1..=20 {
+        db.insert_with_id(id, &[1.], serde_json::json!({"k":1}))
+            .unwrap();
+    }
+    let literal = "v".repeat(65536);
+    let query = format!("FIND {{k:1}} RETURN \"{literal}\" AS value");
+    db.set_memory_limit(1 << 20).unwrap();
+    rejected(db.tql(&query));
+    db.set_memory_limit(0).unwrap();
+    let rows = db.tql(&query).unwrap();
+    assert_eq!(rows.len(), 20);
+    for row in rows {
+        assert!(
+            matches!(&row["value"], triviumdb::query::tql_executor::TqlValue::String(value) if value == &literal)
+        );
+    }
+    db.close().unwrap();
+}
+
+#[test]
+fn 半精度精确评分对任意维度使用固定工作区() {
+    use half::f16;
+    use triviumdb::VectorType;
+    for dim in [3, 65536] {
+        let mut a = vec![f16::ZERO; dim];
+        let mut b = a.clone();
+        a[dim - 1] = f16::MAX;
+        b[dim - 1] = f16::MIN;
+        let (score, peak) = measured(|| f16::similarity(&a, &b));
+        assert_eq!(score, -1.);
+        assert_eq!(peak, 0);
+        let mut mt = triviumdb::storage::memtable::MemTable::<f16>::new(dim);
+        mt.set_auto_build_quiver(false);
+        mt.insert_with_id(1, &a, serde_json::json!({})).unwrap();
+        mt.insert_with_id(2, &b, serde_json::json!({})).unwrap();
+        let hits = triviumdb::index::exact::search(&mt, &a, 2).unwrap();
+        assert_eq!(
+            hits.iter().map(|h| (h.id, h.score)).collect::<Vec<_>>(),
+            [(1, 1.), (2, -1.)]
+        );
+        b[dim - 1] = f16::ZERO;
+        assert_eq!(f16::similarity(&a, &b), 0.);
     }
 }

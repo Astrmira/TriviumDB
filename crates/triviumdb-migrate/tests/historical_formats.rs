@@ -173,6 +173,11 @@ fn migration_matrix<T: VectorType + Serialize + DeserializeOwned>(dtype: &str, f
         let retried = triviumdb_migrate::run(&opts).unwrap();
         assert!(retried.committed && retried.reused);
         assert_eq!(retried.facts, report.facts);
+        opts.mmap = !mmap;
+        assert_eq!(
+            triviumdb_migrate::run(&opts).unwrap_err().code,
+            "TDB_MIGRATION_CONFLICT"
+        );
         let target_config = Config {
             dim: 2,
             storage_mode: if mmap {

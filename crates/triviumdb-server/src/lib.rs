@@ -550,7 +550,10 @@ async fn build_pelorus(
 const MAX_IMPORT_RECORDS: usize = 10_000;
 const MAX_IMPORT_LINE_BYTES: usize = 1024 * 1024;
 
-fn decode_ndjson<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<Vec<T>, ApiError> {
+fn decode_ndjson<T: serde::de::DeserializeOwned>(
+    body: &[u8],
+    operation: impl Fn(T, usize) -> Result<TransactionOperation, ApiError>,
+) -> Result<Vec<TransactionOperation>, ApiError> {
     let mut records = Vec::new();
     for (line_index, line) in body.split(|byte| *byte == b'\n').enumerate() {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -565,13 +568,14 @@ fn decode_ndjson<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<Vec<T>, 
                 "批量导入记录数超过上限 (Bulk import record count exceeds limit)",
             ));
         }
-        records.push(serde_json::from_slice(line).map_err(|error| {
+        let record = serde_json::from_slice(line).map_err(|error| {
             ApiError::invalid_request(format!(
                 "NDJSON 第 {} 行无效 (Invalid NDJSON line {}): {error}",
                 line_index + 1,
                 line_index + 1
             ))
-        })?);
+        })?;
+        records.push(operation(record, line_index + 1)?);
     }
     if records.is_empty() {
         return Err(ApiError::invalid_request(
@@ -583,59 +587,52 @@ fn decode_ndjson<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<Vec<T>, 
 
 async fn import_nodes(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Json<TransactionResponse>, ApiError> {
-    let records: Vec<BulkNodeRecord> = decode_ndjson(&body)?;
-    let operations = records
-        .into_iter()
-        .map(|record| TransactionOperation::Insert {
+) -> Result<Response, ApiError> {
+    let operations = decode_ndjson(&body, |record: BulkNodeRecord, line| {
+        triviumdb::document::validate_node_import_payload(&record.payload, line)?;
+        Ok(TransactionOperation::Insert {
             id: record.id,
             vector: record.vector,
             payload: record.payload,
         })
-        .collect();
-    import_operations(state, operations).await
+    })?;
+    import_operations(state, headers, operations).await
 }
 
 async fn import_edges(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Json<TransactionResponse>, ApiError> {
-    let records: Vec<BulkEdgeRecord> = decode_ndjson(&body)?;
-    let operations = records
-        .into_iter()
-        .map(|record| TransactionOperation::Link {
+) -> Result<Response, ApiError> {
+    let operations = decode_ndjson(&body, |record: BulkEdgeRecord, _| {
+        Ok(TransactionOperation::Link {
             source: record.source,
             target: record.target,
             label: record.label,
             weight: record.weight,
         })
-        .collect();
-    import_operations(state, operations).await
+    })?;
+    import_operations(state, headers, operations).await
 }
 
 async fn import_operations(
     state: Arc<AppState>,
+    headers: HeaderMap,
     operations: Vec<TransactionOperation>,
-) -> Result<Json<TransactionResponse>, ApiError> {
-    let result = state
-        .engine
-        .transaction(
-            TransactionRequest {
-                expected_generation: None,
-                expected_nodes: Default::default(),
-                expected_edges: Vec::new(),
-                operations,
-            },
-            None,
-            Instant::now() + state.request_timeout,
-        )
-        .await?;
-    Ok(Json(TransactionResponse {
-        created_ids: result.created_ids,
-        generation: result.version.global_etag(),
-        replayed: result.replayed,
-    }))
+) -> Result<Response, ApiError> {
+    submit_transaction(
+        &state,
+        &headers,
+        TransactionRequest {
+            expected_generation: None,
+            expected_nodes: Default::default(),
+            expected_edges: Vec::new(),
+            operations,
+        },
+    )
+    .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -766,7 +763,7 @@ async fn search_vector(
         "hits": hits.into_iter().map(|hit| serde_json::json!({
             "id": hit.id.to_string(),
             "score": hit.score,
-            "payload": hit.payload,
+            "payload": protocol::SafeJson(&hit.payload),
         })).collect::<Vec<_>>(),
         "generation": etag,
     }))
@@ -1024,34 +1021,50 @@ fn query_response(
 }
 
 fn index_advice(query: &str, indexed_fields: &[String]) -> Vec<serde_json::Value> {
-    let Some(start) = query.find('{') else {
+    use triviumdb::filter::Filter;
+    use triviumdb::query::tql_ast::QueryEntry;
+    let Ok(parsed) = triviumdb::query::tql_parser::parse_tql(query) else {
         return Vec::new();
     };
-    let Some(end) = query[start + 1..].find([':', '}']) else {
-        return Vec::new();
+    let mut filters = match &parsed.entry {
+        QueryEntry::Find { filter } => vec![filter],
+        QueryEntry::Match { pattern } | QueryEntry::OptionalMatch { pattern } => pattern
+            .nodes
+            .iter()
+            .filter_map(|node| node.filter.as_ref())
+            .collect(),
+        _ => return Vec::new(),
     };
-    let field = query[start + 1..start + 1 + end].trim();
-    if field.is_empty()
-        || field.starts_with('$')
-        || indexed_fields.iter().any(|indexed| indexed == field)
-    {
-        return Vec::new();
+    let mut advice = std::collections::BTreeSet::new();
+    while let Some(filter) = filters.pop() {
+        let (field, kind) = match filter {
+            Filter::And(parts) | Filter::Or(parts) => {
+                filters.extend(parts);
+                continue;
+            }
+            Filter::Eq(field, _) => (field, "hash"),
+            Filter::Range(field, ..)
+            | Filter::Gt(field, _)
+            | Filter::Gte(field, _)
+            | Filter::Lt(field, _)
+            | Filter::Lte(field, _) => (field, "ordered"),
+            Filter::Contains(field, _) => (field, "ngram"),
+            _ => continue,
+        };
+        if !indexed_fields.contains(field) {
+            advice.insert((field, kind));
+        }
     }
-    let kind = if query.contains("$gt")
-        || query.contains("$gte")
-        || query.contains("$lt")
-        || query.contains("$lte")
-        || query.contains("ORDER BY")
-    {
-        "ordered"
-    } else {
-        "hash"
-    };
-    vec![serde_json::json!({
-        "kind": kind,
-        "fields": [field],
-        "reason": "查询使用未索引属性过滤 (Query filters on an unindexed property)",
-    })]
+    advice
+        .into_iter()
+        .map(|(field, kind)| {
+            serde_json::json!({
+                "kind": kind,
+                "fields": [field],
+                "reason": "查询使用未索引属性过滤 (Query filters on an unindexed property)",
+            })
+        })
+        .collect()
 }
 
 async fn get_node(
@@ -1163,7 +1176,7 @@ async fn get_neighbors(
     }
     Ok(Json(serde_json::json!({
         "nodes": result.nodes.into_iter().map(|node| serde_json::json!({
-            "type": "node", "id": node.id.to_string(), "payload": node.payload
+            "type": "node", "id": node.id.to_string(), "payload": protocol::SafeJson(&node.payload)
         })).collect::<Vec<_>>(),
         "edges": result.edges.into_iter().map(encode_graph_edge).collect::<Vec<_>>(),
         "visitedNodes": result.visited_nodes,
@@ -1183,22 +1196,18 @@ async fn get_edges(
             "limit 必须为 1..=10000 (limit must be 1..=10000)",
         ));
     }
-    let (edges, version) = state
+    let (edges, total, version) = state
         .engine
         .list_edges(
             id,
             reachability_direction(query.direction),
             query.label,
+            query.offset,
+            query.limit,
             Instant::now() + state.request_timeout,
         )
         .await?;
-    let total = edges.len();
-    let edges = edges
-        .into_iter()
-        .skip(query.offset)
-        .take(query.limit)
-        .map(encode_graph_edge)
-        .collect::<Vec<_>>();
+    let edges = edges.into_iter().map(encode_graph_edge).collect::<Vec<_>>();
     Ok(Json(serde_json::json!({
         "edges": edges,
         "total": total,
@@ -1274,7 +1283,7 @@ async fn get_paths(
                     "target": step.edge_target.to_string(),
                     "label": step.label,
                     "weight": step.weight,
-                    "metadata": step.metadata,
+                    "metadata": protocol::SafeJson(&step.metadata),
                 })).collect::<Vec<_>>(),
             })
         })
@@ -1293,7 +1302,7 @@ fn encode_graph_edge(edge: triviumdb::graph::reachability::SubgraphEdge) -> serd
         "target": edge.target_id.to_string(),
         "label": edge.label,
         "weight": edge.weight,
-        "metadata": edge.metadata,
+        "metadata": protocol::SafeJson(&edge.metadata),
     })
 }
 
@@ -1365,13 +1374,21 @@ async fn transaction(
     headers: HeaderMap,
     request: Result<Json<TransactionRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let Json(mut request) = decode_json(request)?;
+    let Json(request) = decode_json(request)?;
+    submit_transaction(&state, &headers, request).await
+}
+
+async fn submit_transaction(
+    state: &AppState,
+    headers: &HeaderMap,
+    mut request: TransactionRequest,
+) -> Result<Response, ApiError> {
     if request.operations.is_empty() {
         return Err(ApiError::invalid_request(
             "事务至少需要一个操作 (A transaction requires at least one operation)",
         ));
     }
-    let header_generation = optional_header(&headers, header::IF_MATCH)?;
+    let header_generation = optional_header(headers, header::IF_MATCH)?;
     match (&request.expected_generation, header_generation) {
         (Some(body), Some(header)) if body != &header => {
             return Err(ApiError::invalid_request(
@@ -1385,7 +1402,7 @@ async fn transaction(
         .engine
         .transaction(
             request,
-            optional_header_name(&headers, "idempotency-key")?,
+            optional_header_name(headers, "idempotency-key")?,
             std::time::Instant::now() + state.request_timeout,
         )
         .await?;

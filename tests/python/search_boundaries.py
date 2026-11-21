@@ -158,5 +158,38 @@ def run_search_boundaries(root):
         assert [hit.id for hit in hits] == [1]
         assert hits[0].payload == {"value": "kept"}
         assert hits[0].score == 1
+        class ContextHook:
+            def on_pre_search(self, query, ctx):
+                assert ctx["custom_data"] == {}
+                ctx["custom_data"]["trace"] = ["pre"]
+
+            def on_post_search(self, hits, ctx):
+                ctx["custom_data"]["trace"].append("post")
+
+        class BrokenDescriptor:
+            @property
+            def on_pre_search(self):
+                raise AttributeError("回调属性求值失败")
+
+        class BrokenGetter:
+            @property
+            def on_pre_search(self):
+                raise RuntimeError("回调异常")
+
+        half.clear_hook()
+        assert half.search_with_context([1, 0], top_k=1)[1].custom_data == {}
+        half.set_hook(ContextHook())
+        for _ in range(2):
+            hits, ctx = half.search_with_context([1, 0], top_k=1, expand_depth=0)
+            assert [hit.id for hit in hits] == [1]
+            assert ctx.custom_data == {"trace": ["pre", "post"]}
+        for hook in (Rewrite({"bad": 1}), BrokenDescriptor(), BrokenGetter()):
+            half.set_hook(hook)
+            try:
+                half.search([1, 0], top_k=1, expand_depth=0)
+            except triviumdb.TriviumDBError as error:
+                assert error.code == "TDB_HOOK_EXECUTION"
+            else:
+                raise AssertionError("错误的回调必须拒绝整次检索")
     finally:
         half.close()

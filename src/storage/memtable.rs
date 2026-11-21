@@ -84,7 +84,9 @@ fn increment_json_number(
         };
     }
     let sum = a + b;
-    if (b != 0.0 && sum == a) || (a != 0.0 && sum == b) {
+    // 按绝对值排序后，从舍入和中减去大加数可精确恢复实际计入的小加数。
+    let (larger, smaller) = if a.abs() >= b.abs() { (a, b) } else { (b, a) };
+    if !sum.is_finite() || sum - larger != smaller {
         return Err(invalid());
     }
     serde_json::Number::from_f64(sum)
@@ -556,6 +558,7 @@ pub struct MemTable<T: VectorType> {
     deferred_text_path: Option<String>,
     deferred_text_meta: Option<crate::storage::file_format::TextIndexMetadata>,
     pub(crate) checkpoint_token: Option<[u8; 16]>,
+    pub(crate) published_bytes: Arc<crate::observability::PublishedWriteBytes>,
     text_replay: bool,
     text_replay_checkpoint_seen: bool,
     pending_text_mutations: Vec<PendingTextMutation>,
@@ -601,6 +604,8 @@ pub struct MemTable<T: VectorType> {
     // 仅测试构建记录全库物化，生产构建没有原子计数开销。
     #[cfg(any(test, feature = "test-hooks"))]
     id_materializations: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    pub(crate) adjacency_reads: std::sync::atomic::AtomicU64,
 
     // 映射表：内部索引 (0, 1, 2...) 到 NodeId
     // 用于在 vectors 数组里定位数据位置
@@ -675,6 +680,7 @@ impl<T: VectorType> MemTable<T> {
             deferred_text_path: None,
             deferred_text_meta: None,
             checkpoint_token: None,
+            published_bytes: Default::default(),
             text_replay: false,
             text_replay_checkpoint_seen: false,
             pending_text_mutations: Vec::new(),
@@ -697,6 +703,8 @@ impl<T: VectorType> MemTable<T> {
             active_ids: roaring::RoaringTreemap::new(),
             #[cfg(any(test, feature = "test-hooks"))]
             id_materializations: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            adjacency_reads: Default::default(),
             indices_to_ids: Vec::new(),
             ids_to_indices: HashMap::new(),
             fast_tags: Vec::new(),
@@ -746,6 +754,7 @@ impl<T: VectorType> MemTable<T> {
             deferred_text_path: None,
             deferred_text_meta: None,
             checkpoint_token: None,
+            published_bytes: Default::default(),
             text_replay: false,
             text_replay_checkpoint_seen: false,
             pending_text_mutations: Vec::new(),
@@ -768,6 +777,8 @@ impl<T: VectorType> MemTable<T> {
             active_ids: roaring::RoaringTreemap::new(),
             #[cfg(any(test, feature = "test-hooks"))]
             id_materializations: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            adjacency_reads: Default::default(),
             indices_to_ids: Vec::new(),
             ids_to_indices: HashMap::new(),
             fast_tags: Vec::new(),
@@ -1015,13 +1026,13 @@ impl<T: VectorType> MemTable<T> {
         // 优先从空闲槽复活
         let sig = calculate_json_signature(&payload);
         let idx = if let Some(free_idx) = self.free_slots.pop() {
-            self.vec_pool.update(free_idx, vector);
+            self.vec_pool.update(free_idx, vector)?;
             self.indices_to_ids[free_idx] = id;
             self.fast_tags[free_idx] = sig;
             free_idx
         } else {
             let i = self.indices_to_ids.len();
-            self.vec_pool.push(vector);
+            self.vec_pool.push(vector)?;
             self.indices_to_ids.push(id);
             self.fast_tags.push(sig);
             i
@@ -1116,13 +1127,13 @@ impl<T: VectorType> MemTable<T> {
         // 1. 记录向量（优先尝试从空闲槽复活，否则推入尾部增量层）
         let sig = calculate_json_signature(&payload);
         let idx = if let Some(free_idx) = self.free_slots.pop() {
-            self.vec_pool.update(free_idx, vector); // 原地重生
+            self.vec_pool.update(free_idx, vector)?; // 原地重生
             self.indices_to_ids[free_idx] = id;
             self.fast_tags[free_idx] = sig;
             free_idx
         } else {
             let i = self.indices_to_ids.len();
-            self.vec_pool.push(vector); // 追尾拓展
+            self.vec_pool.push(vector)?; // 追尾拓展
             self.indices_to_ids.push(id);
             self.fast_tags.push(sig);
             i
@@ -1187,13 +1198,13 @@ impl<T: VectorType> MemTable<T> {
         // 优先从空闲槽复活
         let sig = calculate_json_signature(&payload);
         let idx = if let Some(free_idx) = self.free_slots.pop() {
-            self.vec_pool.update(free_idx, vector);
+            self.vec_pool.update(free_idx, vector)?;
             self.indices_to_ids[free_idx] = id;
             self.fast_tags[free_idx] = sig;
             free_idx
         } else {
             let i = self.indices_to_ids.len();
-            self.vec_pool.push(vector);
+            self.vec_pool.push(vector)?;
             self.indices_to_ids.push(id);
             self.fast_tags.push(sig);
             i
@@ -2305,6 +2316,9 @@ impl<T: VectorType> MemTable<T> {
     }
 
     pub fn get_edges(&self, id: NodeId) -> Option<&[Edge]> {
+        #[cfg(test)]
+        self.adjacency_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.edges
             .get(&id)
             .map(Vec::as_slice)
@@ -2778,6 +2792,14 @@ impl<T: VectorType> MemTable<T> {
     }
 
     /// 查询属性索引。字段已建索引时即使值不存在也返回空切片。
+    pub(crate) fn property_posting(
+        &self,
+        field: &str,
+        value: &serde_json::Value,
+    ) -> Option<crate::index::property::PropertyPosting<'_>> {
+        self.property_indexes.posting(field, value)
+    }
+
     pub fn find_by_property_index_limit(
         &self,
         field: &str,
@@ -3071,7 +3093,7 @@ impl<T: VectorType> MemTable<T> {
 
         // 1. 向量层：通过 VecPool 逻辑删除（置零），并回收物理卡槽
         if let Some(idx) = self.ids_to_indices.remove(&id) {
-            self.vec_pool.zero_out(idx);
+            self.vec_pool.zero_out(idx)?;
             self.indices_to_ids[idx] = 0; // 盖上墓碑标识，防止后续被误认
             self.free_slots.push(idx); // 抛入环保回收池，供下一个 insert 使用！
         }
@@ -3445,7 +3467,7 @@ impl<T: VectorType> MemTable<T> {
         self.validate_update_vector(id, vector)?;
         match self.ids_to_indices.get(&id) {
             Some(&idx) => {
-                self.vec_pool.update(idx, vector);
+                self.vec_pool.update(idx, vector)?;
                 // QuIVer 增量更新：soft_delete 旧向量 + incremental_insert 新向量
                 if !self.quiver_sync_paused
                     && let Some(ref mut quiver) = self.quiver_index
@@ -3590,7 +3612,7 @@ impl<T: VectorType> MemTable<T> {
         )
     }
 
-    pub(crate) fn reserve_graph_workspace(
+    pub(crate) fn reserve_instance_workspace(
         &self,
         bytes: usize,
     ) -> Result<crate::resources::RequestWorkspace> {

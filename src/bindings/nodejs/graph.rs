@@ -123,7 +123,7 @@ impl TriviumDB {
         dst: JsUnknown,
         label: JsUnknown,
         weight: Option<JsUnknown>,
-        metadata: Option<JsUnknown>,
+        metadata: JsUnknown,
     ) -> napi::Result<()> {
         let src = write_id(env, src, "src")?;
         let dst = write_id(env, dst, "dst")?;
@@ -131,8 +131,8 @@ impl TriviumDB {
         let weight = weight
             .map(|value| write_number(env, value, "weight"))
             .transpose()?;
-        let metadata = metadata
-            .map(|value| write_json(env, value, "metadata"))
+        let metadata = (metadata.get_type()? != napi::ValueType::Undefined)
+            .then(|| write_json(env, metadata, "metadata"))
             .transpose()?;
         dispatch!(self, mut db => db.update_edge(
             src,

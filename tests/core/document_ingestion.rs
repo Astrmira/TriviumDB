@@ -101,6 +101,25 @@ fn 内置五种解析保留完整正文与独立预期来源范围() {
             json!({"operation":"resolve","reference":{"document_id":"10","revision":snapshot["revision"],"start_byte":0,"end_byte":text.len()}}),
         );
         assert_eq!(evidence["text"], text);
+        for offset in text
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(text.len()))
+        {
+            let empty = request(
+                &mut db,
+                json!({"operation":"resolve","reference":{
+                    "document_id":"10","revision":snapshot["revision"],"start_byte":offset,"end_byte":offset
+                }}),
+            );
+            assert_eq!(empty["text"], "");
+            assert!(
+                empty
+                    .get("source_spans")
+                    .is_none_or(|spans| spans == &json!([])),
+                "{name} @ {offset}: {empty}"
+            );
+        }
         let spans = evidence["source_spans"].as_array().unwrap();
         assert!(!spans.is_empty());
         for span in spans {
@@ -1074,6 +1093,52 @@ fn 归档文档上下文服从候选预算并能只读重开() {
 }
 
 #[test]
+fn 有限共享工作区可展开单个归档的短证据() {
+    let dir = TestDir::new("archived-context-quota");
+    let path = dir.file("data.tdb");
+    let cfg = config(StorageMode::Mmap);
+    let mut db = Database::<f32>::open_with_config(&path, cfg).unwrap();
+    let parsed = parse(
+        &mut db,
+        "archive.txt",
+        &format!("alpha{}", "x".repeat(64 * 1024)),
+    );
+    let snapshot = request(
+        &mut db,
+        json!({"operation":"put_parsed","document":{
+            "parsed":parsed,"root":{"id":"10","vector":[1,0],"payload":{}}
+        }}),
+    );
+    db.close().unwrap();
+    // 为库保留 16 MiB，维护保留 1 MiB，读请求独享其余 1.5 MiB。
+    let runtime = triviumdb::ResourceRuntime::new(triviumdb::ResourceLimits {
+        memory_limit: 18 * 1024 * 1024 + 512 * 1024,
+        maintenance_memory_limit: 1024 * 1024,
+        ..Default::default()
+    })
+    .unwrap();
+    let db = Database::<f32>::open_with_runtime(
+        &path,
+        Config {
+            access_mode: AccessMode::ReadOnly,
+            memory_limit: 16 * 1024 * 1024,
+            ..cfg
+        },
+        runtime.clone(),
+    )
+    .unwrap();
+    let query: DocumentContextQuery = serde_json::from_value(json!({"seeds":[{"reference":{
+        "document_id":"10","revision":snapshot["revision"],"start_byte":0,"end_byte":5
+    }}]}))
+    .unwrap();
+    let context = db.document_context(&query).unwrap();
+    assert_eq!(context.len(), 1);
+    assert_eq!(context[0].windows.len(), 1);
+    assert_eq!(context[0].windows[0].text, "alpha");
+    assert_eq!(runtime.stats().reserved_workspace_bytes, 0);
+}
+
+#[test]
 fn 单次接入块ID冲突重试不写WAL且保留已有节点() {
     let dir = TestDir::new("one-shot-conflict");
     let path = dir.file("data.tdb");
@@ -1192,6 +1257,28 @@ fn 共享JSON入口服从实例配额且拒绝后立即可重试() {
                 "quiver" => Value::Null,
                 _ => json!({"results":[]}),
             }
+        );
+    }
+}
+
+#[test]
+fn 隐藏元素和大指数标量按文档语法提取() {
+    let directory = TestDir::new("parser_scalar_boundaries");
+    let mut db = Database::<f32>::open(&directory.file("db.tdb"), 2).unwrap();
+    for source in ["doc.html", "doc.md"] {
+        for tag in ["script", "template", "style"] {
+            let raw = format!("甲<{tag}/>隐藏</{tag}>乙");
+            let parsed = parse(&mut db, source, &raw);
+            assert_eq!(parsed["text"].as_str().unwrap().trim(), "甲乙");
+        }
+    }
+    for source in ["doc.json", "doc.jsonl"] {
+        assert_eq!(
+            parse(&mut db, source, "[1e400,-1e999]")["text"]
+                .as_str()
+                .unwrap()
+                .trim(),
+            "1e400\n-1e999"
         );
     }
 }

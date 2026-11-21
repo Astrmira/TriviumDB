@@ -163,6 +163,9 @@ function runGraphArguments(root, { TriviumDB }) {
         })
       }
       assert.deepEqual(fs.readFileSync(file + '.wal'), before)
+      const limited = db.reachableDetailed(11, { direction: 'both', maxFrontierSize: 1 })
+      assert.equal(limited.truncated, true)
+      assert.deepEqual(limited.results.map(row => row.targetId), [7])
       db.updateVector(7, [0, 1])
     } finally { db.close() }
     const moved = directory + '-moved'

@@ -53,9 +53,10 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
         graph: NamedGraphWrite,
         expected_revision: Option<&str>,
     ) -> Result<NamedGraphSnapshot> {
-        Self::write_operation(|_| {
+        Self::write_operation(|write| {
             let _operation = self.enter_operation()?;
             self.check_transaction_admission()?;
+            write.phase = crate::error::WritePhase::Validation;
             graph.validate_input()?;
             let bytes = graph.memory_bytes().saturating_mul(8).saturating_add(
                 crate::storage::payload_store::serialized_json_len(&graph)?.saturating_mul(4),
@@ -79,9 +80,10 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
         expected_revision: &str,
         edits: Vec<NamedGraphEdit>,
     ) -> Result<NamedGraphSnapshot> {
-        Self::write_operation(|_| {
+        Self::write_operation(|write| {
             let _operation = self.enter_operation()?;
             self.check_transaction_admission()?;
+            write.phase = crate::error::WritePhase::Validation;
             let limits = NamedGraphLimits::default();
             let mut snapshot = self.get_named_graph(graph_id, &limits)?.ok_or_else(|| {
                 TriviumError::GraphNotFound {
@@ -272,9 +274,7 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
                 0
             };
             let mut edges = if scope.include_default {
-                mt.active_node_ids()
-                    .map(|id| mt.get_edges(id).map_or(0, <[_]>::len))
-                    .sum::<usize>()
+                mt.edge_count()
             } else {
                 0
             };
@@ -294,23 +294,32 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
                 }
                 nodes = nodes.saturating_add(record.graph.members.len());
                 edges = edges.saturating_add(record.graph.edges.len());
-                bytes = bytes
-                    .saturating_add(record.graph.memory_bytes().saturating_mul(4))
-                    .saturating_add(
-                        record
-                            .graph
-                            .edges
-                            .len()
-                            .saturating_mul(id.len())
-                            .saturating_mul(2),
-                    );
             }
-            // 准入按读取的成员关系与边计数，联合后的去重不会扩大工作预算。
+            // 先核对计数，再访问边、标签与元数据。
             bound("named_graph_nodes", nodes, limits.max_nodes)?;
             bound("named_graph_edges", edges, limits.max_edges)?;
+            for id in &selected {
+                crate::request::check_current()?;
+                let graph = &mt.named_graphs.graphs[*id].graph;
+                bytes = bytes.saturating_add(graph.members.len().saturating_mul(128));
+                for edge in &graph.edges {
+                    crate::request::check_current()?;
+                    bytes = bytes.saturating_add(256).saturating_add(
+                        edge.label
+                            .len()
+                            .saturating_add(id.len())
+                            .saturating_add(crate::storage::payload_store::estimate_json_memory(
+                                &edge.metadata,
+                            ))
+                            .saturating_mul(4),
+                    );
+                }
+            }
             if scope.include_default {
                 for id in mt.active_node_ids() {
+                    crate::request::check_current()?;
                     for edge in mt.get_edges(id).unwrap_or(&[]) {
+                        crate::request::check_current()?;
                         bytes = bytes.saturating_add(
                             edge.label
                                 .len()
@@ -341,7 +350,10 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
                 result
                     .revisions
                     .insert((*id).into(), record.revision.clone());
-                members.extend(record.graph.members.iter().copied());
+                for &member in &record.graph.members {
+                    crate::request::check_current()?;
+                    members.insert(member);
+                }
                 for edge in &record.graph.edges {
                     crate::request::check_current()?;
                     encoded_edges = encoded_edges.saturating_add(edge_bytes(
@@ -359,6 +371,7 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
                     crate::request::check_current()?;
                     members.insert(id);
                     for edge in mt.get_edges(id).unwrap_or(&[]) {
+                        crate::request::check_current()?;
                         encoded_edges = encoded_edges.saturating_add(edge_bytes(
                             None,
                             id,
@@ -372,9 +385,10 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
             }
             let encoded_members = members
                 .iter()
-                .fold(0usize, |bytes, id| {
-                    bytes.saturating_add(id.to_string().len() + 2)
-                })
+                .try_fold(0usize, |bytes, id| -> Result<usize> {
+                    crate::request::check_current()?;
+                    Ok(bytes.saturating_add(id.to_string().len() + 2))
+                })?
                 .saturating_add(members.len().saturating_sub(1));
             // 两个空数组已计入外层编码，只补元素内容与分隔符。
             let response_bytes = crate::storage::payload_store::serialized_json_len(&result)?
@@ -398,6 +412,7 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
             }
             if scope.include_default {
                 for id in mt.active_node_ids() {
+                    crate::request::check_current()?;
                     for edge in mt.get_edges(id).unwrap_or(&[]) {
                         crate::request::check_current()?;
                         result.edges.push(ScopedGraphEdge {

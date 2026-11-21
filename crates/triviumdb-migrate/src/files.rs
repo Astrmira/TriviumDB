@@ -328,6 +328,7 @@ pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T
 
 pub(crate) struct Stage {
     root: PathBuf,
+    check_dir: Option<tempfile::TempDir>,
     pub database: PathBuf,
     pub source: PathBuf,
     pub facts: PathBuf,
@@ -340,26 +341,43 @@ impl Stage {
         check: bool,
     ) -> Result<Self> {
         let stem = utf8(Path::new(leaf))?;
-        let root = if check {
-            parent.join(format!(".{stem}.migration-check-{}", uuid::Uuid::new_v4()))
+        let check_dir = if check {
+            Some(
+                tempfile::Builder::new()
+                    .prefix(&format!(".{stem}.migration-check-"))
+                    .tempdir_in(parent)?,
+            )
         } else {
-            parent.join(format!(".{stem}.migration-stage"))
+            None
         };
+        let root = check_dir.as_ref().map_or_else(
+            || parent.join(format!(".{stem}.migration-stage")),
+            |dir| dir.path().to_owned(),
+        );
         let stage = Self {
             database: root.join("database"),
             source: root.join("source"),
             facts: root.join("facts"),
             root,
+            check_dir,
         };
-        if std::fs::symlink_metadata(&stage.root).is_ok() {
-            stage.cleanup(owner)?;
+        if !check {
+            if std::fs::symlink_metadata(&stage.root).is_ok() {
+                stage.cleanup(owner)?;
+            }
+            std::fs::create_dir(&stage.root)?;
         }
-        std::fs::create_dir(&stage.root)?;
         write_json(&stage.root.join("owner.json"), owner)?;
         std::fs::create_dir(&stage.database)?;
         std::fs::create_dir(&stage.source)?;
         std::fs::create_dir(&stage.facts)?;
         Ok(stage)
+    }
+    pub fn finish_check(self) -> Result<()> {
+        if let Some(directory) = self.check_dir {
+            directory.close()?;
+        }
+        Ok(())
     }
     pub fn cleanup(&self, expected: &Owner) -> Result<()> {
         fn plain_tree(path: &Path) -> Result<()> {
@@ -491,10 +509,31 @@ pub(crate) fn prepare_publication(database: &Path, owner: &Owner) -> Result<()> 
 }
 
 /// 调用方已持有目标数据库共享锁，标记移除后写入者仍须等待本次复核结束。
-pub(crate) fn finish_publication(database: &Path, owner: &Owner) -> Result<()> {
+pub(crate) fn verify_publication(
+    expected: &crate::Report,
+    owner: &Owner,
+) -> Result<Option<PathBuf>> {
+    let database = &expected.database;
+    let final_path = database.with_file_name("migration-report.json");
+    let verify_report = |path: &Path| -> Result<()> {
+        let report: crate::Report = read_json(path)?;
+        if report
+            != (crate::Report {
+                committed: true,
+                ..expected.clone()
+            })
+        {
+            return Err(Failure::new(
+                "TDB_CORRUPTED_FILE",
+                "迁移报告与已验证事实不符 (Migration report differs from verified facts)",
+            ));
+        }
+        Ok(())
+    };
     let marker = PathBuf::from(format!("{}.migration", utf8(database)?));
     if !marker.try_exists()? {
-        return Ok(());
+        verify_report(&final_path)?;
+        return Ok(None);
     }
     let record: Publication = read_json(&marker)?;
     let mut files = inventory(database, u64::MAX)?;
@@ -505,12 +544,38 @@ pub(crate) fn finish_publication(database: &Path, owner: &Owner) -> Result<()> {
             "迁移目标制品与已验证清单不一致，保留发布标记 (Migration artifacts differ from the verified manifest; publication marker retained)",
         ));
     }
-    std::fs::remove_file(marker)?;
-    triviumdb::database::inspection::sync_directory(database.parent().ok_or_else(|| {
+    let parent = marker.parent().ok_or_else(|| {
         Failure::new(
             "TDB_INVALID_INPUT",
             "目标缺少父目录 (Destination has no parent)",
         )
-    })?)?;
+    })?;
+    let pending = parent.join("migration-report.pending");
+    if pending.try_exists()? {
+        verify_report(&pending)?;
+        if final_path.try_exists()? {
+            return Err(Failure::new(
+                "TDB_MIGRATION_CONFLICT",
+                "目标报告已存在 (Destination report already exists)",
+            ));
+        }
+    } else {
+        verify_report(&final_path)?;
+    }
+    Ok(Some(marker))
+}
+
+pub(crate) fn finish_publication(expected: &crate::Report, owner: &Owner) -> Result<()> {
+    let Some(marker) = verify_publication(expected, owner)? else {
+        return Ok(());
+    };
+    let parent = owner.destination.as_path();
+    let pending = parent.join("migration-report.pending");
+    if pending.try_exists()? {
+        std::fs::rename(pending, parent.join("migration-report.json"))?;
+    }
+    triviumdb::database::inspection::sync_directory(parent)?;
+    std::fs::remove_file(&marker)?;
+    triviumdb::database::inspection::sync_directory(parent)?;
     Ok(())
 }

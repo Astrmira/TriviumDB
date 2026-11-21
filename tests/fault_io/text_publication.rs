@@ -184,3 +184,57 @@ fn 文本与派生索引发布故障支持重开恢复及同句柄重试() {
         }
     }
 }
+
+#[test]
+fn 发布日志退役失败保留旧备份并从已提交代恢复完整事实() {
+    let root = super::support::TestDir::new("retire-journal");
+    for mode in [StorageMode::Rom, StorageMode::Mmap] {
+        let path = root.file(&format!("{mode:?}.tdb"));
+        let cfg = Config {
+            dim: 2,
+            storage_mode: mode,
+            ..Default::default()
+        };
+        let mut db = Database::<f32>::open_with_config(&path, cfg).unwrap();
+        db.insert_with_id(1, &[1., 0.], json!({"state":"old"}))
+            .unwrap();
+        db.flush().unwrap();
+        let original = std::fs::read(&path).unwrap();
+        db.update_payload(1, json!({"state":"new"})).unwrap();
+        db.insert_with_id(2, &[0., 1.], json!({"kept":true}))
+            .unwrap();
+        db.link(1, 2, "new", 0.5).unwrap();
+        {
+            let _failure = fail_io_at(IoPoint::PublicationRetireJournal);
+            let err = db.flush().unwrap_err();
+            assert_eq!(err.code(), "TDB_IO");
+            assert_eq!(
+                err.info().write.unwrap().outcome,
+                triviumdb::error::WriteOutcome::Committed
+            );
+            assert!(std::path::Path::new(&format!("{path}.publish")).is_file());
+            assert_eq!(
+                std::fs::read(format!("{path}.publish.0")).unwrap(),
+                original
+            );
+            drop(db);
+        }
+        for _ in 0..2 {
+            let mut db = Database::<f32>::open_with_config(&path, cfg).unwrap();
+            let first = db.get(1).unwrap().unwrap();
+            assert_eq!(first.payload, json!({"state":"new"}));
+            assert_eq!(first.edges.len(), 1);
+            assert_eq!(
+                (
+                    first.edges[0].target_id,
+                    first.edges[0].label.as_str(),
+                    first.edges[0].weight
+                ),
+                (2, "new", 0.5)
+            );
+            assert_eq!(db.get_payload(2).unwrap(), Some(json!({"kept":true})));
+            db.close().unwrap();
+        }
+        assert!(!std::path::Path::new(&format!("{path}.publish")).exists());
+    }
+}

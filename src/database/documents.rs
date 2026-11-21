@@ -87,14 +87,14 @@ pub(super) fn read_snapshot_checked<T: VectorType>(
                 "文档发布指针无效 (Invalid document publication pointer)",
             ));
         }
-        if let Some(budget) = budget.as_deref_mut() {
-            budget.payload(mt, upload.storage_bytes(), upload.workspace_bytes())?;
-        }
-        mt.check_load_allocation(upload.workspace_bytes())?;
-        _archive_workspace = Some(
-            mt.resource_runtime()
-                .reserve_workspace(upload.workspace_bytes())?,
-        );
+        let archive_bytes = upload.workspace_bytes();
+        _archive_workspace = if let Some(budget) = budget.as_deref_mut() {
+            budget.retain_archive(mt, upload.storage_bytes(), archive_bytes)?;
+            None
+        } else {
+            mt.check_load_allocation(archive_bytes)?;
+            Some(mt.resource_runtime().reserve_workspace(archive_bytes)?)
+        };
         upload.snapshot()?
     } else {
         _archive_workspace = None;

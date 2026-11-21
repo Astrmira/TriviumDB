@@ -551,12 +551,7 @@ impl TqlParser {
     }
 
     fn parse_finite_f32(&mut self) -> Result<f32, String> {
-        let value = match self.advance() {
-            TqlToken::FloatLit(value) => value,
-            TqlToken::IntLit(value) => value as f64,
-            TqlToken::UIntLit(value) => value as f64,
-            other => return Err(format!("Expected finite number, got {other:?}")),
-        };
+        let value = self.parse_json_number()?;
         if !value.is_finite() || value < f32::MIN as f64 || value > f32::MAX as f64 {
             return Err("参数必须是有限 f32 数值 (Parameter must be finite f32)".into());
         }
@@ -809,9 +804,7 @@ impl TqlParser {
             };
             vector.push(value);
             self.finish_source("vector_element", element_mark);
-            if self.at(&TqlToken::Comma) {
-                self.advance();
-            }
+            self.expect_separator_or_end(&TqlToken::RBracket)?;
         }
         self.expect(&TqlToken::RBracket)?;
         self.finish_source("vector", vector_mark);
@@ -1510,9 +1503,7 @@ impl TqlParser {
                     let mut sub_filters = Vec::new();
                     while !self.at(&TqlToken::RBracket) {
                         sub_filters.push(self.parse_doc_filter()?);
-                        if self.at(&TqlToken::Comma) {
-                            self.advance();
-                        }
+                        self.expect_separator_or_end(&TqlToken::RBracket)?;
                     }
                     self.expect(&TqlToken::RBracket)?;
 
@@ -1551,9 +1542,7 @@ impl TqlParser {
                             filters.push(f);
                             self.finish_source("filter", operator_mark);
 
-                            if self.at(&TqlToken::Comma) {
-                                self.advance();
-                            }
+                            self.expect_separator_or_end(&TqlToken::RBrace)?;
                         }
                         self.expect(&TqlToken::RBrace)?;
                         self.finish_source("filter_field", filter_mark);
@@ -1568,9 +1557,7 @@ impl TqlParser {
                 _ => return Err(format!("Unexpected token in doc filter: {:?}", self.peek())),
             }
 
-            if self.at(&TqlToken::Comma) {
-                self.advance();
-            }
+            self.expect_separator_or_end(&TqlToken::RBrace)?;
         }
 
         self.expect(&TqlToken::RBrace)?;
@@ -1692,8 +1679,8 @@ impl TqlParser {
             return Ok(Predicate::Not(Box::new(inner)));
         }
 
-        // 括号
-        if self.at(&TqlToken::LParen) {
+        // 括号后的算术或比较运算属于标量表达式，其余括号交给谓词分组。
+        if self.at(&TqlToken::LParen) && !self.group_has_scalar_suffix() {
             self.advance();
             let inner = self.parse_predicate()?;
             self.expect(&TqlToken::RParen)?;
@@ -1707,45 +1694,72 @@ impl TqlParser {
         }
 
         // 表达式比较或 var MATCHES 文档过滤
+        let left = self.parse_expr()?;
+        if let TqlExpr::Variable(ident) = &left
+            && self.at(&TqlToken::Matches)
+        {
+            self.advance();
+            let filter = self.parse_doc_filter()?;
+            return Ok(Predicate::DocFilter {
+                var: Some(ident.clone()),
+                filter,
+            });
+        }
         if matches!(
             self.peek(),
-            TqlToken::Ident(_) | TqlToken::Rank | TqlToken::DollarOp(_)
+            TqlToken::Eq
+                | TqlToken::Ne
+                | TqlToken::Gt
+                | TqlToken::Gte
+                | TqlToken::Lt
+                | TqlToken::Lte
         ) {
-            let checkpoint = self.pos;
-            let left = self.parse_expr()?;
-            if let TqlExpr::Variable(ident) = &left
-                && self.at(&TqlToken::Matches)
-            {
-                self.advance();
-                let filter = self.parse_doc_filter()?;
-                return Ok(Predicate::DocFilter {
-                    var: Some(ident.clone()),
-                    filter,
-                });
-            }
-            if matches!(
-                self.peek(),
-                TqlToken::Eq
-                    | TqlToken::Ne
-                    | TqlToken::Gt
-                    | TqlToken::Gte
-                    | TqlToken::Lt
-                    | TqlToken::Lte
-            ) {
-                let op = self.parse_comp_op()?;
-                let right = self.parse_expr()?;
-                return Ok(Predicate::Compare { left, op, right });
-            }
-            self.pos = checkpoint;
-            let ident = self.parse_ident()?;
-            return Err(format!(
-                "Unexpected token after identifier '{}': {:?}",
-                ident,
-                self.peek()
-            ));
+            let op = self.parse_comp_op()?;
+            let right = self.parse_expr()?;
+            return Ok(Predicate::Compare { left, op, right });
         }
+        if matches!(left, TqlExpr::IsNull { .. }) {
+            self.synthetic_source("expression");
+            return Ok(Predicate::Compare {
+                left,
+                op: TqlCompOp::Eq,
+                right: TqlExpr::Literal(TqlLiteral::Bool(true)),
+            });
+        }
+        Err(self.error_here("谓词需要比较运算符 (Expected a predicate comparison)"))
+    }
 
-        Err(format!("Unexpected token in predicate: {:?}", self.peek()))
+    fn group_has_scalar_suffix(&self) -> bool {
+        let mut depth = 0;
+        for (i, token) in self.tokens.iter().enumerate().skip(self.pos) {
+            match token {
+                TqlToken::LParen => depth += 1,
+                TqlToken::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return matches!(
+                            self.tokens.get(i + 1),
+                            Some(
+                                TqlToken::Plus
+                                    | TqlToken::Dash
+                                    | TqlToken::Star
+                                    | TqlToken::Slash
+                                    | TqlToken::Eq
+                                    | TqlToken::Ne
+                                    | TqlToken::Lt
+                                    | TqlToken::Lte
+                                    | TqlToken::Gt
+                                    | TqlToken::Gte
+                                    | TqlToken::Is
+                                    | TqlToken::Matches
+                            )
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -2269,16 +2283,32 @@ impl TqlParser {
     }
 
     fn parse_json_number(&mut self) -> Result<f64, String> {
-        match self.advance() {
-            TqlToken::IntLit(n) => Ok(n as f64),
-            TqlToken::UIntLit(n) => Ok(n as f64),
-            TqlToken::FloatLit(f) => Ok(f),
-            other => Err(self.error_previous(format!("Expected number, got {:?}", other))),
+        // 具名数值选项的前一个词也可作变量，词法层会保留独立的负号。
+        let negative = self.at(&TqlToken::Dash);
+        if negative {
+            self.advance();
         }
+        let value = match self.advance() {
+            TqlToken::IntLit(n) => n as f64,
+            TqlToken::UIntLit(n) => n as f64,
+            TqlToken::FloatLit(f) => f,
+            other => return Err(self.error_previous(format!("Expected number, got {:?}", other))),
+        };
+        if negative && value.is_sign_negative() {
+            return Err(self.error_previous("重复的数值负号 (Repeated numeric sign)"));
+        }
+        Ok(if negative { -value } else { value })
     }
 
     fn parse_json_array(&mut self) -> Result<Vec<serde_json::Value>, String> {
         self.sourced("array", Self::parse_json_array_source_inner)
+    }
+
+    fn expect_separator_or_end(&mut self, end: &TqlToken) -> Result<(), String> {
+        if !self.at(end) {
+            self.expect(&TqlToken::Comma)?;
+        }
+        Ok(())
     }
 
     fn parse_json_array_source_inner(&mut self) -> Result<Vec<serde_json::Value>, String> {
@@ -2286,9 +2316,7 @@ impl TqlParser {
         let mut items = Vec::new();
         while !self.at(&TqlToken::RBracket) {
             items.push(self.parse_json_value()?);
-            if self.at(&TqlToken::Comma) {
-                self.advance();
-            }
+            self.expect_separator_or_end(&TqlToken::RBracket)?;
         }
         self.expect(&TqlToken::RBracket)?;
         Ok(items)
@@ -2419,9 +2447,7 @@ impl TqlParser {
                             )));
                         }
                         weight = self.parse_json_number()? as f32;
-                        if self.at(&TqlToken::Comma) {
-                            self.advance();
-                        }
+                        self.expect_separator_or_end(&TqlToken::RBrace)?;
                     }
                     self.expect(&TqlToken::RBrace)?;
                 }
@@ -2482,9 +2508,7 @@ impl TqlParser {
             self.expect(&TqlToken::Colon)?;
             let val = self.parse_json_value()?;
             map.insert(key, val);
-            if self.at(&TqlToken::Comma) {
-                self.advance();
-            }
+            self.expect_separator_or_end(&TqlToken::RBrace)?;
         }
         self.expect(&TqlToken::RBrace)?;
         Ok(serde_json::Value::Object(map))
@@ -2679,18 +2703,19 @@ fn merge_create_node(
     Ok(())
 }
 
-fn collect_return_kind_vars(kind: &ReturnExprKind, output: &mut Vec<String>) {
+fn collect_return_kind_vars(kind: &ReturnExprKind, output: &mut Vec<String>, bare_fields: bool) {
     match kind {
-        ReturnExprKind::Var(var) if var != "*" => output.push(var.clone()),
+        ReturnExprKind::Var(var) if var != "*" && !bare_fields => output.push(var.clone()),
         ReturnExprKind::Property(var, _) => output.push(var.clone()),
-        ReturnExprKind::Scalar(expr) => collect_expr_vars(expr, output),
-        ReturnExprKind::Aggregate(_, inner) => collect_return_kind_vars(inner, output),
+        ReturnExprKind::Scalar(expr) => collect_expr_vars(expr, output, bare_fields),
+        ReturnExprKind::Aggregate(_, inner) => collect_return_kind_vars(inner, output, bare_fields),
         ReturnExprKind::Var(_) => {}
     }
 }
 
-fn collect_expr_vars(expr: &TqlExpr, output: &mut Vec<String>) {
+fn collect_expr_vars(expr: &TqlExpr, output: &mut Vec<String>, bare_fields: bool) {
     match expr {
+        TqlExpr::Variable(_) if bare_fields => {}
         TqlExpr::Variable(var)
         | TqlExpr::Property { var, .. }
         | TqlExpr::Similarity { var }
@@ -2711,32 +2736,37 @@ fn collect_expr_vars(expr: &TqlExpr, output: &mut Vec<String>) {
         | TqlExpr::PairLeft { var }
         | TqlExpr::PairRight { var } => output.push(var.clone()),
         TqlExpr::Binary { left, right, .. } => {
-            collect_expr_vars(left, output);
-            collect_expr_vars(right, output);
+            collect_expr_vars(left, output, bare_fields);
+            collect_expr_vars(right, output, bare_fields);
         }
         TqlExpr::Coalesce(values) => {
             for value in values {
-                collect_expr_vars(value, output);
+                collect_expr_vars(value, output, bare_fields);
             }
         }
-        TqlExpr::IsNull { expr, .. } => collect_expr_vars(expr, output),
+        TqlExpr::IsNull { expr, .. } => collect_expr_vars(expr, output, bare_fields),
         TqlExpr::Parameter(_) | TqlExpr::Literal(_) => {}
     }
 }
 
-fn predicate_vars(predicate: &Predicate, output: &mut Vec<String>) {
+pub(super) fn predicate_vars(
+    predicate: &Predicate,
+    output: &mut Vec<String>,
+    bare_fields: bool,
+    default_node: Option<&str>,
+) {
     match predicate {
         Predicate::Compare { left, right, .. } => {
-            collect_expr_vars(left, output);
-            collect_expr_vars(right, output);
+            collect_expr_vars(left, output, bare_fields);
+            collect_expr_vars(right, output, bare_fields);
         }
         Predicate::DocFilter { var: Some(var), .. } => output.push(var.clone()),
-        Predicate::DocFilter { var: None, .. } => {}
+        Predicate::DocFilter { var: None, .. } => output.extend(default_node.map(str::to_owned)),
         Predicate::And(left, right) | Predicate::Or(left, right) => {
-            predicate_vars(left, output);
-            predicate_vars(right, output);
+            predicate_vars(left, output, bare_fields, default_node);
+            predicate_vars(right, output, bare_fields, default_node);
         }
-        Predicate::Not(inner) => predicate_vars(inner, output),
+        Predicate::Not(inner) => predicate_vars(inner, output, bare_fields, default_node),
     }
 }
 
@@ -2772,7 +2802,7 @@ fn expression_reference(expr: &TqlExpr, variable: &str) -> Option<SourcePath> {
         }
         _ => {
             let mut variables = Vec::new();
-            collect_expr_vars(expr, &mut variables);
+            collect_expr_vars(expr, &mut variables, false);
             variables.iter().any(|name| name == variable).then(Vec::new)
         }
     }
@@ -2848,6 +2878,17 @@ fn validate_pipeline_scope_origin(
             QueryEntry::Documents { .. } | QueryEntry::Pelorus { .. }
         )
     {
+        if matches!(
+            query.entry,
+            QueryEntry::Find { .. } | QueryEntry::Search { .. } | QueryEntry::Text { .. }
+        ) {
+            return validate_final_scope(
+                query,
+                ["_".to_owned()].into(),
+                Default::default(),
+                origin,
+            );
+        }
         let pattern = match &query.entry {
             QueryEntry::Match { pattern } | QueryEntry::OptionalMatch { pattern } => pattern,
             _ => return Ok(()),
@@ -2878,7 +2919,7 @@ fn validate_pipeline_scope_origin(
                 for (item_index, item) in with.items.iter().enumerate() {
                     *origin = Some(SourceSelector::WithItem(stage_index, item_index));
                     let mut variables = Vec::new();
-                    collect_expr_vars(&item.expr, &mut variables);
+                    collect_expr_vars(&item.expr, &mut variables, false);
                     if let Some(var) = variables
                         .iter()
                         .find(|var| !scope.contains(*var) && !scalar_aliases.contains(*var))
@@ -3013,7 +3054,7 @@ fn validate_pipeline_scope_origin(
             }
             PipelineStage::Filter(predicate) => {
                 let mut vars = Vec::new();
-                predicate_vars(predicate, &mut vars);
+                predicate_vars(predicate, &mut vars, false, None);
                 if let Some(var) = vars
                     .into_iter()
                     .find(|var| !scope.contains(var) && !scalar_aliases.contains(var))
@@ -3048,6 +3089,7 @@ fn validate_final_scope(
     scalar_aliases: std::collections::BTreeSet<String>,
     origin: &mut Option<SourceSelector>,
 ) -> Result<(), String> {
+    let bare_fields = query.pipeline.is_empty() && matches!(query.entry, QueryEntry::Find { .. });
     if let Some(rank) = &query.rank {
         let edge_variable = match &query.entry {
             QueryEntry::Match { pattern } | QueryEntry::OptionalMatch { pattern } => pattern
@@ -3081,44 +3123,37 @@ fn validate_final_scope(
     };
     if let Some(predicate) = &query.predicate {
         let mut referenced = Vec::new();
-        predicate_vars(predicate, &mut referenced);
+        predicate_vars(predicate, &mut referenced, bare_fields, None);
         check(referenced, SourceSelector::Predicate)?;
     }
     match &query.returns {
         ReturnClause::Variables(vars) => {
-            for (index, var) in vars.iter().enumerate() {
+            for (index, var) in vars.iter().enumerate().filter(|_| !bare_fields) {
                 check(vec![var.clone()], SourceSelector::ReturnItem(index))?;
             }
         }
         ReturnClause::Expressions(expressions) => {
             for (index, expression) in expressions.iter().enumerate() {
                 let mut referenced = Vec::new();
-                match &expression.kind {
-                    ReturnExprKind::Var(var) | ReturnExprKind::Property(var, _) => {
-                        referenced.push(var.clone());
-                    }
-                    ReturnExprKind::Scalar(expr) => collect_expr_vars(expr, &mut referenced),
-                    ReturnExprKind::Aggregate(_, inner) => {
-                        collect_return_kind_vars(inner, &mut referenced);
-                    }
-                }
+                collect_return_kind_vars(&expression.kind, &mut referenced, bare_fields);
                 check(referenced, SourceSelector::ReturnItem(index))?;
             }
         }
         ReturnClause::All => {}
     }
     // RETURN 的别名在排序阶段可见，WHERE 与 RETURN 求值仍使用输入作用域。
-    let return_aliases = match &query.returns {
+    let return_aliases: std::collections::BTreeSet<String> = match &query.returns {
         ReturnClause::Expressions(items) => items
             .iter()
-            .filter_map(|item| item.alias.as_ref())
-            .collect::<std::collections::BTreeSet<_>>(),
-        _ => std::collections::BTreeSet::new(),
+            .map(super::tql_executor::return_column_name)
+            .collect(),
+        ReturnClause::Variables(vars) => vars.iter().cloned().collect(),
+        ReturnClause::All => Default::default(),
     };
     for (index, order) in query.order_by.iter().enumerate() {
         *origin = Some(SourceSelector::Order(index));
         let mut ordered = Vec::new();
-        collect_expr_vars(&order.expr, &mut ordered);
+        collect_expr_vars(&order.expr, &mut ordered, bare_fields);
         if let Some(var) = ordered.into_iter().find(|var| {
             !final_scope.contains(var)
                 && !scalar_aliases.contains(var)

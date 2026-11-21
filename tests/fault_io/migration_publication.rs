@@ -61,7 +61,8 @@ fn 迁移取消在提交标记前撤销文件组且可重试() {
 
 #[test]
 fn 发布持有目标锁且文件碰撞只回收本次移动的文件() {
-    use triviumdb::test_hooks::{ConcurrencyPoint, pause_at};
+    use triviumdb::sdk::RequestContext;
+    use triviumdb::test_hooks::{ConcurrencyPoint, pause_at_request};
     let source_root = TestDir::new("migration_collision_source");
     let target_root = TestDir::new("migration_collision_target");
     let mut source = Database::<f32>::open(&source_root.file("source.tdb"), 1).unwrap();
@@ -69,10 +70,16 @@ fn 发布持有目标锁且文件碰撞只回收本次移动的文件() {
         .insert_with_id(1, &[1.], json!({"source":true}))
         .unwrap();
     let target = target_root.file("target.tdb");
-    let gate = pause_at(ConcurrencyPoint::MigrationFilePublished);
+    let context =
+        RequestContext::with_timeout("migration-collision", std::time::Duration::ZERO, false)
+            .unwrap();
+    let gate = pause_at_request(
+        ConcurrencyPoint::MigrationFilePublished,
+        context.request_id(),
+    );
     let worker_target = target.clone();
     let worker = std::thread::spawn(move || {
-        let result = source.migrate_to(&worker_target, 2);
+        let result = context.run(|| source.migrate_to(&worker_target, 2));
         source.close().unwrap();
         result.err().expect("目标文件碰撞必须报错")
     });
@@ -112,7 +119,8 @@ use triviumdb::{Database, TriviumError};
 #[test]
 fn 迁移在公开目标前预留最终实例配额() {
     use triviumdb::resources::{ResourceLimits, ResourceRuntime};
-    use triviumdb::test_hooks::{ConcurrencyPoint, pause_at};
+    use triviumdb::sdk::RequestContext;
+    use triviumdb::test_hooks::{ConcurrencyPoint, pause_at_request};
     const MB: usize = 1024 * 1024;
     let root = TestDir::new("migration-publish-quota");
     let runtime = ResourceRuntime::new(ResourceLimits {
@@ -137,9 +145,14 @@ fn 迁移在公开目标前预留最终实例配额() {
         .unwrap();
     let target = root.file("target.tdb");
     let worker_target = target.clone();
-    let pause = pause_at(ConcurrencyPoint::MigrationBeforeCommit);
+    let context =
+        RequestContext::with_timeout("migration-quota", std::time::Duration::ZERO, false).unwrap();
+    let pause = pause_at_request(
+        ConcurrencyPoint::MigrationBeforeCommit,
+        context.request_id(),
+    );
     let worker = std::thread::spawn(move || {
-        let result = source.migrate_to(&worker_target, 2);
+        let result = context.run(|| source.migrate_to(&worker_target, 2));
         source.close().unwrap();
         result.unwrap()
     });

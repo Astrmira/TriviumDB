@@ -1569,6 +1569,125 @@ async fn ndjson分块协议包含meta_rows_summary与profile() {
 }
 
 #[tokio::test]
+async fn 节点导入遇到文档归档字段时整批拒绝() {
+    let (app, _directory) = app("import_document_reference").await;
+    let response = raw_request(
+        app.clone(),
+        "POST",
+        "/v1/import/nodes",
+        br#"{"id":1,"vector":[1,0],"payload":{"v":1}}
+{"id":2,"vector":[0,1],"payload":{"_tdb_document":{"archive":7}}}
+"#
+        .to_vec(),
+        &[("content-type", "application/x-ndjson")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json(response).await["code"], "TDB_INVALID_INPUT");
+    for id in [1, 2] {
+        let node = request(app.clone(), "GET", &format!("/v1/nodes/{id}"), None, &[]).await;
+        assert_eq!(node.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[tokio::test]
+async fn 两种导入均重放已确认回执并在写入前检查版本() {
+    let (app, _dir) = app("import-receipt").await;
+    let nodes = br#"{"vector":[1,0],"payload":{}}
+{"vector":[0,1],"payload":{}}"#;
+    let edge = br#"{"source":1,"target":2,"label":"rel","weight":1}"#;
+    let mut stale = String::new();
+    for (path, body, key) in [
+        ("/v1/import/nodes", nodes.as_slice(), "nodes"),
+        ("/v1/import/edges", edge.as_slice(), "edges"),
+    ] {
+        let first = raw_request(
+            app.clone(),
+            "POST",
+            path,
+            body.to_vec(),
+            &[("idempotency-key", key)],
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let etag = first.headers()[header::ETAG].to_str().unwrap().to_owned();
+        let receipt = json(first).await;
+        assert_eq!(receipt["generation"], etag);
+        assert_eq!(receipt["replayed"], false);
+        let retry = json(
+            raw_request(
+                app.clone(),
+                "POST",
+                path,
+                body.to_vec(),
+                &[("idempotency-key", key)],
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(retry["createdIds"], receipt["createdIds"]);
+        assert_eq!(retry["generation"], etag);
+        assert_eq!(retry["replayed"], true);
+        if path.ends_with("nodes") {
+            assert_eq!(receipt["createdIds"], serde_json::json!(["1", "2"]));
+            stale = etag;
+        }
+    }
+    for (path, body) in [
+        ("/v1/import/nodes", nodes.as_slice()),
+        ("/v1/import/edges", edge.as_slice()),
+    ] {
+        let rejected = raw_request(
+            app.clone(),
+            "POST",
+            path,
+            body.to_vec(),
+            &[("if-match", &stale)],
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        assert_eq!(json(rejected).await["code"], "TDB_HTTP_PRECONDITION_FAILED");
+    }
+    assert_eq!(
+        request(app, "GET", "/v1/nodes/3", None, &[]).await.status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn 投影列类型与行顺序和传输编码无关() {
+    let (app, _dir) = app("mixed-columns").await;
+    let rows = br#"{"id":1,"vector":[1,0],"payload":{"k":1,"v":42}}
+{"id":2,"vector":[0,1],"payload":{"k":1,"v":"word"}}"#;
+    assert_eq!(
+        raw_request(app.clone(), "POST", "/v1/import/nodes", rows.to_vec(), &[])
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    for direction in ["ASC", "DESC"] {
+        let query = format!("FIND {{k:1}} RETURN _.v AS v ORDER BY _.id {direction}");
+        for accept in ["application/json", "application/x-ndjson"] {
+            let response = request(
+                app.clone(),
+                "POST",
+                "/v1/tql",
+                Some(serde_json::json!({"query":query})),
+                &[("accept", accept)],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = text(response).await;
+            let meta: Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+            assert_eq!(
+                meta["columns"],
+                serde_json::json!([{"name":"v","kind":"mixed"}])
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn 索引管理quiver状态与ndjson导入形成完整http契约() {
     let (app, _directory) = app("management_import").await;
     let nodes = raw_request(
@@ -1607,6 +1726,25 @@ async fn 索引管理quiver状态与ndjson导入形成完整http契约() {
     assert_eq!(created.status(), StatusCode::OK);
     let indexes = json(request(app.clone(), "GET", "/v1/indexes", None, &[]).await).await;
     assert_eq!(indexes["indexes"].as_array().unwrap().len(), 1);
+
+    for query in [
+        r#"FIND {type:"event"} RETURN *"#,
+        r#"FIND {"type":"event"} RETURN *"#,
+    ] {
+        let result = json(
+            request(
+                app.clone(),
+                "POST",
+                "/v1/tql",
+                Some(serde_json::json!({"query":query})),
+                &[],
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(result["rowCount"], 1);
+        assert_eq!(result["indexAdvice"], serde_json::json!([]));
+    }
 
     let quiver = json(request(app.clone(), "GET", "/v1/indexes/quiver", None, &[]).await).await;
     assert!(quiver["status"].as_str().is_some());
@@ -2244,7 +2382,7 @@ async fn zero_prepared_capacity_rejects_registration() {
 
 #[cfg(feature = "test-hooks")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn 写请求在WAL前断开时无业务副作用() {
+async fn 写请求在_wal_前断开时无业务副作用() {
     use triviumdb::test_hooks::{ConcurrencyPoint, pause_at_request};
     let (app, _directory) = app("cancel-in-core").await;
     let gate = pause_at_request(ConcurrencyPoint::BeforeTransactionWal, "cancel-in-core");
@@ -2262,7 +2400,7 @@ async fn 写请求在WAL前断开时无业务副作用() {
     assert!(client.await.unwrap_err().is_cancelled());
     gate.release();
     let response = request(
-        app,
+        app.clone(),
         "POST",
         "/v1/tql",
         Some(serde_json::json!({
@@ -2273,4 +2411,89 @@ async fn 写请求在WAL前断开时无业务副作用() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(json(response).await["rows"][0]["total"]["value"], 0);
+    let inserted = request(
+        app.clone(),
+        "POST",
+        "/v1/transactions",
+        Some(serde_json::json!({
+            "operations":[{"op":"insert","id":1,"vector":[1,0],"payload":{"v":1}}]
+        })),
+        &[],
+    )
+    .await;
+    assert_eq!(inserted.status(), StatusCode::OK);
+    for (uri, body, point) in [
+        (
+            "/v1/transactions",
+            serde_json::json!({"operations":[{"op":"delete","id":1}]}),
+            ConcurrencyPoint::BeforeTransactionWal,
+        ),
+        (
+            "/v1/nodes/delete-many",
+            serde_json::json!({"ids":[1,1]}),
+            ConcurrencyPoint::BeforeTransactionWal,
+        ),
+        (
+            "/v1/nodes/1/compare-and-set",
+            serde_json::json!({"field":"v","expected":1,"replacement":2}),
+            ConcurrencyPoint::DirectWriteWalLockAcquired,
+        ),
+    ] {
+        let gate = pause_at_request(point, "cancel-in-core");
+        let client = tokio::spawn(request(
+            app.clone(),
+            "POST",
+            uri,
+            Some(body),
+            &[("x-request-id", "cancel-in-core")],
+        ));
+        while !gate.is_arrived() {
+            assert!(!client.is_finished(), "请求应进入内核提交屏障 {uri}");
+            tokio::task::yield_now().await;
+        }
+        client.abort();
+        assert!(client.await.unwrap_err().is_cancelled());
+        gate.release();
+        let response = request(app.clone(), "GET", "/v1/nodes/1", None, &[]).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            json(response).await["node"]["payload"],
+            serde_json::json!({"v":1})
+        );
+    }
+}
+
+#[tokio::test]
+async fn 大整数在整节点和单列投影中保留精度和嵌套结构() {
+    use serde_json::json;
+    let (app, _dir) = app("exact-http-json").await;
+    let payload = json!({"wide":9007199254740993u64, "values":[9007199254740991i64, i64::MIN, {"max":u64::MAX,"literal":"001"}]});
+    let expected = json!({"wide":"9007199254740993","values":[9007199254740991i64,"-9223372036854775808",{"max":"18446744073709551615","literal":"001"}]});
+    let tx = request(
+        app.clone(),
+        "POST",
+        "/v1/transactions",
+        Some(json!({"operations":[{"op":"insert","id":1,"vector":[1.,0.],"payload":payload}]})),
+        &[],
+    )
+    .await;
+    assert_eq!(tx.status(), StatusCode::OK);
+    let get = request(app.clone(), "GET", "/v1/nodes/1", None, &[]).await;
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_eq!(json(get).await["node"]["payload"], expected);
+    let tql = request(
+        app,
+        "POST",
+        "/v1/tql",
+        Some(json!({"query":"MATCH (n) RETURN n, n.wide AS wide, n.values AS items"})),
+        &[],
+    )
+    .await;
+    assert_eq!(tql.status(), StatusCode::OK);
+    let body = json(tql).await;
+    let rows = body["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["n"]["payload"], expected);
+    assert_eq!(rows[0]["wide"]["value"], expected["wide"]);
+    assert_eq!(rows[0]["items"]["value"], expected["values"]);
 }

@@ -593,6 +593,50 @@ impl<V> ArtMap<V> {
         output
     }
 
+    /// 保持每层一个子游标，调用方在取得足够的合格行后可以直接停止。
+    pub(crate) fn iter_values(
+        &self,
+        descending: bool,
+        range: Option<(Vec<u8>, Ordering, bool)>,
+    ) -> impl Iterator<Item = &V> {
+        let include = |key: &[u8], range: &Option<(Vec<u8>, Ordering, bool)>| {
+            range.as_ref().is_none_or(|(bound, order, inclusive)| {
+                key.first() == bound.first() && key_matches(key, bound, *order, *inclusive)
+            })
+        };
+        let mut stack = Vec::new();
+        if let Some(root) = self.root.as_deref() {
+            stack.push((root.terminal.as_ref(), root.children.iter(descending)));
+        }
+        std::iter::from_fn(move || {
+            loop {
+                let (terminal, children) = stack.last_mut()?;
+                if !descending
+                    && let Some(entry) = terminal.take()
+                    && include(&entry.key, &range)
+                {
+                    return Some(&entry.value);
+                }
+                if let Some((_, child)) = children.next() {
+                    if range.as_ref().is_some_and(|(bound, order, inclusive)| {
+                        first_key(child).is_some_and(|first| first.first() > bound.first())
+                            || last_key(child).is_some_and(|last| last.first() < bound.first())
+                            || subtree_relation(child, bound, *order, *inclusive) == Some(false)
+                    }) {
+                        continue;
+                    }
+                    stack.push((child.terminal.as_ref(), child.children.iter(descending)));
+                } else if let Some(entry) = terminal.take()
+                    && include(&entry.key, &range)
+                {
+                    return Some(&entry.value);
+                } else {
+                    stack.pop();
+                }
+            }
+        })
+    }
+
     pub(crate) fn ordered_values(&self, descending: bool, limit: usize) -> Vec<&V> {
         let mut output = Vec::with_capacity(limit.min(self.len));
         if let Some(root) = self.root.as_deref() {

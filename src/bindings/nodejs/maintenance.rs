@@ -1,8 +1,7 @@
 //! 持久化、后台维护、容量与资源管理入口。
 
 use super::arguments::{
-    node_id_to_js, parse_management_string, parse_management_usize, parse_positive_usize,
-    write_number, write_string,
+    node_id_to_js, parse_management_usize, parse_positive_usize, write_number, write_string,
 };
 use super::database::{DbBackend, TriviumDB};
 use super::errors::{to_napi_error, with_napi_write_info};
@@ -31,9 +30,9 @@ impl TriviumDB {
     pub fn publish_generation_manifest(
         &mut self,
         env: Env,
-        generation_id: Either<String, JsUnknown>,
+        generation_id: JsUnknown,
     ) -> napi::Result<NodeJson> {
-        let generation_id = parse_management_string(env, generation_id, "generationId")?;
+        let generation_id = write_string(env, generation_id, "generationId")?;
         let manifest = dispatch!(self, mut db => db.publish_generation_manifest(&generation_id))
             .map_err(|error| to_napi_error(env, error))?;
         node_json_value(manifest).map_err(|error| napi::Error::from_reason(error.to_string()))
@@ -41,8 +40,8 @@ impl TriviumDB {
 
     /// 运行时切换 WAL 同步模式
     #[napi]
-    pub fn set_sync_mode(&mut self, env: Env, mode: Either<String, JsUnknown>) -> napi::Result<()> {
-        let mode = parse_management_string(env, mode, "mode")?;
+    pub fn set_sync_mode(&mut self, env: Env, mode: JsUnknown) -> napi::Result<()> {
+        let mode = write_string(env, mode, "mode")?;
         let sm = crate::storage::wal::SyncMode::parse(&mode).map_err(|reason| {
             to_napi_error(
                 env,

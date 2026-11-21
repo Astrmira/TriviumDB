@@ -7,6 +7,9 @@
   ],
   "edges":[[1,2],[3,2],[2,4]],
   "cases":[
+    {"query":"MATCH (a)-[e:rel]->(b {id:4}) WITH _ AS seed RETURN seed.id AS id","rows":[{"id":2}]},
+    {"query":"MATCH (a)-[e:rel]->(b) WITH b,e WHERE e MATCHES {label:'rel'} RETURN b.id AS id ORDER BY id","rows":[{"id":2},{"id":2},{"id":4}]},
+    {"query":"FIND {x:11} AS seed WITH seed AS origin, 99 AS num EXPAND origin [:rel*1..1] AS child RETURN depth(origin) AS prior,depth(num) AS scalar,depth(child) AS current,graph_score(origin) AS score","rows":[{"prior":null,"scalar":null,"current":1,"score":null}]},
     {"query":"FIND {x:11} AS seed WITH seed, seed.x AS before, seed AS origin EXPAND seed [:rel*1..1] AS child RETURN before, origin.id AS origin, child.x AS after","rows":[{"before":11,"origin":1,"after":22}]},
     {"query":"FIND {seed:true} AS seed WITH seed, seed.x AS before EXPAND seed [:rel*1..1] AS child RETURN seed.id AS origin, before, child.id AS child ORDER BY origin ASC","rows":[{"origin":1,"before":11,"child":2},{"origin":3,"before":33,"child":2}]},
     {"query":"FIND {x:11} AS seed WITH seed AS origin, seed, seed.x AS before EXPAND seed [:rel*1..1] AS child RETURN origin.id AS origin, seed.id AS seed, before","rows":[{"origin":1,"seed":1,"before":11}]},
@@ -19,6 +22,8 @@
     {"query":"FIND {seed:true} AS seed WITH seed, seed.x AS before EXPAND seed [:rel*1..1] AS child WITH child, seed, before degree child AS scored RETURN seed.id AS origin, before, scored.id AS target ORDER BY origin ASC","rows":[{"origin":1,"before":11,"target":2},{"origin":3,"before":33,"target":2}]}
   ],
   "invalid":[
+    "SEARCH VECTOR [1] TOP 3 RETURN typo.x",
+    "TEXT BM25 'unregistered' TOP 3 RETURN typo.x",
     "MATCH (n) AS n WITH n, n.x + missing.x AS total RETURN total",
     "MATCH (n) AS n WITH n, COALESCE(n.x,missing.x) AS total RETURN total",
     "MATCH (n) AS n WITH n, COALESCE(n.x,missing.x + 1) IS NULL AS total RETURN total",

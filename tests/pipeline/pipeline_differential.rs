@@ -534,10 +534,7 @@ fn assert_reference(family: usize, actual: &NodeSet) {
                 let degree = reference_degree(&universe, row.id);
                 let score = row.graph_score.expect("度中心性结果必须包含分数");
                 assert_eq!(score.kind, ScoreKind::Exact);
-                close_score(
-                    score.value,
-                    degree as f64 / (2 * (universe.len() - 1)) as f64,
-                );
+                close_score(score.value, degree as f64 / (universe.len() - 1) as f64);
             }
         }
         9 => {

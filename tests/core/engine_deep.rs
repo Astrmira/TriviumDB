@@ -509,51 +509,52 @@ fn COV7_18_find_array_value() {
 //  WAL 截断恢复 (wal.rs L69-79)
 // ════════════════════════════════════════════════════════════════
 
-/// 损坏 WAL 截断 → 重新打开时安全跳过
+/// 最后一个事务的提交帧缺失尾字节，完整事务前缀须在两次重开后仍可读取。
 #[test]
 fn COV7_19_wal_truncated_recovery() {
-    let path = tmp_db("wal_trunc");
-
-    // 正常写入
-    {
-        let mut db = Database::<f32>::open(&path, DIM).unwrap();
-        for i in 0..5u32 {
-            db.insert(&[i as f32, 0.0, 0.0, 0.0], serde_json::json!({"v": i}))
-                .unwrap();
+    use triviumdb::storage::wal::{Wal, WalEntry};
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("prefix.tdb");
+    let path = file.to_str().unwrap();
+    Database::<f32>::open(path, DIM).unwrap().close().unwrap();
+    let mut wal = Wal::open(path).unwrap();
+    let append = |wal: &mut Wal, id: u64| {
+        wal.append_batch(
+            id,
+            &[WalEntry::Insert {
+                id,
+                vector: vec![id as f32; DIM],
+                payload: serde_json::json!({"v": id}).to_string(),
+            }],
+        )
+        .unwrap();
+    };
+    for id in 1..=4 {
+        append(&mut wal, id);
+    }
+    let wal_path = file.with_extension("tdb.wal");
+    let prefix = std::fs::metadata(&wal_path).unwrap().len();
+    append(&mut wal, 5);
+    drop(wal);
+    let tail = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&wal_path)
+        .unwrap();
+    let len = tail.metadata().unwrap().len();
+    assert!(len > prefix + 1);
+    tail.set_len(len - 1).unwrap();
+    tail.sync_all().unwrap();
+    drop(tail);
+    for _ in 0..2 {
+        let mut db = Database::<f32>::open(path, DIM).unwrap();
+        assert_eq!(db.all_node_ids().unwrap(), [1, 2, 3, 4]);
+        for id in 1..=4 {
+            let node = db.get(id).unwrap().unwrap();
+            assert_eq!(node.payload, serde_json::json!({"v":id}));
+            assert_eq!(node.vector, vec![id as f32; DIM]);
         }
-        // 不 flush → WAL 有数据
+        db.close().unwrap();
     }
-
-    // 手动截断 WAL 文件的最后几字节 → 模拟断电损坏
-    let wal_path = format!("{}.wal", path);
-    if let Ok(data) = std::fs::read(&wal_path)
-        && data.len() > 20
-    {
-        // 截断掉最后 15 字节
-        std::fs::write(&wal_path, &data[..data.len() - 15]).ok();
-    }
-
-    // 重新打开 → 应安全恢复（丢失部分数据但不崩溃）
-    let db = Database::<f32>::open(&path, DIM);
-    match db {
-        Ok(db) => {
-            assert!(
-                db.node_count().unwrap() <= 5,
-                "截断 WAL 恢复不能产生额外脏节点"
-            );
-            for id in db.all_node_ids().unwrap() {
-                let payload = db.get_payload(id).unwrap().expect("恢复节点必须有 payload");
-                let v = payload
-                    .get("v")
-                    .and_then(|value| value.as_u64())
-                    .expect("恢复节点必须携带原始 v 字段");
-                assert!(v < 5, "截断 WAL 恢复不能产生越界 payload: {payload}");
-            }
-        }
-        Err(e) => assert!(!e.to_string().is_empty(), "安全拒绝必须返回可诊断错误"),
-    }
-
-    cleanup(&path);
 }
 
 // ════════════════════════════════════════════════════════════════

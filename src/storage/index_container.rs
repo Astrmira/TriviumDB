@@ -293,7 +293,7 @@ pub(crate) fn publish_checkpoint(
     db_path: &str,
     preserve_text: bool,
     pelorus: [Option<Part>; 2],
-) -> io::Result<()> {
+) -> io::Result<u64> {
     let mut parts = Vec::with_capacity(COMPONENTS);
     for suffix in INDEX_SUFFIXES.into_iter().take(BASE_COMPONENTS) {
         parts.push(if suffix == ".text" && preserve_text || suffix == ".qssd" {
@@ -307,7 +307,7 @@ pub(crate) fn publish_checkpoint(
 }
 
 /// 派生 SSD 更新保持同一事实身份与其他组件，旧 Reader 继续持有旧代文件。
-pub(crate) fn publish_ssd(db_path: &str) -> io::Result<()> {
+pub(crate) fn publish_ssd(db_path: &str) -> io::Result<u64> {
     validate(db_path, true)?;
     let mut parts = Vec::with_capacity(COMPONENTS);
     for suffix in INDEX_SUFFIXES {
@@ -317,8 +317,9 @@ pub(crate) fn publish_ssd(db_path: &str) -> io::Result<()> {
             open(db_path, suffix)?
         });
     }
-    publish(db_path, parts)?;
-    cleanup_components(db_path)
+    let bytes = publish(db_path, parts)?;
+    cleanup_components(db_path)?;
+    Ok(bytes)
 }
 
 fn identities(db_path: &str) -> io::Result<([u8; 16], [u8; 16])> {
@@ -340,7 +341,7 @@ fn identities(db_path: &str) -> io::Result<([u8; 16], [u8; 16])> {
     ))
 }
 
-fn publish(db_path: &str, parts: Vec<Option<Part>>) -> io::Result<()> {
+fn publish(db_path: &str, parts: Vec<Option<Part>>) -> io::Result<u64> {
     #[cfg(feature = "test-hooks")]
     crate::test_hooks::io_result(crate::test_hooks::IoPoint::IndexContainerWrite)?;
     let path = PathBuf::from(format!("{db_path}.idx"));
@@ -361,6 +362,8 @@ fn publish(db_path: &str, parts: Vec<Option<Part>>) -> io::Result<()> {
         main_crc: super::file_format::file_crc32(db_path)?,
     };
     let mut end = HEADER as u64;
+    // 目录先占位，最后回填；对齐间隙通过 seek 跳过。
+    let mut written = 2 * HEADER as u64;
     for (index, part) in parts.into_iter().enumerate() {
         let Some(part) = part else { continue };
         if part.length == 0 {
@@ -391,6 +394,7 @@ fn publish(db_path: &str, parts: Vec<Option<Part>>) -> io::Result<()> {
             crc,
         };
         end = offset.checked_add(length).ok_or_else(invalid)?;
+        written += length;
     }
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&directory.bytes())?;
@@ -401,7 +405,8 @@ fn publish(db_path: &str, parts: Vec<Option<Part>>) -> io::Result<()> {
     drop(file);
     #[cfg(feature = "test-hooks")]
     crate::test_hooks::io_result(crate::test_hooks::IoPoint::IndexContainerPublish)?;
-    robust_rename_and_sync(&temporary, &path)
+    robust_rename_and_sync(&temporary, &path)?;
+    Ok(written)
 }
 
 /// 只在文件组提交成功之后删除已归入容器的独立组件。
