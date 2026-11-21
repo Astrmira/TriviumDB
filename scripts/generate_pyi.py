@@ -226,7 +226,7 @@ def render_params(qual: str, sig: inspect.Signature, receiver: str) -> str:
             parts.append("*")
         piece = f"{p.name}: {param_type(qual, p.name, p.default)}"
         if p.default is not _EMPTY:
-            piece += f" = {p.default!r}"
+            piece += " = ..." if p.default is Ellipsis else f" = {p.default!r}"
         parts.append(piece)
         nxt = params[i + 1] if i + 1 < len(params) else None
         if p.kind == p.POSITIONAL_ONLY and (nxt is None or nxt.kind != p.POSITIONAL_ONLY):

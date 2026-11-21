@@ -6,6 +6,11 @@
 
 ## 中文说明
 
+- FIND 分页排序按实际投影列解析，直接查询与 Prepared 查询共用排序语义。普通投影将每行字符串字面量计入查询内存预算。空成员列表按常量条件规划，索引建议按解析后的字段名生成。
+- Server 的节点与边 NDJSON 导入支持幂等重试和版本前置条件。Writer 按请求剩余期限决定是否等待合批。JSON 与 NDJSON 对混合类型列统一返回 mixed。边分页按稳定顺序计数，仅复制当前页的元数据。Server 启动时验证数据库路径可用 UTF-8 表示。
+- 文档零宽选区返回空正文和空来源范围。Python 和 Node 局部更新边时可显式清空元数据。Hash 索引在映射与堆加载模式下均拒绝重复键。专用属性查询在确认结果超限时停止核验。
+- f16 精确扫描在请求预算内扩宽一次查询向量，评分线程共享查询向量与范数，直接读取候选分量。全路径枚举使用显式栈和共享路径前缀，支持按调用方预算遍历深链。
+
 - HTTP 事务在组 WAL 同步成功后确认幂等回执。同步之前发生的实体版本读取错误会使旧 ETag 整体失效，同键重试可以取回原先分配的节点 ID。HTTP 整节点、边、搜索结果和 TQL 投影中的嵌套大整数采用同一十进制字符串编码。
 - 文件组回收先持久退役发布日志，再删除恢复备份。Windows 使用同卷写穿透移动发布控制文件。代际指针替换后的同步错误携带 `publish/unknown`，调用方可读取当前代际确认结果。
 - TQL 简写向量查询在文档谓词匹配集内取 Top-K。`FIND` 默认按节点 ID 分页，显式字段排序可按有序索引游标取页。`SET VECTOR` 按唯一目标写入，`MATCH … CREATE` 拒绝在已绑定节点上提供属性，集合字面量检查成员之间的逗号。
@@ -20,6 +25,11 @@
 ---
 
 ## English
+
+- FIND pagination resolves ordering against the actual projection for both direct and prepared queries. Node projections account for string literals per row. Empty membership predicates produce constant decisions, and index advice uses parsed field names.
+- Node and edge NDJSON imports honor idempotency keys and generation preconditions. The writer uses the remaining request deadline when deciding whether to wait for a batch. JSON and NDJSON label heterogeneous columns as mixed. Edge pagination counts in stable order and copies metadata only for the requested page. The server validates that its database path can be represented in UTF-8 before opening it.
+- Empty document selections return empty text and source spans. Python and Node edge updates can explicitly clear metadata. Both mapped and heap-backed hash indexes reject duplicate keys. Indexed property lookups stop verification once they establish that the result limit has been exceeded.
+- Exact f16 scans reserve and widen the query once, share its components and norm across workers, and read candidate components directly. Both all-paths traversal APIs use an explicit stack and a shared path prefix for deep graphs.
 
 - HTTP transactions confirm idempotent receipts after the group WAL sync succeeds. If entity-version reads fail before that point, the server invalidates prior ETags. A retry with the same key can retrieve the original allocated IDs. Nested large integers in node, edge, search and TQL responses use the same decimal string encoding.
 - Checkpoint cleanup durably retires the publication journal before removing recovery backups. On Windows, control files use same-volume write-through moves. A sync error after a generation pointer switch carries `publish/unknown`; callers can read the current generation to reconcile the outcome.

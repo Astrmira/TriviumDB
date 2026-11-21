@@ -706,6 +706,8 @@ pub fn projection_columns(
                 .and_modify(|current| {
                     if *current == "null" {
                         *current = kind;
+                    } else if kind != "null" && *current != kind {
+                        *current = "mixed";
                     }
                 })
                 .or_insert(kind);

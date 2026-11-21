@@ -805,7 +805,7 @@ export class TriviumDB {
   /** 插入或覆盖唯一边三元组的权重与元数据 */
   upsertEdge(src: number, dst: number, label: string, weight: number, metadata?: any): void;
 
-  /** 更新已存在边的部分字段 */
+  /** 更新已存在边的部分字段。省略 metadata 或传 undefined 保留原值，传 null 清空元数据。 */
   updateEdge(src: number, dst: number, label: string, weight?: number, metadata?: any): void;
 
   /**

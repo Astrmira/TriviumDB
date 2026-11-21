@@ -609,7 +609,7 @@ db.link(1, 2, "knows", 0.95)?;
 
 ### 精确边读取与 Upsert
 
-边的唯一键是 `(src, dst, label)`。`get_edge/getEdge` 精确读取单边；`upsert_edge/upsertEdge` 创建或覆盖 `weight` 与任意 JSON `metadata`；`update_edge/updateEdge` 只更新已存在边的指定字段。边元数据会贯穿 WAL、v7 `.tdb` 文件、迁移和各语言绑定。
+边的唯一键是 `(src, dst, label)`。`get_edge/getEdge` 精确读取单边；`upsert_edge/upsertEdge` 创建或覆盖 `weight` 与任意 JSON `metadata`；`update_edge/updateEdge` 只更新已存在边的指定字段。省略 `metadata` 保留原值。Rust 传 `Some(Value::Null)`、Python 显式传 `None`、Node 显式传 `null` 可将元数据设为 JSON 空值。边元数据随 WAL、检查点和维度迁移持久化。
 
 ```rust
 let metadata = serde_json::json!({"confidence": 0.98});
@@ -1573,7 +1573,7 @@ print(info["property_index_format"])    # 8
 print(info["sidecars"])
 ```
 
-`tql_mut` 读查询、patch 普通对象简写、Node 数字构造参数分别返回迁移错误。Rust 同步配置通过 `Config.sync_mode` 提供。当前开发 WAL 为 v7，ReadWrite 按对应历史布局校验并原子升级 v2/v3/v4/v5/v6，流式恢复完整提交前缀。ReadOnly/Immutable 采用物理零写契约，旧格式升级由 Writer 完成。无头、未知版本及非法迁移输入返回结构化错误。
+`tql_mut` 读查询、patch 普通对象简写、Node 数字构造参数分别返回迁移错误。Rust 同步配置通过 `Config.sync_mode` 提供。当前内核校验 WAL v7 并恢复完整的已提交前缀。遇到受支持的旧格式时，普通打开返回 `TDB_MIGRATION_REQUIRED`。升级前停用来源库，使用[外部迁移工具](migration.md)核验并发布目标文件组，再以目标路径启动服务。
 
 `patch_payload`／`patchPayload` 先校验全部顶层操作符及操作数，再预览整份修改并执行写入。支持的操作符为 `$set`、`$inc` 和 `$unset`，操作数须为 JSON 对象。未知操作符或非法操作数返回 `TDB_INVALID_INPUT`，目标字段为对应的 `patch.<操作符>`，写入完成点为 `validation/not_committed`。`$inc` 成员继续执行数值类型、精确整数及溢出校验。
 
@@ -1746,7 +1746,7 @@ db.build_text_index()
 
 开发版本的 TMET v2 同时保存主文件 CRC、WAL 检查点封条和元数据 CRC。恢复先核对封条与主检查点，再划分旧删除和检查点后删除。TMET v1 的无封条文本在 ID 删除及复用造成恢复歧义时，返回 `TDB_RECOVERY_REQUIRED`，字段为 `text_index.recovery_boundary`。历史文本的必要加载与校验遵守实例和共享工作区预算。
 
-无待恢复日志的历史文本检查点在 Writer 打开时补齐封条和 TMET v2。元数据更新沿用已有文本 CRC，并按主文件绑定和原子替换完成发布。旧 WAL 的升级采用帧级及事务暂存准入，日志总量与单次恢复工作区分别计量。
+外部迁移工具在暂存副本中恢复历史 WAL 和文本检查点，并核对目标库的文本事实与索引定义。
 
 > **恢复提醒**　历史文本恢复歧义通过完整数据库备份恢复，或由宿主事实创建新库后登记正文与关键词。升级前保留完整备份，旧版本环境使用对应备份恢复。
 

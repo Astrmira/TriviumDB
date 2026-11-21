@@ -70,23 +70,6 @@ fn text_ngrams(text: &str) -> Result<Vec<String>> {
     Ok(grams)
 }
 
-fn intersect_postings<'a, I>(mut postings: I) -> Vec<NodeId>
-where
-    I: Iterator<Item = &'a [NodeId]>,
-{
-    let Some(first) = postings.next() else {
-        return Vec::new();
-    };
-    let mut output = first.to_vec();
-    for posting in postings {
-        output.retain(|id| posting.binary_search(id).is_ok());
-        if output.is_empty() {
-            break;
-        }
-    }
-    output
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PropertyKey(Vec<u8>);
 
@@ -1266,6 +1249,14 @@ impl PropertyIndexRegistry {
     }
 
     pub fn ngram_lookup(&self, field: &str, needle: &str) -> Result<Option<Vec<NodeId>>> {
+        Ok(self.ngram_candidates(field, needle)?.map(Iterator::collect))
+    }
+
+    pub(crate) fn ngram_candidates(
+        &self,
+        field: &str,
+        needle: &str,
+    ) -> Result<Option<impl Iterator<Item = NodeId> + '_>> {
         let index = match self.ngram_indexes.get(field) {
             Some(index) => index,
             None => return Ok(None),
@@ -1287,10 +1278,14 @@ impl PropertyIndexRegistry {
             })
             .collect::<Vec<_>>();
         postings.sort_by_key(|posting| posting.len());
-        if postings.first().is_some_and(|posting| posting.is_empty()) {
-            return Ok(Some(Vec::new()));
-        }
-        Ok(Some(intersect_postings(postings.into_iter())))
+        let mut postings = postings.into_iter();
+        let first = postings.next().unwrap_or_default();
+        Ok(Some(first.iter().copied().filter(move |id| {
+            postings
+                .as_slice()
+                .iter()
+                .all(|posting| posting.binary_search(id).is_ok())
+        })))
     }
 
     pub fn drop_ngram_index(&mut self, field: &str) {
@@ -2221,6 +2216,8 @@ fn load_part(
         key_encoding_version: key_version,
         ..Default::default()
     };
+    // 映射 posting 单独保存，字段身份须独立于堆索引目录校验。
+    let mut hash_fields = std::collections::HashSet::new();
     let mut all_mapped_blocks = BTreeMap::new();
     let mut all_mapped_posting_entries = 0usize;
     for _ in 0..field_count {
@@ -2289,7 +2286,7 @@ fn load_part(
             Vec::new()
         };
         let duplicate = match kind {
-            0 => registry.indexes.contains_key(&field),
+            0 => !hash_fields.insert(field.clone()),
             1 => registry.ordered_indexes.contains_key(&field),
             2 => registry
                 .composite_indexes
@@ -2393,13 +2390,17 @@ fn load_part(
                     ids.push(id);
                 }
             }
-            if prefer_mmap_postings && kind == 0 {
-                mapped_blocks.insert(
+            let duplicate = if prefer_mmap_postings && kind == 0 {
+                let previous = mapped_blocks.insert(
                     (field.clone(), key.clone()),
                     posting_range.expect("v3 posting 必须有范围"),
                 );
                 mapped_posting_entries = mapped_posting_entries.saturating_add(id_count);
-            } else if entries.insert(key, ids).is_some() {
+                previous.is_some()
+            } else {
+                entries.insert(key, ids).is_some()
+            };
+            if duplicate {
                 return Err(TriviumError::CorruptedFile(
                     "属性索引包含重复键 (Property index contains duplicate keys)".into(),
                 ));

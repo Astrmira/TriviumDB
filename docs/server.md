@@ -142,7 +142,7 @@ closed?;
 | `--max-concurrent-reads` | `TRIVIUMDB_MAX_CONCURRENT_READS` | 系统并行度 | 最大并发读 |
 | `--idempotency-capacity` | `TRIVIUMDB_IDEMPOTENCY_CAPACITY` | `4096` | 进程内幂等缓存容量 |
 | `--max-write-batch-size` | `TRIVIUMDB_MAX_WRITE_BATCH_SIZE` | `64` | Group Commit 合批上限 |
-| `--max-write-batch-delay-us` | `TRIVIUMDB_MAX_WRITE_BATCH_DELAY_US` | `500` | 动态合批窗口（微秒） |
+| `--max-write-batch-delay-us` | `TRIVIUMDB_MAX_WRITE_BATCH_DELAY_US` | `500` | 动态合批窗口（微秒）。队首请求的剩余期限不足一个窗口时直接处理 |
 | `--prepared-cache-capacity` | `TRIVIUMDB_PREPARED_CACHE_CAPACITY` | `1024` | Prepared TQL 缓存容量，设为 0 时创建返回 `503 TDB_PREPARED_DISABLED` |
 | `--request-timeout-ms` | `TRIVIUMDB_REQUEST_TIMEOUT_MS` | `30000` | 请求 deadline（毫秒） |
 | `--max-body-bytes` | `TRIVIUMDB_MAX_BODY_BYTES` | `4194304` | HTTP 请求体硬上限 |
@@ -200,7 +200,7 @@ Server 不为认知算子维护另一套 HTTP API；`TEXT`、`RESIDUAL`、`DIVER
 
 普通 JSON 查询响应在编码过程中实施 16 MiB 硬上限。超限返回 `413 TDB_HTTP_RESPONSE_TOO_LARGE`，旧类别保存在 legacyCode。可使用属性投影、`LIMIT` 或 NDJSON 响应控制返回量。
 
-请求头设置 `Accept: application/x-ndjson` 时，响应按 `meta → row... → summary` 输出；`meta.columns` 明确声明每个投影列的 `node`、`edge`、`path` 或标量类型。普通 JSON 响应也在顶层 `columns` 返回相同元数据。HTTP 输出逐行生成，但排序、聚合和 Top-K 等 Core 算子仍可能先物化结果。
+请求头设置 `Accept: application/x-ndjson` 时，响应按 `meta → row... → summary` 输出；`meta.columns` 明确声明每个投影列的 `node`、`edge`、`path` 或标量类型。同一列含多种非空类型时标记为 `mixed`，只有空值或零行时标记为 `null`。普通 JSON 响应也在顶层 `columns` 返回相同元数据。HTTP 输出逐行生成，但排序、聚合和 Top-K 等 Core 算子仍可能先物化结果。
 
 普通及 Prepared TQL 的空结果保留静态投影列名。没有结果值可推断类型时，`kind` 为 `null`。查询诊断的字节位置按客户端提交的原始 UTF-8 计算。
 
@@ -267,7 +267,7 @@ Content-Type: application/vnd.triviumdb.vector+f32
 - 空请求、未知字段、非法 JSON、非法维度和非有限数值均 fail-closed；
 - 当前模式为**整请求原子提交**：任意记录失败时整批不写入；
 - 节点导入遇到 Payload 顶层保留字段 `_tdb_document` 时，返回 HTTP 400 和 `TDB_INVALID_INPUT`。跨库传输受管理文档请使用快照，或在目标库重新接入原文。
-- 导入通过 Writer Actor 和 Core transaction/WAL 完成原子提交与持久化。
+- 两个导入入口都支持 `If-Match` 和 `Idempotency-Key`。重试时携带首次请求的幂等键、版本条件和相同记录，可取回原先分配的节点 ID 与 generation。
 
 ---
 

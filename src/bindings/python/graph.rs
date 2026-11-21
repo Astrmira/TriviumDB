@@ -11,6 +11,16 @@ use super::types::{PyEdge, PyIncomingEdge, PyReachabilityResult, to_py_reachabil
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
+// PyO3 的 Option 同时接受省略和 None；局部更新需要保留这两种语义。
+#[derive(Default)]
+struct EdgeMetadata<'py>(Option<Bound<'py, PyAny>>);
+
+impl<'py> FromPyObject<'py> for EdgeMetadata<'py> {
+    fn extract_bound(value: &Bound<'py, PyAny>) -> PyResult<Self> {
+        Ok(Self(Some(value.clone())))
+    }
+}
+
 #[pymethods]
 impl PyTriviumDB {
     #[pyo3(signature = (src, dst, label=string_argument("related"), weight=float_argument(1.0)), text_signature="($self, src, dst, label='related', weight=1.0)")]
@@ -79,14 +89,14 @@ impl PyTriviumDB {
             .map_err(to_py_error)
     }
 
-    #[pyo3(signature = (src, dst, label, weight=None, metadata=None))]
+    #[pyo3(signature = (src, dst, label, weight=None, metadata=EdgeMetadata::default()), text_signature="($self, src, dst, label, weight=None, metadata=...)")]
     fn update_edge(
         slf: &Bound<'_, Self>,
         src: Bound<'_, PyAny>,
         dst: Bound<'_, PyAny>,
         label: Bound<'_, PyAny>,
         weight: Option<Bound<'_, PyAny>>,
-        metadata: Option<&Bound<'_, PyAny>>,
+        metadata: EdgeMetadata<'_>,
     ) -> PyResult<()> {
         let (_request, mut borrowed) = database_write(slf).map_err(write_admission_error)?;
         let this = &mut *borrowed;
@@ -101,7 +111,7 @@ impl PyTriviumDB {
             dst,
             &label,
             weight,
-            metadata.map(|value| write_json(value, "metadata")).transpose()?,
+            metadata.0.as_ref().map(|value| write_json(value, "metadata")).transpose()?,
         ))
         .map_err(to_py_error)
     }

@@ -587,8 +587,9 @@ fn decode_ndjson<T: serde::de::DeserializeOwned>(
 
 async fn import_nodes(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Json<TransactionResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let operations = decode_ndjson(&body, |record: BulkNodeRecord, line| {
         triviumdb::document::validate_node_import_payload(&record.payload, line)?;
         Ok(TransactionOperation::Insert {
@@ -597,13 +598,14 @@ async fn import_nodes(
             payload: record.payload,
         })
     })?;
-    import_operations(state, operations).await
+    import_operations(state, headers, operations).await
 }
 
 async fn import_edges(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Json<TransactionResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let operations = decode_ndjson(&body, |record: BulkEdgeRecord, _| {
         Ok(TransactionOperation::Link {
             source: record.source,
@@ -612,31 +614,25 @@ async fn import_edges(
             weight: record.weight,
         })
     })?;
-    import_operations(state, operations).await
+    import_operations(state, headers, operations).await
 }
 
 async fn import_operations(
     state: Arc<AppState>,
+    headers: HeaderMap,
     operations: Vec<TransactionOperation>,
-) -> Result<Json<TransactionResponse>, ApiError> {
-    let result = state
-        .engine
-        .transaction(
-            TransactionRequest {
-                expected_generation: None,
-                expected_nodes: Default::default(),
-                expected_edges: Vec::new(),
-                operations,
-            },
-            None,
-            Instant::now() + state.request_timeout,
-        )
-        .await?;
-    Ok(Json(TransactionResponse {
-        created_ids: result.created_ids,
-        generation: result.version.global_etag(),
-        replayed: result.replayed,
-    }))
+) -> Result<Response, ApiError> {
+    submit_transaction(
+        &state,
+        &headers,
+        TransactionRequest {
+            expected_generation: None,
+            expected_nodes: Default::default(),
+            expected_edges: Vec::new(),
+            operations,
+        },
+    )
+    .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -1025,34 +1021,50 @@ fn query_response(
 }
 
 fn index_advice(query: &str, indexed_fields: &[String]) -> Vec<serde_json::Value> {
-    let Some(start) = query.find('{') else {
+    use triviumdb::filter::Filter;
+    use triviumdb::query::tql_ast::QueryEntry;
+    let Ok(parsed) = triviumdb::query::tql_parser::parse_tql(query) else {
         return Vec::new();
     };
-    let Some(end) = query[start + 1..].find([':', '}']) else {
-        return Vec::new();
+    let mut filters = match &parsed.entry {
+        QueryEntry::Find { filter } => vec![filter],
+        QueryEntry::Match { pattern } | QueryEntry::OptionalMatch { pattern } => pattern
+            .nodes
+            .iter()
+            .filter_map(|node| node.filter.as_ref())
+            .collect(),
+        _ => return Vec::new(),
     };
-    let field = query[start + 1..start + 1 + end].trim();
-    if field.is_empty()
-        || field.starts_with('$')
-        || indexed_fields.iter().any(|indexed| indexed == field)
-    {
-        return Vec::new();
+    let mut advice = std::collections::BTreeSet::new();
+    while let Some(filter) = filters.pop() {
+        let (field, kind) = match filter {
+            Filter::And(parts) | Filter::Or(parts) => {
+                filters.extend(parts);
+                continue;
+            }
+            Filter::Eq(field, _) => (field, "hash"),
+            Filter::Range(field, ..)
+            | Filter::Gt(field, _)
+            | Filter::Gte(field, _)
+            | Filter::Lt(field, _)
+            | Filter::Lte(field, _) => (field, "ordered"),
+            Filter::Contains(field, _) => (field, "ngram"),
+            _ => continue,
+        };
+        if !indexed_fields.contains(field) {
+            advice.insert((field, kind));
+        }
     }
-    let kind = if query.contains("$gt")
-        || query.contains("$gte")
-        || query.contains("$lt")
-        || query.contains("$lte")
-        || query.contains("ORDER BY")
-    {
-        "ordered"
-    } else {
-        "hash"
-    };
-    vec![serde_json::json!({
-        "kind": kind,
-        "fields": [field],
-        "reason": "查询使用未索引属性过滤 (Query filters on an unindexed property)",
-    })]
+    advice
+        .into_iter()
+        .map(|(field, kind)| {
+            serde_json::json!({
+                "kind": kind,
+                "fields": [field],
+                "reason": "查询使用未索引属性过滤 (Query filters on an unindexed property)",
+            })
+        })
+        .collect()
 }
 
 async fn get_node(
@@ -1184,22 +1196,18 @@ async fn get_edges(
             "limit 必须为 1..=10000 (limit must be 1..=10000)",
         ));
     }
-    let (edges, version) = state
+    let (edges, total, version) = state
         .engine
         .list_edges(
             id,
             reachability_direction(query.direction),
             query.label,
+            query.offset,
+            query.limit,
             Instant::now() + state.request_timeout,
         )
         .await?;
-    let total = edges.len();
-    let edges = edges
-        .into_iter()
-        .skip(query.offset)
-        .take(query.limit)
-        .map(encode_graph_edge)
-        .collect::<Vec<_>>();
+    let edges = edges.into_iter().map(encode_graph_edge).collect::<Vec<_>>();
     Ok(Json(serde_json::json!({
         "edges": edges,
         "total": total,
@@ -1366,13 +1374,21 @@ async fn transaction(
     headers: HeaderMap,
     request: Result<Json<TransactionRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let Json(mut request) = decode_json(request)?;
+    let Json(request) = decode_json(request)?;
+    submit_transaction(&state, &headers, request).await
+}
+
+async fn submit_transaction(
+    state: &AppState,
+    headers: &HeaderMap,
+    mut request: TransactionRequest,
+) -> Result<Response, ApiError> {
     if request.operations.is_empty() {
         return Err(ApiError::invalid_request(
             "事务至少需要一个操作 (A transaction requires at least one operation)",
         ));
     }
-    let header_generation = optional_header(&headers, header::IF_MATCH)?;
+    let header_generation = optional_header(headers, header::IF_MATCH)?;
     match (&request.expected_generation, header_generation) {
         (Some(body), Some(header)) if body != &header => {
             return Err(ApiError::invalid_request(
@@ -1386,7 +1402,7 @@ async fn transaction(
         .engine
         .transaction(
             request,
-            optional_header_name(&headers, "idempotency-key")?,
+            optional_header_name(headers, "idempotency-key")?,
             std::time::Instant::now() + state.request_timeout,
         )
         .await?;

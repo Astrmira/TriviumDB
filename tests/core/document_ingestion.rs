@@ -101,6 +101,25 @@ fn 内置五种解析保留完整正文与独立预期来源范围() {
             json!({"operation":"resolve","reference":{"document_id":"10","revision":snapshot["revision"],"start_byte":0,"end_byte":text.len()}}),
         );
         assert_eq!(evidence["text"], text);
+        for offset in text
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(text.len()))
+        {
+            let empty = request(
+                &mut db,
+                json!({"operation":"resolve","reference":{
+                    "document_id":"10","revision":snapshot["revision"],"start_byte":offset,"end_byte":offset
+                }}),
+            );
+            assert_eq!(empty["text"], "");
+            assert!(
+                empty
+                    .get("source_spans")
+                    .is_none_or(|spans| spans == &json!([])),
+                "{name} @ {offset}: {empty}"
+            );
+        }
         let spans = evidence["source_spans"].as_array().unwrap();
         assert!(!spans.is_empty());
         for span in spans {

@@ -407,7 +407,15 @@ impl EngineHandle {
                 "调度容量超过信号量上限 (Scheduling capacity exceeds semaphore limit)",
             ));
         }
-        let path = config.database_path.to_string_lossy().into_owned();
+        let path = config
+            .database_path
+            .to_str()
+            .ok_or_else(|| {
+                ApiError::invalid_request(
+                    "数据库路径必须为 UTF-8 (Database path must be valid UTF-8)",
+                )
+            })?
+            .to_owned();
         let database = tokio::task::spawn_blocking(move || {
             Database::<f32>::open_with_config(&path, config.database).map_err(ApiError::from)
         })
@@ -783,55 +791,16 @@ impl EngineHandle {
         id: u64,
         direction: triviumdb::graph::reachability::ReachabilityDirection,
         label: Option<String>,
+        offset: usize,
+        limit: usize,
         deadline: Instant,
-    ) -> Result<(Vec<SubgraphEdge>, VersionSnapshot), ApiError> {
+    ) -> Result<(Vec<SubgraphEdge>, usize, VersionSnapshot), ApiError> {
         let versions = self.inner.versions.clone();
         let control = QueryControl::with_deadline(deadline);
         self.run_read(deadline, control, move |database| {
-            if database.get(id).map_err(ApiError::from)?.is_none() {
-                return Err(ApiError::from(
-                    triviumdb::error::TriviumError::NodeNotFound(id),
-                ));
-            }
-            let mut edges = Vec::new();
-            if direction != triviumdb::graph::reachability::ReachabilityDirection::Incoming {
-                for edge in database.get_edges(id).map_err(ApiError::from)? {
-                    if label.as_ref().is_none_or(|label| label == &edge.label) {
-                        edges.push(SubgraphEdge {
-                            source_id: id,
-                            target_id: edge.target_id,
-                            label: edge.label,
-                            weight: edge.weight,
-                            metadata: edge.metadata,
-                        });
-                    }
-                }
-            }
-            if direction != triviumdb::graph::reachability::ReachabilityDirection::Outgoing {
-                for edge in database
-                    .get_incoming_edges(id, label.as_deref())
-                    .map_err(ApiError::from)?
-                {
-                    edges.push(SubgraphEdge {
-                        source_id: edge.source_id,
-                        target_id: edge.target_id,
-                        label: edge.label,
-                        weight: edge.weight,
-                        metadata: edge.metadata,
-                    });
-                }
-            }
-            edges.sort_by(|a, b| {
-                (a.source_id, a.target_id, a.label.as_str()).cmp(&(
-                    b.source_id,
-                    b.target_id,
-                    b.label.as_str(),
-                ))
-            });
-            edges.dedup_by(|a, b| {
-                a.source_id == b.source_id && a.target_id == b.target_id && a.label == b.label
-            });
-            Ok((edges, lock_or_recover(&versions).snapshot()))
+            let (page, total) =
+                database.edge_page(id, direction, label.as_deref(), offset, limit)?;
+            Ok((page, total, lock_or_recover(&versions).snapshot()))
         })
         .await
     }
@@ -1329,7 +1298,13 @@ async fn collect_write_batch(
     if *stopping.borrow_and_update() {
         receiver.close();
     }
-    if receiver.is_empty() && !inner.max_write_batch_delay.is_zero() {
+    let now = Instant::now();
+    if receiver.is_empty()
+        && !inner.max_write_batch_delay.is_zero()
+        && batch.iter().all(|command| {
+            command.deadline.saturating_duration_since(now) > inner.max_write_batch_delay
+        })
+    {
         let command = tokio::select! {
             biased;
             _ = stopping.changed() => {
@@ -2652,7 +2627,7 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(1);
         let (response, result) = oneshot::channel();
         let mut batch = vec![WriteCommand {
-            deadline: Instant::now() + Duration::from_secs(30),
+            deadline: Instant::now() + Duration::from_secs(7200),
             control: QueryControl::default(),
             enqueued_at: Instant::now(),
             telemetry: None,
@@ -2663,6 +2638,18 @@ mod tests {
             },
             response,
         }];
+        // 合批窗口大于剩余期限时，空队列立即归还首条命令。
+        batch[0].deadline = Instant::now() + Duration::from_secs(30);
+        assert!(
+            futures_util::poll!(Box::pin(collect_write_batch(
+                &engine.inner,
+                &mut receiver,
+                &mut batch
+            )))
+            .is_ready()
+        );
+        assert_eq!(batch.len(), 1);
+        batch[0].deadline = Instant::now() + Duration::from_secs(7200);
         {
             let collecting = collect_write_batch(&engine.inner, &mut receiver, &mut batch);
             tokio::pin!(collecting);
@@ -2926,6 +2913,33 @@ mod tests {
         .await
         .unwrap();
         (engine, directory)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn 非utf8数据库路径在启动前返回参数错误() {
+        use axum::response::IntoResponse;
+        use std::os::unix::ffi::OsStringExt;
+        let directory = tempfile::tempdir().unwrap();
+        let result = EngineHandle::start(EngineConfig {
+            database_path: directory
+                .path()
+                .join(std::ffi::OsString::from_vec(vec![0xff])),
+            database: Config {
+                dim: 2,
+                ..Config::default()
+            },
+            write_queue_capacity: 1,
+            max_concurrent_reads: 1,
+            idempotency_capacity: 1,
+            max_write_batch_size: 1,
+            max_write_batch_delay: Duration::ZERO,
+            prepared_cache_capacity: 1,
+        })
+        .await;
+        let error = result.err().expect("非 UTF-8 路径必须在打开前被拒绝");
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+        assert_eq!(directory.path().read_dir().unwrap().count(), 0);
     }
 
     #[test]

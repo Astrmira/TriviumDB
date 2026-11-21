@@ -810,9 +810,17 @@ fn admit_return_workspace<T: VectorType>(
         .saturating_add(scope.query.order_by.len().saturating_mul(8))
         .saturating_add(if grouped { 8 } else { 3 });
     let mut bytes = inputs.len().checked_mul(512).ok_or_else(memory::overflow)?;
+    let node_expressions = if matches!(inputs.first(), Some(Input::Nodes(..))) {
+        return_expression_bytes(None, scope)?
+    } else {
+        0
+    };
     for input in inputs {
         match input {
             Input::Nodes(nodes, edge) => {
+                bytes = bytes
+                    .checked_add(node_expressions)
+                    .ok_or_else(memory::overflow)?;
                 for (name, node) in *nodes {
                     bytes = bytes
                         .checked_add(memory::snapshot_bytes(node)?)
@@ -831,7 +839,7 @@ fn admit_return_workspace<T: VectorType>(
             }
             Input::Pipeline(row) => {
                 bytes = bytes
-                    .checked_add(pipeline_return_bytes(row, scope)?)
+                    .checked_add(return_expression_bytes(Some(row), scope)?)
                     .ok_or_else(memory::overflow)?;
             }
         }
@@ -842,11 +850,13 @@ fn admit_return_workspace<T: VectorType>(
 }
 
 fn pipeline_binding_bytes<T: VectorType>(
-    row: &crate::query::pipeline::NodeRow,
+    row: Option<&crate::query::pipeline::NodeRow>,
     var: &str,
     field: Option<&str>,
     scope: &Scope<'_, T>,
 ) -> Result<usize, TriviumError> {
+    // 普通节点及其绑定已按快照计量，此处仅补充表达式自身的工作区。
+    let Some(row) = row else { return Ok(0) };
     let value = row.bindings.as_ref().and_then(|bindings| bindings.get(var));
     let node = match value {
         Some(RuntimeValue::Node(id)) => Some(*id),
@@ -879,26 +889,25 @@ fn pipeline_binding_bytes<T: VectorType>(
     })
 }
 
-fn pipeline_expr_bytes<T: VectorType>(
+fn return_expr_bytes<T: VectorType>(
     expr: &TqlExpr,
-    row: &crate::query::pipeline::NodeRow,
+    row: Option<&crate::query::pipeline::NodeRow>,
     scope: &Scope<'_, T>,
 ) -> Result<usize, TriviumError> {
     match expr {
         TqlExpr::Variable(var) => pipeline_binding_bytes(row, var, None, scope),
         TqlExpr::Property { var, field } => pipeline_binding_bytes(row, var, Some(field), scope),
         TqlExpr::Literal(TqlLiteral::Str(value)) => Ok(value.len().saturating_add(64)),
-        TqlExpr::Binary { left, right, .. } => pipeline_expr_bytes(left, row, scope)?
-            .checked_add(pipeline_expr_bytes(right, row, scope)?)
+        TqlExpr::Binary { left, right, .. } => return_expr_bytes(left, row, scope)?
+            .checked_add(return_expr_bytes(right, row, scope)?)
             .ok_or_else(memory::overflow),
         TqlExpr::Coalesce(items) => items.iter().try_fold(0usize, |sum, item| {
-            sum.checked_add(pipeline_expr_bytes(item, row, scope)?)
+            sum.checked_add(return_expr_bytes(item, row, scope)?)
                 .ok_or_else(memory::overflow)
         }),
-        TqlExpr::IsNull { expr, .. } => pipeline_expr_bytes(expr, row, scope),
+        TqlExpr::IsNull { expr, .. } => return_expr_bytes(expr, row, scope),
         TqlExpr::Path { .. } => Ok(row
-            .path
-            .as_ref()
+            .and_then(|row| row.path.as_ref())
             .map_or(64, |path| path.len().saturating_mul(8).saturating_add(64))),
         TqlExpr::Similarity { .. } => Ok(scope
             .mt
@@ -909,9 +918,9 @@ fn pipeline_expr_bytes<T: VectorType>(
     }
 }
 
-fn pipeline_kind_bytes<T: VectorType>(
+fn return_kind_bytes<T: VectorType>(
     kind: &ReturnExprKind,
-    row: &crate::query::pipeline::NodeRow,
+    row: Option<&crate::query::pipeline::NodeRow>,
     scope: &Scope<'_, T>,
 ) -> Result<usize, TriviumError> {
     match kind {
@@ -920,22 +929,22 @@ fn pipeline_kind_bytes<T: VectorType>(
         ReturnExprKind::Property(var, field) => {
             pipeline_binding_bytes(row, var, Some(field), scope)
         }
-        ReturnExprKind::Scalar(expr) => pipeline_expr_bytes(expr, row, scope),
-        ReturnExprKind::Aggregate(_, inner) => pipeline_kind_bytes(inner, row, scope),
+        ReturnExprKind::Scalar(expr) => return_expr_bytes(expr, row, scope),
+        ReturnExprKind::Aggregate(_, inner) => return_kind_bytes(inner, row, scope),
     }
 }
 
 // 管线只为实际求值的列计量；常量、标量别名和节点 ID 投影保持轻量。
-fn pipeline_return_bytes<T: VectorType>(
-    row: &crate::query::pipeline::NodeRow,
+fn return_expression_bytes<T: VectorType>(
+    row: Option<&crate::query::pipeline::NodeRow>,
     scope: &Scope<'_, T>,
 ) -> Result<usize, TriviumError> {
-    let mut bytes = 256usize;
+    let mut bytes = if row.is_some() { 256usize } else { 0 };
     match &scope.query.returns {
         ReturnClause::Expressions(items) => {
             for item in items {
                 bytes = bytes
-                    .checked_add(pipeline_kind_bytes(&item.kind, row, scope)?)
+                    .checked_add(return_kind_bytes(&item.kind, row, scope)?)
                     .ok_or_else(memory::overflow)?;
             }
         }
@@ -960,13 +969,13 @@ fn pipeline_return_bytes<T: VectorType>(
         let alias = if let (TqlExpr::Variable(name), ReturnClause::Expressions(items)) =
             (&order.expr, &scope.query.returns)
         {
-            items.iter().find(|item| item.alias.as_ref() == Some(name))
+            items.iter().find(|item| column_name(item) == *name)
         } else {
             None
         };
         let cost = match alias {
-            Some(item) => pipeline_kind_bytes(&item.kind, row, scope)?,
-            None => pipeline_expr_bytes(&order.expr, row, scope)?,
+            Some(item) => return_kind_bytes(&item.kind, row, scope)?,
+            None => return_expr_bytes(&order.expr, row, scope)?,
         };
         bytes = bytes.checked_add(cost).ok_or_else(memory::overflow)?;
     }

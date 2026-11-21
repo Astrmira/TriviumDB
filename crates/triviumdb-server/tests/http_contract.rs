@@ -1591,6 +1591,103 @@ async fn 节点导入遇到文档归档字段时整批拒绝() {
 }
 
 #[tokio::test]
+async fn 两种导入均重放已确认回执并在写入前检查版本() {
+    let (app, _dir) = app("import-receipt").await;
+    let nodes = br#"{"vector":[1,0],"payload":{}}
+{"vector":[0,1],"payload":{}}"#;
+    let edge = br#"{"source":1,"target":2,"label":"rel","weight":1}"#;
+    let mut stale = String::new();
+    for (path, body, key) in [
+        ("/v1/import/nodes", nodes.as_slice(), "nodes"),
+        ("/v1/import/edges", edge.as_slice(), "edges"),
+    ] {
+        let first = raw_request(
+            app.clone(),
+            "POST",
+            path,
+            body.to_vec(),
+            &[("idempotency-key", key)],
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let etag = first.headers()[header::ETAG].to_str().unwrap().to_owned();
+        let receipt = json(first).await;
+        assert_eq!(receipt["generation"], etag);
+        assert_eq!(receipt["replayed"], false);
+        let retry = json(
+            raw_request(
+                app.clone(),
+                "POST",
+                path,
+                body.to_vec(),
+                &[("idempotency-key", key)],
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(retry["createdIds"], receipt["createdIds"]);
+        assert_eq!(retry["generation"], etag);
+        assert_eq!(retry["replayed"], true);
+        if path.ends_with("nodes") {
+            assert_eq!(receipt["createdIds"], serde_json::json!(["1", "2"]));
+            stale = etag;
+        }
+    }
+    for (path, body) in [
+        ("/v1/import/nodes", nodes.as_slice()),
+        ("/v1/import/edges", edge.as_slice()),
+    ] {
+        let rejected = raw_request(
+            app.clone(),
+            "POST",
+            path,
+            body.to_vec(),
+            &[("if-match", &stale)],
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        assert_eq!(json(rejected).await["code"], "TDB_HTTP_PRECONDITION_FAILED");
+    }
+    assert_eq!(
+        request(app, "GET", "/v1/nodes/3", None, &[]).await.status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn 投影列类型与行顺序和传输编码无关() {
+    let (app, _dir) = app("mixed-columns").await;
+    let rows = br#"{"id":1,"vector":[1,0],"payload":{"k":1,"v":42}}
+{"id":2,"vector":[0,1],"payload":{"k":1,"v":"word"}}"#;
+    assert_eq!(
+        raw_request(app.clone(), "POST", "/v1/import/nodes", rows.to_vec(), &[])
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    for direction in ["ASC", "DESC"] {
+        let query = format!("FIND {{k:1}} RETURN _.v AS v ORDER BY _.id {direction}");
+        for accept in ["application/json", "application/x-ndjson"] {
+            let response = request(
+                app.clone(),
+                "POST",
+                "/v1/tql",
+                Some(serde_json::json!({"query":query})),
+                &[("accept", accept)],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = text(response).await;
+            let meta: Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
+            assert_eq!(
+                meta["columns"],
+                serde_json::json!([{"name":"v","kind":"mixed"}])
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn 索引管理quiver状态与ndjson导入形成完整http契约() {
     let (app, _directory) = app("management_import").await;
     let nodes = raw_request(
@@ -1629,6 +1726,25 @@ async fn 索引管理quiver状态与ndjson导入形成完整http契约() {
     assert_eq!(created.status(), StatusCode::OK);
     let indexes = json(request(app.clone(), "GET", "/v1/indexes", None, &[]).await).await;
     assert_eq!(indexes["indexes"].as_array().unwrap().len(), 1);
+
+    for query in [
+        r#"FIND {type:"event"} RETURN *"#,
+        r#"FIND {"type":"event"} RETURN *"#,
+    ] {
+        let result = json(
+            request(
+                app.clone(),
+                "POST",
+                "/v1/tql",
+                Some(serde_json::json!({"query":query})),
+                &[],
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(result["rowCount"], 1);
+        assert_eq!(result["indexAdvice"], serde_json::json!([]));
+    }
 
     let quiver = json(request(app.clone(), "GET", "/v1/indexes/quiver", None, &[]).await).await;
     assert!(quiver["status"].as_str().is_some());

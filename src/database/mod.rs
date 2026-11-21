@@ -94,6 +94,31 @@ pub(crate) fn write_or_recover<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
     })
 }
 
+fn verified_property_matches<T: VectorType>(
+    mt: &MemTable<T>,
+    candidates: impl IntoIterator<Item = NodeId>,
+    max_results: usize,
+    matches: impl Fn(&serde_json::Value) -> bool,
+) -> Result<Vec<NodeId>> {
+    let mut ids = Vec::new();
+    for id in candidates {
+        crate::request::check_current()?;
+        if mt
+            .try_get_payload(id)?
+            .is_some_and(|payload| matches(&payload))
+        {
+            if ids.len() == max_results {
+                return Err(TriviumError::QueryRowBudgetExceeded {
+                    budget: max_results,
+                });
+            }
+            ids.push(id);
+        }
+    }
+    ids.sort_unstable();
+    Ok(ids)
+}
+
 fn normalized_database_path(path: &str) -> Result<PathBuf> {
     let requested = Path::new(path);
     if requested.try_exists()? {
@@ -2681,6 +2706,72 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         })
     }
 
+    /// 在同一读视图中按来源、目标、标签分页，仅为返回页复制边元数据。
+    pub fn edge_page(
+        &self,
+        id: NodeId,
+        direction: crate::graph::reachability::ReachabilityDirection,
+        label: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<crate::graph::reachability::SubgraphEdge>, usize)> {
+        use crate::graph::reachability::{ReachabilityDirection, SubgraphEdge};
+        let _operation = self.enter_operation()?;
+        let mt = read_or_recover(&self.memtable);
+        if !mt.contains(id) {
+            return Err(TriviumError::NodeNotFound(id));
+        }
+        let mut page = Vec::new();
+        let mut total = 0usize;
+        let mut visit = |source, outgoing: bool| -> Result<()> {
+            crate::request::check_current()?;
+            let edges = mt.get_edges(source).unwrap_or_default();
+            // 邻接表按目标和标签排序，入边只需访问该目标的连续区间。
+            let edges = if outgoing {
+                edges
+            } else {
+                let first = edges.partition_point(|edge| edge.target_id < id);
+                let last = edges.partition_point(|edge| edge.target_id <= id);
+                &edges[first..last]
+            };
+            for edge in edges {
+                crate::request::check_current()?;
+                if label.is_some_and(|expected| expected != edge.label) {
+                    continue;
+                }
+                if total >= offset && page.len() < limit {
+                    page.push(SubgraphEdge {
+                        source_id: source,
+                        target_id: edge.target_id,
+                        label: edge.label.clone(),
+                        weight: edge.weight,
+                        metadata: edge.metadata.clone(),
+                    });
+                }
+                total += 1;
+            }
+            Ok(())
+        };
+        let sources = mt.get_incoming_sources(id);
+        let split = sources.partition_point(|source| *source < id);
+        if direction != ReachabilityDirection::Outgoing {
+            for &source in &sources[..split] {
+                visit(source, false)?;
+            }
+        }
+        if direction != ReachabilityDirection::Incoming {
+            visit(id, true)?;
+        }
+        if direction != ReachabilityDirection::Outgoing {
+            for &source in &sources[split..] {
+                if source != id || direction == ReachabilityDirection::Incoming {
+                    visit(source, false)?;
+                }
+            }
+        }
+        Ok((page, total))
+    }
+
     pub fn get_incoming_edges(
         &self,
         id: NodeId,
@@ -3104,7 +3195,8 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                     .collect(),
             )
         };
-        let plan = crate::query::planner::plan_filter(&filter, &mt);
+        let plan =
+            crate::query::planner::plan_filter_with_limit(&filter, Some(max_results + 1), &mt);
         if matches!(
             plan.access_path,
             crate::query::planner::AccessPath::FullNodeScan
@@ -3115,21 +3207,9 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                     .into(),
             ));
         }
-        let mut ids = plan
-            .candidates
-            .into_iter()
-            .filter(|id| {
-                mt.get_payload(*id)
-                    .is_some_and(|payload| filter.matches(&payload))
-            })
-            .collect::<Vec<_>>();
-        ids.sort_unstable();
-        if ids.len() > max_results {
-            return Err(TriviumError::QueryRowBudgetExceeded {
-                budget: max_results,
-            });
-        }
-        Ok(ids)
+        verified_property_matches(&mt, plan.candidates, max_results, |payload| {
+            filter.matches(payload)
+        })
     }
 
     pub fn create_ngram_index(&mut self, field: &str) -> Result<()> {
@@ -3181,32 +3261,20 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
             ).at_field("max_results"));
         }
         let mt = read_or_recover(&self.memtable);
-        let candidates = mt
-            .find_by_ngram_property_index(field, needle)?
+        let candidates = mt.property_indexes()
+            .ngram_candidates(field, needle)?
             .ok_or_else(|| {
                 TriviumError::InvalidInput(
                     "字段没有 N-gram 索引，已拒绝全扫描 (Field has no N-gram index; full scan rejected)"
                         .into(),
                 )
             })?;
-        let mut ids = candidates
-            .into_iter()
-            .filter(|id| {
-                mt.get_payload(*id).is_some_and(|payload| {
-                    payload
-                        .get(field)
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|text| text.contains(needle))
-                })
-            })
-            .collect::<Vec<_>>();
-        ids.sort_unstable();
-        if ids.len() > max_results {
-            return Err(TriviumError::QueryRowBudgetExceeded {
-                budget: max_results,
-            });
-        }
-        Ok(ids)
+        verified_property_matches(&mt, candidates, max_results, |payload| {
+            payload
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| text.contains(needle))
+        })
     }
 
     pub fn create_unique_index(&mut self, field: &str) -> Result<()> {

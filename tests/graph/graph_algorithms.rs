@@ -345,6 +345,48 @@ fn 可变长路径_结果数熔断() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
+fn 全路径_深链按原节点顺序返回() {
+    use triviumdb::graph::{
+        budget::TraversalBudget,
+        pathfinding::{BoundedPathConfig, bounded_all_paths},
+    };
+    let mut mt = MemTable::<f32>::new(1);
+    mt.set_auto_build_quiver(false);
+    let expected: Vec<_> = (1..=2048).collect();
+    for &id in &expected {
+        mt.insert_with_id(id, &[1.], serde_json::Value::Null)
+            .unwrap();
+        if id > 1 {
+            mt.link(id - 1, id, "chain".into(), 1.).unwrap();
+        }
+    }
+    let depth = expected.len() - 1;
+    let last = *expected.last().unwrap();
+    let paths = all_paths(&mt, 1, last, depth, Some("chain"), 1);
+    assert_eq!(paths.as_slice(), std::slice::from_ref(&expected));
+    let result = bounded_all_paths(
+        &mt,
+        1,
+        last,
+        &BoundedPathConfig {
+            max_depth: depth,
+            max_paths: 1,
+            label_sequence: None,
+            forbidden_nodes: Default::default(),
+        },
+        &TraversalBudget {
+            max_depth: depth,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(!result.truncated);
+    assert_eq!(result.metrics.examined_edges, depth);
+    assert_eq!(result.paths.len(), 1);
+    assert_eq!(result.paths[0].nodes, expected);
+}
+
+#[test]
 fn 全路径_双路由() {
     let mt = build_path_graph();
     let paths = all_paths(&mt, 1, 3, 5, None, 100);

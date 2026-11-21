@@ -223,3 +223,52 @@ fn 多变量快照和写匹配在复制前拒绝并限制实际分配峰值() {
         reopened.close().unwrap();
     }
 }
+
+#[test]
+fn 长字面量按投影行数计入内存准入() {
+    let root = support::TestDir::new("return_literal_budget");
+    let mut db = Database::<f32>::open(&root.file("query.tdb"), 1).unwrap();
+    for id in 1..=20 {
+        db.insert_with_id(id, &[1.], serde_json::json!({"k":1}))
+            .unwrap();
+    }
+    let literal = "v".repeat(65536);
+    let query = format!("FIND {{k:1}} RETURN \"{literal}\" AS value");
+    db.set_memory_limit(1 << 20).unwrap();
+    rejected(db.tql(&query));
+    db.set_memory_limit(0).unwrap();
+    let rows = db.tql(&query).unwrap();
+    assert_eq!(rows.len(), 20);
+    for row in rows {
+        assert!(
+            matches!(&row["value"], triviumdb::query::tql_executor::TqlValue::String(value) if value == &literal)
+        );
+    }
+    db.close().unwrap();
+}
+
+#[test]
+fn 半精度精确评分对任意维度使用固定工作区() {
+    use half::f16;
+    use triviumdb::VectorType;
+    for dim in [3, 65536] {
+        let mut a = vec![f16::ZERO; dim];
+        let mut b = a.clone();
+        a[dim - 1] = f16::MAX;
+        b[dim - 1] = f16::MIN;
+        let (score, peak) = measured(|| f16::similarity(&a, &b));
+        assert_eq!(score, -1.);
+        assert_eq!(peak, 0);
+        let mut mt = triviumdb::storage::memtable::MemTable::<f16>::new(dim);
+        mt.set_auto_build_quiver(false);
+        mt.insert_with_id(1, &a, serde_json::json!({})).unwrap();
+        mt.insert_with_id(2, &b, serde_json::json!({})).unwrap();
+        let hits = triviumdb::index::exact::search(&mt, &a, 2).unwrap();
+        assert_eq!(
+            hits.iter().map(|h| (h.id, h.score)).collect::<Vec<_>>(),
+            [(1, 1.), (2, -1.)]
+        );
+        b[dim - 1] = f16::ZERO;
+        assert_eq!(f16::similarity(&a, &b), 0.);
+    }
+}

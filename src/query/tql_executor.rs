@@ -20,8 +20,7 @@ use memory::QueryMemory;
 
 use super::pipeline::BindingValue as RuntimeValue;
 use super::planner::{
-    AccessPath, NodeAccessPlan, plan_filter, plan_filter_with_limit, plan_match,
-    plan_match_node_filter,
+    AccessPath, NodeAccessPlan, plan_filter_with_limit, plan_match, plan_match_node_filter,
 };
 use super::tql_ast::*;
 use super::tql_source::{QueryOrigin, SourceSelector, TqlSource};
@@ -3045,8 +3044,12 @@ fn plan_find_filter<T: VectorType>(
     mt: &MemTable<T>,
     row_limit: usize,
 ) -> NodeAccessPlan {
-    let candidate_limit = query.predicate.is_none().then_some(row_limit);
-    plan_filter_with_limit(filter, candidate_limit, mt)
+    let candidate_limit = if query.predicate.is_none() {
+        row_limit
+    } else {
+        usize::MAX
+    };
+    plan_filter_with_limit(filter, Some(candidate_limit), mt)
 }
 
 fn find_ordered_field(query: &TqlQuery) -> Option<(&str, bool)> {
@@ -3058,9 +3061,18 @@ fn find_ordered_field(query: &TqlQuery) -> Option<(&str, bool)> {
         return None;
     };
     // 返回别名先在投影作用域求值，事实字段的索引须先证明排序等价。
-    if let ReturnClause::Expressions(items) = &query.returns
-        && items.iter().any(|item| item.alias.as_ref() == Some(var))
-    {
+    let projected = match &query.returns {
+        ReturnClause::Expressions(items) => items
+            .iter()
+            .rev()
+            .find(|item| return_column_name(item) == *var),
+        _ => None,
+    };
+    let is_node = projected.map_or(
+        var == "_",
+        |item| matches!(&item.kind, ReturnExprKind::Var(name) if name == "_"),
+    );
+    if !is_node {
         return None;
     }
     if field == "id" {
@@ -4052,7 +4064,8 @@ fn generate_explain_plan<T: VectorType>(
     let search_filter = shorthand_search_filter(query);
     let (access_path, estimated_rows, reversed) = match &query.entry {
         QueryEntry::Find { filter } => {
-            let planned = find_plan.unwrap_or_else(|| plan_filter(filter, mt));
+            let planned =
+                find_plan.unwrap_or_else(|| plan_filter_with_limit(filter, Some(usize::MAX), mt));
             (planned.access_path, planned.estimated_rows, false)
         }
         QueryEntry::Match { pattern } => {
@@ -4106,6 +4119,7 @@ fn generate_explain_plan<T: VectorType>(
         AccessPath::EdgeLabelIndex { labels } => {
             format!("label_index pushdown (labels: [{}])", labels.join(", "))
         }
+        AccessPath::EmptyResult => "empty_result".to_owned(),
         AccessPath::ColdPayloadScan => "cold_payload_scan".to_owned(),
         AccessPath::FullNodeScan => "full_scan".to_owned(),
     };

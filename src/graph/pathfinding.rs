@@ -449,7 +449,49 @@ pub(crate) fn bounded_all_paths_view<T: VectorType>(
         },
         truncated: false,
     };
-    bounded_path_dfs(mt, src, dst, config, budget, &mut state)?;
+    let mut stack = vec![path_frame(mt, src, dst, config, budget, &mut state)?.into_iter()];
+    while !state.truncated {
+        control.check()?;
+        let Some(frame) = stack.last_mut() else { break };
+        let Some(edge) = frame.next() else {
+            stack.pop();
+            if let Some(node) = state.nodes.pop() {
+                state.visited.remove(&node);
+            }
+            state.weights.pop();
+            state.labels.pop();
+            continue;
+        };
+        if state.metrics.examined_edges >= budget.max_examined_edges {
+            state.truncated = exhausted(budget, BudgetDimension::ExaminedEdges, state.metrics)?;
+            break;
+        }
+        state.metrics.examined_edges += 1;
+        let depth = state.weights.len();
+        if config
+            .label_sequence
+            .as_ref()
+            .is_some_and(|sequence| sequence.get(depth) != Some(&edge.label))
+            || config.forbidden_nodes.contains(&edge.target_id)
+            || state.visited.contains(&edge.target_id)
+        {
+            continue;
+        }
+        if depth >= budget.max_depth {
+            state.truncated = exhausted(budget, BudgetDimension::Depth, state.metrics)?;
+            break;
+        }
+        if state.metrics.visited_nodes >= budget.max_visited_nodes {
+            state.truncated = exhausted(budget, BudgetDimension::VisitedNodes, state.metrics)?;
+            break;
+        }
+        state.metrics.visited_nodes += 1;
+        state.visited.insert(edge.target_id);
+        state.nodes.push(edge.target_id);
+        state.weights.push(edge.weight);
+        state.labels.push(edge.label.clone());
+        stack.push(path_frame(mt, edge.target_id, dst, config, budget, &mut state)?.into_iter());
+    }
     state
         .results
         .sort_by(|left, right| left.nodes.cmp(&right.nodes));
@@ -501,19 +543,14 @@ fn path_product(weights: &[f32]) -> f32 {
     if negative { -magnitude } else { magnitude }
 }
 
-fn bounded_path_dfs<T: VectorType>(
-    mt: &impl GraphRead<T>,
+fn path_frame<'a, T: VectorType>(
+    mt: &'a impl GraphRead<T>,
     current: NodeId,
     dst: NodeId,
     config: &BoundedPathConfig,
     budget: &TraversalBudget,
     state: &mut BoundedPathState,
-) -> Result<()> {
-    let control = crate::request::control().unwrap_or_default();
-    control.check()?;
-    if state.truncated {
-        return Ok(());
-    }
+) -> Result<Vec<&'a crate::node::Edge>> {
     let depth = state.weights.len();
     state.metrics.depth_reached = state.metrics.depth_reached.max(depth);
     if current == dst {
@@ -522,11 +559,11 @@ fn bounded_path_dfs<T: VectorType>(
             .as_ref()
             .is_some_and(|labels| labels.len() != depth)
         {
-            return Ok(());
+            return Ok(Vec::new());
         }
         if state.results.len() == config.max_paths {
             state.truncated = true;
-            return Ok(());
+            return Ok(Vec::new());
         }
         state.results.push(BoundedPath {
             nodes: state.nodes.clone(),
@@ -543,7 +580,7 @@ fn bounded_path_dfs<T: VectorType>(
                 sum.into_f32(state.weights.len())
             },
         });
-        return Ok(());
+        return Ok(Vec::new());
     }
     if depth >= config.max_depth
         || config
@@ -551,12 +588,12 @@ fn bounded_path_dfs<T: VectorType>(
             .as_ref()
             .is_some_and(|labels| labels.len() == depth)
     {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let outgoing = mt.get_edges(current).unwrap_or_default();
     if outgoing.len() > budget.max_frontier_size {
         state.truncated = exhausted(budget, BudgetDimension::FrontierSize, state.metrics)?;
-        return Ok(());
+        return Ok(Vec::new());
     }
     state.metrics.peak_frontier_size = state.metrics.peak_frontier_size.max(outgoing.len());
     let mut edges = outgoing.iter().collect::<Vec<_>>();
@@ -566,45 +603,7 @@ fn bounded_path_dfs<T: VectorType>(
             .then_with(|| left.label.cmp(&right.label))
             .then_with(|| left.weight.total_cmp(&right.weight))
     });
-    for edge in edges {
-        crate::graph::budget::check_control(&control)?;
-        if state.metrics.examined_edges >= budget.max_examined_edges {
-            state.truncated = exhausted(budget, BudgetDimension::ExaminedEdges, state.metrics)?;
-            break;
-        }
-        state.metrics.examined_edges += 1;
-        if config
-            .label_sequence
-            .as_ref()
-            .is_some_and(|sequence| sequence.get(depth) != Some(&edge.label))
-            || config.forbidden_nodes.contains(&edge.target_id)
-            || state.visited.contains(&edge.target_id)
-        {
-            continue;
-        }
-        if depth >= budget.max_depth {
-            state.truncated = exhausted(budget, BudgetDimension::Depth, state.metrics)?;
-            break;
-        }
-        if state.metrics.visited_nodes >= budget.max_visited_nodes {
-            state.truncated = exhausted(budget, BudgetDimension::VisitedNodes, state.metrics)?;
-            break;
-        }
-        state.metrics.visited_nodes += 1;
-        state.visited.insert(edge.target_id);
-        state.nodes.push(edge.target_id);
-        state.weights.push(edge.weight);
-        state.labels.push(edge.label.clone());
-        bounded_path_dfs(mt, edge.target_id, dst, config, budget, state)?;
-        state.labels.pop();
-        state.weights.pop();
-        state.nodes.pop();
-        state.visited.remove(&edge.target_id);
-        if state.truncated {
-            break;
-        }
-    }
-    Ok(())
+    Ok(edges)
 }
 
 /// 全路径枚举：找到从 src 到 dst 的所有路径（不允许环路）
@@ -634,92 +633,38 @@ pub(crate) fn all_paths_view<T: VectorType>(
     limit: usize,
 ) -> Vec<Path> {
     let mut results = Vec::new();
-    let mut visited = HashSet::new();
-    visited.insert(src);
-
-    dfs_all_paths(
-        mt,
-        src,
-        dst,
-        &vec![src],
-        max_depth,
-        label_filter,
-        &mut visited,
-        &mut results,
-        limit,
-    );
-
-    results
-}
-
-fn dfs_all_paths<T: VectorType>(
-    mt: &impl GraphRead<T>,
-    current: NodeId,
-    dst: NodeId,
-    path: &Vec<NodeId>,
-    max_depth: usize,
-    label_filter: Option<&str>,
-    visited: &mut HashSet<NodeId>,
-    results: &mut Vec<Path>,
-    limit: usize,
-) {
-    if current == dst && path.len() > 1 {
-        results.push(path.clone());
-        return;
+    if max_depth == 0 || limit == 0 || src == dst {
+        return results;
     }
-
-    let depth = path.len() - 1;
-    if depth >= max_depth || results.len() >= limit {
-        return;
-    }
-
-    if let Some(edges) = mt.get_edges(current) {
-        for edge in edges {
-            if let Some(lf) = label_filter
-                && edge.label != lf
-            {
-                continue;
+    let mut path = vec![src];
+    let mut visited = HashSet::from([src]);
+    let mut stack = vec![mt.get_edges(src).unwrap_or_default().iter()];
+    while let Some(frame) = stack.last_mut() {
+        let Some(edge) = frame.next() else {
+            stack.pop();
+            if let Some(node) = path.pop() {
+                visited.remove(&node);
             }
-
-            let next = edge.target_id;
-            if visited.contains(&next) {
-                continue;
+            continue;
+        };
+        let next = edge.target_id;
+        if label_filter.is_some_and(|label| label != edge.label) || visited.contains(&next) {
+            continue;
+        }
+        if next == dst {
+            path.push(dst);
+            results.push(path.clone());
+            path.pop();
+            if results.len() == limit {
+                break;
             }
-
-            if next == dst {
-                let mut result_path = path.clone();
-                result_path.push(dst);
-                results.push(result_path);
-                if results.len() >= limit {
-                    return;
-                }
-                continue;
-            }
-
+        } else if path.len() < max_depth {
             visited.insert(next);
-            let mut new_path = path.clone();
-            new_path.push(next);
-
-            dfs_all_paths(
-                mt,
-                next,
-                dst,
-                &new_path,
-                max_depth,
-                label_filter,
-                visited,
-                results,
-                limit,
-            );
-
-            if results.len() >= limit {
-                visited.remove(&next);
-                return;
-            }
-
-            visited.remove(&next);
+            path.push(next);
+            stack.push(mt.get_edges(next).unwrap_or_default().iter());
         }
     }
+    results
 }
 
 /// K-hop 邻域：从 src 出发，返回 K 跳范围内的所有可达节点及其最短距离

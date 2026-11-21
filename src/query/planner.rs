@@ -16,6 +16,7 @@ use std::collections::HashSet;
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AccessPath {
+    EmptyResult,
     NamedGraphMembers { graph_ids: Vec<String> },
     PrimaryKey { id: NodeId },
     PropertyIndex { field: String },
@@ -42,6 +43,7 @@ impl AccessPath {
             Self::PropertyIndexIntersection { .. } => "property_index_intersection",
             Self::EdgeLabelIndex { .. } => "edge_label_index",
             Self::ColdPayloadScan => "cold_payload_scan",
+            Self::EmptyResult => "empty_result",
             Self::FullNodeScan => "full_node_scan",
         }
     }
@@ -107,6 +109,9 @@ pub fn plan_filter_with_limit<T: VectorType>(
     limit: Option<usize>,
     mt: &MemTable<T>,
 ) -> NodeAccessPlan {
+    if let Some(plan) = constant_filter_plan(filter, mt, limit.is_none()) {
+        return plan;
+    }
     if let Filter::Eq(field, value) = filter
         && let Some(candidates) = mt.find_by_property_index_limit(field, value, limit)
     {
@@ -159,7 +164,7 @@ pub fn plan_filter_with_limit<T: VectorType>(
 }
 
 pub fn plan_filter<T: VectorType>(filter: &Filter, mt: &MemTable<T>) -> NodeAccessPlan {
-    plan_filter_impl(filter, mt, true)
+    constant_filter_plan(filter, mt, true).unwrap_or_else(|| plan_filter_impl(filter, mt, true))
 }
 
 fn plan_filter_impl<T: VectorType>(
@@ -492,6 +497,47 @@ pub(super) fn ordered_range(filter: &Filter) -> Option<(&str, Ordering, bool, se
     }
 }
 
+fn constant_filter_plan<T: VectorType>(
+    filter: &Filter,
+    mt: &MemTable<T>,
+    materialize_scan: bool,
+) -> Option<NodeAccessPlan> {
+    let value = constant_filter(filter)?;
+    Some(NodeAccessPlan {
+        access_path: if value {
+            AccessPath::FullNodeScan
+        } else {
+            AccessPath::EmptyResult
+        },
+        estimated_rows: if value { mt.node_count() } else { 0 },
+        candidates: if value && materialize_scan {
+            mt.all_node_ids()
+        } else {
+            Vec::new()
+        },
+    })
+}
+
+fn constant_filter(filter: &Filter) -> Option<bool> {
+    match filter {
+        Filter::In(_, values) if values.is_empty() => Some(false),
+        Filter::Nin(_, values) if values.is_empty() => Some(true),
+        Filter::And(parts) | Filter::Or(parts) => {
+            let identity = matches!(filter, Filter::And(_));
+            let mut result = Some(identity);
+            for part in parts {
+                match constant_filter(part) {
+                    Some(value) if value != identity => return Some(value),
+                    None => result = None,
+                    _ => {}
+                }
+            }
+            result
+        }
+        _ => None,
+    }
+}
+
 fn bitmap_filter_candidates<T: VectorType>(
     filter: &Filter,
     mt: &MemTable<T>,
@@ -506,7 +552,7 @@ fn bitmap_filter_candidates<T: VectorType>(
                 HashSet::from([field.clone()]),
                 mt.find_by_bitmap_property_index(field, value)?,
             )),
-            Filter::In(field, values) => {
+            Filter::In(field, values) if !values.is_empty() => {
                 let mut union = Vec::new();
                 for value in values {
                     union.extend(mt.find_by_bitmap_property_index(field, value)?);
@@ -523,7 +569,7 @@ fn bitmap_filter_candidates<T: VectorType>(
                     difference_sorted(universe, &excluded),
                 ))
             }
-            Filter::Nin(field, values) => {
+            Filter::Nin(field, values) if !values.is_empty() => {
                 let mut excluded = Vec::new();
                 for value in values {
                     excluded.extend(mt.find_by_bitmap_property_index(field, value)?);
@@ -704,6 +750,7 @@ fn access_path_key(path: &AccessPath) -> (u8, String) {
         AccessPath::PropertyIndexIntersection { fields } => (6, fields.join("\0")),
         AccessPath::EdgeLabelIndex { labels } => (7, labels.join("\0")),
         AccessPath::ColdPayloadScan => (8, String::new()),
+        AccessPath::EmptyResult => (0, String::new()),
         AccessPath::FullNodeScan => (9, String::new()),
     }
 }

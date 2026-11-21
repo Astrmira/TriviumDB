@@ -498,6 +498,10 @@ fn planner_limit_保留复合_bitmap_和_ngram_索引() {
 #[test]
 fn explain_limit_只对允许提前停止的查询标注优化() {
     let (path, mut db) = build("explain_limit");
+    for (op, path) in [("$in", "empty_result"), ("$nin", "full_node_scan")] {
+        let query = format!("EXPLAIN FIND {{missing: {{{op}: []}}}} RETURN * LIMIT 1");
+        assert_eq!(plan(&db, &query)["access_path"]["kind"], path);
+    }
     let scan = plan(&db, "EXPLAIN FIND {sequence: {$gte: 0}} RETURN * LIMIT 10");
     assert_eq!(scan["access_path"]["kind"], "full_node_scan");
     assert!(
