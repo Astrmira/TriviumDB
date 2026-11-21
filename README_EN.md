@@ -24,7 +24,8 @@
 [![Rust](https://img.shields.io/badge/Rust-stable-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python 3.9–3.12](https://img.shields.io/badge/Python-3.9%E2%80%933.12-blue?logo=python)](https://pypi.org/)
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![arXiv](https://img.shields.io/badge/arXiv-2605.02171-b31b1b.svg)](https://arxiv.org/abs/2605.02171)
+[![QuIVer arXiv](https://img.shields.io/badge/QuIVer%20arXiv-2605.02171-b31b1b.svg)](https://arxiv.org/abs/2605.02171)
+[![Pelorus arXiv](https://img.shields.io/badge/Pelorus%20arXiv-2611.22159-b31b1b.svg)](https://arxiv.org/abs/2611.22159)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/YoKONCy/TriviumDB)
 
 [**中文文档**](README.md) | **English**
