@@ -6,6 +6,8 @@
 
 ## 中文说明
 
+- TQL 的 `GRAPH` 在读取默认图的邻接表前核对节点数、边数和图视图的基础内存需求。联合查询按节点 ID 去重，并保留各图独立的边。
+
 - 离线迁移在创建目录前排查源库制品名冲突。预检和复用核对已有目标布局及交付报告，预检失败时回收临时副本。已确认发布的目标在重试失败时仍返回已提交状态。
 - TQL 保留 MATCH 模式左端的节点身份、WITH 后的边谓词和各节点自己的图指标。排序函数可引用 RETURN 中的节点别名。向量与文本查询在执行前检查变量作用域，数值等值过滤直接查询索引成员身份。
 - 精确余弦在严重抵消时采用补偿点积，加权最短路径和 Yen 使用完整边权和比较候选。Pelorus 过滤、精确结果物化和文档来源标识复制在分配前申请实例与共享运行时额度。
@@ -40,6 +42,8 @@
 ---
 
 ## English
+
+- TQL `GRAPH` checks node and edge counts and the view's base memory requirement before reading default-graph adjacency lists. A union counts each node ID once and retains each graph's edges.
 
 - Offline migration checks for source artifact name conflicts before creating a directory. Preflight and reuse validate the published layout and report. Failed preflight runs release their temporary copies. Retry errors preserve the committed outcome after publication is confirmed.
 - TQL preserves the left endpoint of MATCH, edge predicates after WITH, and metrics attached to each node binding. Sort functions resolve projected node aliases. Vector and text sources validate variable scope before execution. Numeric equality filters probe index membership directly.

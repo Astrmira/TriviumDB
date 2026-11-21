@@ -95,31 +95,20 @@ impl ScopedGraph {
     pub(crate) fn build<T: VectorType>(
         mt: &MemTable<T>,
         scope: &NamedGraphScope,
+        limits: &NamedGraphLimits,
         memory_limit: usize,
     ) -> Result<Arc<Self>> {
-        let limits = NamedGraphLimits::default();
-        let selected = scope.selected(&limits)?;
-        let mut bytes = 4096usize;
-        let mut members = std::collections::BTreeSet::new();
-        let mut workspace = mt.resource_runtime().reserve_workspace(bytes)?;
-        let mut add_member = |id| -> Result<()> {
-            crate::request::check_current()?;
-            if members.contains(&id) {
-                return Ok(());
-            }
-            crate::named_graph::bound(
-                "named_graph_nodes",
-                members.len().saturating_add(1),
-                limits.max_nodes,
-            )?;
-            let peak =
-                4096usize.saturating_add(members.len().saturating_add(1).saturating_mul(256));
-            mt.ensure_additional_memory(memory_limit, peak)?;
-            workspace.resize(peak)?;
-            members.insert(id);
-            Ok(())
+        let selected = scope.selected(limits)?;
+        let mut edges = if scope.include_default {
+            mt.edge_count()
+        } else {
+            0
         };
-        let mut edges = 0usize;
+        let mut min_nodes = if scope.include_default {
+            mt.node_count()
+        } else {
+            0
+        };
         for id in &selected {
             crate::request::check_current()?;
             let record =
@@ -132,18 +121,63 @@ impl ScopedGraph {
             if let Some(expected) = scope.expected_revisions.get(*id) {
                 mt.named_graphs.check(id, Some(expected))?;
             }
-            for member in &record.graph.members {
-                add_member(*member)?;
-            }
+            // 成员可以跨图共享，每条物理边则只属于一张图。
+            min_nodes = min_nodes.max(record.graph.members.len());
             edges = edges.saturating_add(record.graph.edges.len());
-            bytes = bytes.saturating_add(record.graph.memory_bytes().saturating_mul(4));
+        }
+        crate::named_graph::bound("named_graph_nodes", min_nodes, limits.max_nodes)?;
+        crate::named_graph::bound("named_graph_edges", edges, limits.max_edges)?;
+        let view_bytes = |nodes: usize| {
+            4096usize
+                .saturating_add(nodes.saturating_mul(256))
+                .saturating_add(edges.saturating_mul(512))
+        };
+        mt.ensure_additional_memory(memory_limit, view_bytes(min_nodes))?;
+        let mut workspace = mt
+            .resource_runtime()
+            .reserve_workspace(view_bytes(min_nodes))?;
+        let ids = if scope.include_default {
+            // 默认图的有序活跃节点已包含全部命名图成员。
+            let mut ids = Vec::with_capacity(min_nodes);
+            for id in mt.active_node_ids() {
+                crate::request::check_current()?;
+                ids.push(id);
+            }
+            ids
+        } else {
+            let mut members = std::collections::BTreeSet::new();
+            for id in &selected {
+                for &member in &mt.named_graphs.graphs[*id].graph.members {
+                    crate::request::check_current()?;
+                    if members.contains(&member) {
+                        continue;
+                    }
+                    let count = members.len().saturating_add(1);
+                    if count > min_nodes {
+                        crate::named_graph::bound("named_graph_nodes", count, limits.max_nodes)?;
+                        mt.ensure_additional_memory(memory_limit, view_bytes(count))?;
+                        workspace.resize(view_bytes(count))?;
+                    }
+                    members.insert(member);
+                }
+            }
+            members.into_iter().collect()
+        };
+        let mut bytes = view_bytes(ids.len());
+        for id in &selected {
+            crate::request::check_current()?;
+            bytes = bytes.saturating_add(
+                mt.named_graphs.graphs[*id]
+                    .graph
+                    .memory_bytes()
+                    .saturating_mul(4),
+            );
         }
         if scope.include_default {
             for id in mt.active_node_ids() {
                 crate::request::check_current()?;
-                add_member(id)?;
                 for edge in mt.get_edges(id).unwrap_or_default() {
-                    edges = edges.saturating_add(1);
+                    crate::request::check_current()?;
                     bytes = bytes.saturating_add(
                         edge.label
                             .len()
@@ -155,11 +189,6 @@ impl ScopedGraph {
                 }
             }
         }
-        let nodes = members.len();
-        crate::named_graph::bound("named_graph_edges", edges, limits.max_edges)?;
-        bytes = bytes
-            .saturating_add(nodes.saturating_mul(256))
-            .saturating_add(edges.saturating_mul(512));
         mt.ensure_additional_memory(memory_limit, bytes)?;
         workspace.resize(bytes)?;
         #[cfg(feature = "test-hooks")]
@@ -180,7 +209,7 @@ impl ScopedGraph {
                 in_degree_histogram: Vec::new(),
             },
             revisions: BTreeMap::new(),
-            ids: members.into_iter().collect(),
+            ids,
             outgoing: BTreeMap::new(),
             identities: BTreeMap::new(),
             incoming: BTreeMap::new(),
@@ -210,6 +239,7 @@ impl ScopedGraph {
             for id in mt.active_node_ids() {
                 crate::request::check_current()?;
                 for edge in mt.get_edges(id).unwrap_or_default() {
+                    crate::request::check_current()?;
                     view.insert(id, edge.clone(), None);
                 }
             }
@@ -387,5 +417,98 @@ impl<T: VectorType> GraphRead<T> for GraphView<'_, T> {
             return None;
         }
         view.identities.get(&source)?.get(position)?.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Database;
+    use serde_json::json;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn 命名图预算在读取默认邻接表前拒绝且联合保留物理边() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db =
+            Database::<f32>::open(dir.path().join("scope.tdb").to_str().unwrap(), 1).unwrap();
+        for id in 1..=3 {
+            db.insert_with_id(id, &[1.], json!({})).unwrap();
+        }
+        db.link(1, 2, "rel", 1.).unwrap();
+        let graph = serde_json::from_value(json!({
+            "graph_id":"g", "members":["1","2"],
+            "edges":[{"source_id":"1","target_id":"2","label":"rel","weight":2.0}]
+        }))
+        .unwrap();
+        db.put_named_graph(graph, None).unwrap();
+        let scope = NamedGraphScope {
+            graph_ids: vec!["g".into()],
+            include_default: true,
+            ..Default::default()
+        };
+        let reads = || {
+            db.memtable
+                .read()
+                .unwrap()
+                .adjacency_reads
+                .load(Ordering::Relaxed)
+        };
+        let initial = reads();
+        for (limits, resource) in [
+            (
+                NamedGraphLimits {
+                    max_nodes: 2,
+                    ..Default::default()
+                },
+                "named_graph_nodes",
+            ),
+            (
+                NamedGraphLimits {
+                    max_edges: 1,
+                    ..Default::default()
+                },
+                "named_graph_edges",
+            ),
+        ] {
+            let sdk_error = db.named_graph_scope(&scope, &limits).unwrap_err();
+            let view_error = ScopedGraph::build(&db.memtable.read().unwrap(), &scope, &limits, 0)
+                .err()
+                .expect("图视图必须在读取邻接表前拒绝超限请求");
+            for error in [sdk_error, view_error] {
+                assert_eq!(error.code(), "QueueFull");
+                assert_eq!(error.details()["resource"], resource);
+            }
+            assert_eq!(reads(), initial);
+        }
+        let limits = NamedGraphLimits {
+            max_nodes: 3,
+            max_edges: 2,
+            ..Default::default()
+        };
+        let memory_error = ScopedGraph::build(&db.memtable.read().unwrap(), &scope, &limits, 1)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(matches!(
+            memory_error,
+            TriviumError::CapacityReservationRejected { .. }
+        ));
+        assert_eq!(reads(), initial);
+        let view = ScopedGraph::build(&db.memtable.read().unwrap(), &scope, &limits, 0).unwrap();
+        assert_eq!(view.ids, [1, 2, 3]);
+        let edges: Vec<_> = view.outgoing[&1]
+            .iter()
+            .zip(&view.identities[&1])
+            .map(|(edge, graph)| {
+                (
+                    edge.target_id,
+                    edge.label.as_str(),
+                    edge.weight,
+                    graph.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(edges, [(2, "rel", 1., None), (2, "rel", 2., Some("g"))]);
+        assert!(reads() > initial);
     }
 }

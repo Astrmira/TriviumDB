@@ -140,7 +140,7 @@ python scripts/migrate.py --source /data/legacy.tdb --source-dtype f32 --destina
 迁移验收核对向量、Payload、边元数据、文本、索引约束及再次重开，另覆盖当前文档/命名图事实、未提交事务与截断 WAL 尾帧、租约冲突、预算、损坏、发布中断和重试。
 
 ```bash
-cargo test --locked --manifest-path crates/triviumdb-migrate/Cargo.toml --target-dir target/migration -- --test-threads=1
+cargo test --locked --manifest-path crates/triviumdb-migrate/Cargo.toml --target-dir target/migration --features test-hooks -- --test-threads=1
 ```
 
 各平台运行结果以对应提交的 CI 为准。本地与 CI 的验收范围见[测试实践](testing.md)。

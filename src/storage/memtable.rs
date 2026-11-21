@@ -604,6 +604,8 @@ pub struct MemTable<T: VectorType> {
     // 仅测试构建记录全库物化，生产构建没有原子计数开销。
     #[cfg(any(test, feature = "test-hooks"))]
     id_materializations: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    pub(crate) adjacency_reads: std::sync::atomic::AtomicU64,
 
     // 映射表：内部索引 (0, 1, 2...) 到 NodeId
     // 用于在 vectors 数组里定位数据位置
@@ -701,6 +703,8 @@ impl<T: VectorType> MemTable<T> {
             active_ids: roaring::RoaringTreemap::new(),
             #[cfg(any(test, feature = "test-hooks"))]
             id_materializations: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            adjacency_reads: Default::default(),
             indices_to_ids: Vec::new(),
             ids_to_indices: HashMap::new(),
             fast_tags: Vec::new(),
@@ -773,6 +777,8 @@ impl<T: VectorType> MemTable<T> {
             active_ids: roaring::RoaringTreemap::new(),
             #[cfg(any(test, feature = "test-hooks"))]
             id_materializations: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            adjacency_reads: Default::default(),
             indices_to_ids: Vec::new(),
             ids_to_indices: HashMap::new(),
             fast_tags: Vec::new(),
@@ -2310,6 +2316,9 @@ impl<T: VectorType> MemTable<T> {
     }
 
     pub fn get_edges(&self, id: NodeId) -> Option<&[Edge]> {
+        #[cfg(test)]
+        self.adjacency_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.edges
             .get(&id)
             .map(Vec::as_slice)

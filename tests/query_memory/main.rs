@@ -115,6 +115,76 @@ fn 有序小分页在游标上跳过不合格记录且查询峰值小于一份�
 }
 
 #[test]
+fn 数值索引过滤小候选集时峰值小于一份高频倒排表() {
+    use serde_json::json;
+    use triviumdb::query::{tql_executor::execute_tql, tql_parser::parse_tql};
+    use triviumdb::storage::memtable::MemTable;
+
+    const N: u64 = 32_768;
+    const CANDIDATES: u64 = 32;
+    let mut mt = MemTable::<f32>::new(1);
+    mt.set_auto_build_quiver(false);
+    for id in 1..=N {
+        let rank = match (id <= CANDIDATES, id % 4) {
+            (true, 0) => json!(2),
+            (true, 1) => json!(1.0),
+            _ => json!(1),
+        };
+        mt.insert_with_id(id, &[1.], json!({"seed":id <= CANDIDATES, "rank":rank}))
+            .unwrap();
+    }
+    mt.register_property_index("seed");
+    mt.register_property_index("rank");
+    let source = "FIND {seed:true} AS n WITH n WHERE n.rank == 1 RETURN n ORDER BY n.id";
+    let query = parse_tql(source).unwrap();
+    let profile = parse_tql(&format!("EXPLAIN ANALYZE {source}")).unwrap();
+    let expected: Vec<_> = (1..=CANDIDATES).filter(|id| id % 4 != 0).collect();
+    let check = |mt: &MemTable<f32>| {
+        let (rows, peak) = measured(|| execute_tql(&query, mt).unwrap());
+        assert_eq!(
+            rows.iter().map(|row| row["n"].id).collect::<Vec<_>>(),
+            expected
+        );
+        // 候选集外的每个节点都在整数 1 的倒排表内。
+        assert!(
+            peak < (N - CANDIDATES) as usize * size_of::<u64>(),
+            "查询分配峰值 {peak}"
+        );
+        let plan = execute_tql(&profile, mt).unwrap();
+        let stages = plan[0]["plan"].payload["pipeline_stage_actuals"]
+            .as_array()
+            .unwrap();
+        let filter = stages
+            .iter()
+            .find(|stage| stage["operator"] == "tql_numeric_index_filter")
+            .expect("查询应执行数值索引过滤");
+        assert_eq!(filter["input_rows"], CANDIDATES);
+        assert_eq!(filter["actual_rows"], expected.len());
+    };
+    check(&mt);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("numeric.tdb");
+    let path = path.to_str().unwrap();
+    use triviumdb::storage::file_format::{load, save};
+    save(&mut mt, path, StorageMode::Mmap).unwrap();
+    drop(mt);
+    let mapped = load(
+        path,
+        StorageMode::Mmap,
+        false,
+        false,
+        triviumdb::database::MissingIndexPolicy::Fallback,
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        mapped.property_indexes().mapped_posting_entries(),
+        2 * N as usize
+    );
+    check(&mapped);
+}
+
+#[test]
 fn 三元字符索引按字符上限准入且拒绝长值时分配有界() {
     use triviumdb::index::property::PropertyIndexRegistry;
     let mut registry = PropertyIndexRegistry::default();

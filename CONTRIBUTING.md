@@ -73,7 +73,7 @@ cargo check --features python
 cargo check --features nodejs
 cargo fmt --manifest-path crates/triviumdb-migrate/Cargo.toml --all -- --check
 cargo clippy --locked --manifest-path crates/triviumdb-migrate/Cargo.toml --target-dir target/migration --all-targets -- -D warnings
-cargo test --locked --manifest-path crates/triviumdb-migrate/Cargo.toml --target-dir target/migration -- --test-threads=1
+cargo test --locked --manifest-path crates/triviumdb-migrate/Cargo.toml --target-dir target/migration --features test-hooks -- --test-threads=1
 git diff --check
 ```
 

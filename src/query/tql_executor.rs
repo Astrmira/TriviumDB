@@ -280,7 +280,12 @@ impl ExecutionContext {
                         &format!("图作用域配置无效 (Invalid graph scope configuration): {error}"),
                     )
                 })?;
-                crate::graph::view::ScopedGraph::build(mt, &scope, self.memory_limit)
+                crate::graph::view::ScopedGraph::build(
+                    mt,
+                    &scope,
+                    &Default::default(),
+                    self.memory_limit,
+                )
             };
             self.graph = Some(prepare().map_err(|error| {
                 self.error(error, QueryErrorStage::Plan, SourceSelector::GraphScope)
