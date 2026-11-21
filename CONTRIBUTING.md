@@ -6,6 +6,12 @@
 
 ### 分支模型
 
+[项目仓库](https://github.com/Astrmira/TriviumDB)已迁至 Astrmira 组织。如果本地 `origin` 指向原官方仓库，可在仓库目录中运行：
+
+```bash
+git remote set-url origin https://github.com/Astrmira/TriviumDB.git
+```
+
 项目采用 `master` + `dev` 双长期分支模型：
 
 ```text

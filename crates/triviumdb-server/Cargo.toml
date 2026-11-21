@@ -5,7 +5,7 @@ edition = "2024"
 authors = ["YoKONCy <2752026184@qq.com>"]
 description = "HTTP server for TriviumDB"
 license = "Apache-2.0"
-repository = "https://github.com/YoKONCy/TriviumDB"
+repository = "https://github.com/Astrmira/TriviumDB"
 publish = false
 
 [features]

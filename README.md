@@ -5,7 +5,7 @@
 <div align="center">
 
 <!-- 动态打字效果 Slogan -->
-<a href="https://github.com/YoKONCy/TriviumDB">
+<a href="https://github.com/Astrmira/TriviumDB">
   <img src="https://readme-typing-svg.demolab.com?font=Noto+Serif+SC&weight=600&size=24&duration=4000&pause=1000&color=1E90FF&center=true&vCenter=true&multiline=true&repeat=false&width=800&height=70&lines=%E4%B8%89%E4%BD%8D%E4%B8%80%E4%BD%93%E7%9A%84+AI+%E5%8E%9F%E7%94%9F%E5%B5%8C%E5%85%A5%E5%BC%8F%E6%95%B0%E6%8D%AE%E5%BA%93;%E5%90%91%E9%87%8F+%C3%97+%E5%9B%BE%E8%B0%B1+%C3%97+%E5%85%B3%E7%B3%BB%E5%9E%8B;%E4%B8%BA+Agent+%E6%89%93%E9%80%A0%E7%9A%84%E9%AB%98%E6%80%A7%E8%83%BD%E8%AE%B0%E5%BF%86%E6%A0%B8%E5%BF%83" alt="Slogan" />
 </a>
 
@@ -26,7 +26,7 @@
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![QuIVer arXiv](https://img.shields.io/badge/QuIVer%20arXiv-2605.02171-b31b1b.svg)](https://arxiv.org/abs/2605.02171)
 [![Pelorus arXiv](https://img.shields.io/badge/Pelorus%20arXiv-2611.22159-b31b1b.svg)](https://arxiv.org/abs/2611.22159)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/YoKONCy/TriviumDB)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Astrmira/TriviumDB)
 
 **中文** | [**English**](README_EN.md)
 
@@ -666,7 +666,7 @@ Apache-2.0
 
 ## 🌟 Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=YoKONCy/TriviumDB&type=Date)](https://star-history.com/#YoKONCy/TriviumDB&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=Astrmira/TriviumDB&type=Date)](https://star-history.com/#Astrmira/TriviumDB&Date)
 
 <br/>
 

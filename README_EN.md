@@ -5,7 +5,7 @@
 <div align="center">
 
 <!-- Dynamic Typing Slogan -->
-<a href="https://github.com/YoKONCy/TriviumDB">
+<a href="https://github.com/Astrmira/TriviumDB">
   <img src="https://readme-typing-svg.demolab.com?font=Inter&weight=600&size=24&duration=4000&pause=1000&color=1E90FF&center=true&vCenter=true&multiline=true&repeat=false&width=800&height=70&lines=A+Trinity+AI-Native+Embedded+Database;Vector+%C3%97+Graph+%C3%97+Document;High-Performance+Memory+Core+for+Agents" alt="Slogan" />
 </a>
 
@@ -26,7 +26,7 @@
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![QuIVer arXiv](https://img.shields.io/badge/QuIVer%20arXiv-2605.02171-b31b1b.svg)](https://arxiv.org/abs/2605.02171)
 [![Pelorus arXiv](https://img.shields.io/badge/Pelorus%20arXiv-2611.22159-b31b1b.svg)](https://arxiv.org/abs/2611.22159)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/YoKONCy/TriviumDB)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Astrmira/TriviumDB)
 
 [**中文文档**](README.md) | **English**
 
@@ -665,7 +665,7 @@ This project is linked to and recognizes the [LINUX DO community](https://linux.
 
 ## 🌟 Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=YoKONCy/TriviumDB&type=Date)](https://star-history.com/#YoKONCy/TriviumDB&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=Astrmira/TriviumDB&type=Date)](https://star-history.com/#Astrmira/TriviumDB&Date)
 
 <br/>
 
