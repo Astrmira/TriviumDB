@@ -30,7 +30,7 @@
 
 **中文** | [**English**](README_EN.md)
 
-当前预发布版本为 **0.9.3-beta.1**，新增可选的 Pelorus 双曲向量检索、QuIVer SSD 请求级 I/O 计量，并改进检查点恢复和图查询预算。Python 版本为 `0.9.3b1`，npm 使用 `beta` 通道。完整变更与升级步骤见[双语发布说明](docs/changes/0.9.3-beta.1.md)。
+当前正式版本为 **0.9.3**，提供可选的 Pelorus 双曲检索和 QuIVer SSD 请求级 I/O 计量，并改进 WAL 恢复、TQL 查询与图预算。完整变更、Rust 接口调整及升级步骤见[双语发布说明](docs/changes/0.9.3.md)。
 
 SDK 的支持范围见 [SDK 正式接口清单](docs/sdk-contract.md)，历史磁盘格式通过[外部迁移工具](docs/migration.md)升级。
 
@@ -161,13 +161,13 @@ flowchart TD
 推荐使用超快的 [uv](https://github.com/astral-sh/uv) （只需毫秒级）：
 
 ```bash
-uv pip install "triviumdb==0.9.3b1"
+uv pip install "triviumdb==0.9.3"
 ```
 
 或者使用传统 pip：
 
 ```bash
-pip install "triviumdb==0.9.3b1"
+pip install "triviumdb==0.9.3"
 ```
 
 ### 🌐 Node.js / 前端用户
@@ -175,9 +175,9 @@ pip install "triviumdb==0.9.3b1"
 跨平台包已自带 `*.node` 预编译拓展，并含有完整的 TypeScript 补全：
 
 ```bash
-npm install triviumdb@0.9.3-beta.1
+npm install triviumdb@0.9.3
 # 或者
-pnpm add triviumdb@0.9.3-beta.1
+pnpm add triviumdb@0.9.3
 ```
 
 ### 🦀 Rust 原生用户
@@ -185,10 +185,10 @@ pnpm add triviumdb@0.9.3-beta.1
 直接把我们当成 Library 依赖：
 
 ```bash
-cargo add triviumdb@0.9.3-beta.1
+cargo add triviumdb@0.9.3
 ```
 
-本页示例使用 `0.9.3-beta.1`。采用当前格式的 0.9.2 数据库可直接打开。打开时若返回 `TDB_MIGRATION_REQUIRED`，按[外部迁移指南](docs/migration.md)创建并核验目标库。
+本页示例使用 `0.9.3`。采用当前格式的 0.9.2 和 0.9.3-beta.1 数据库可直接打开。打开时若返回 `TDB_MIGRATION_REQUIRED`，按[外部迁移指南](docs/migration.md)创建并核验目标库。
 
 需要为嵌入式应用提供管理前端时，按[Console 宿主接入](docs/embedded-console.md)复用同一实例和文件锁；现有 HTML 仍需前端传输适配，资源包会标明这一条件及 CDN 依赖。
 

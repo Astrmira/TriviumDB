@@ -1,6 +1,6 @@
 # TriviumDB
 
-The latest stable release is [0.9.2](https://github.com/Astrmira/TriviumDB/releases/tag/v0.9.2). The [ICDE evaluation archive](https://github.com/Astrmira/TriviumDB/tree/master/evaluation) contains frozen measurements and source identities.
+The latest stable release is [0.9.3](https://github.com/Astrmira/TriviumDB/releases/tag/v0.9.3). The [ICDE evaluation archive](https://github.com/Astrmira/TriviumDB/tree/master/evaluation) contains frozen measurements and source identities.
 
 Document APIs provide source revisions, logical blocks, grouped text/vector/hybrid retrieval, phrase and proximity evidence, parser mappings, and staged publication. DOCUMENTS sources and GRAPH scopes integrate documents and named graphs into TQL, Prepared queries, and Planner. QuIVer offers centered INT8/INT4 reranking, FP32/INT8/INT4 query representations, SSD/Hot residency, byte-bounded caches, native I/O, and aligned window reuse. Document ANN can select compressed reranking per request. Rust, Python, and Node share Core semantics.
 
@@ -28,11 +28,12 @@ TriviumDB runs inside the host application. Applications use it for AI agent mem
 - [TQL reference](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/tql-reference.md): Unified Cascades planning, cross-model query syntax, pipeline operators, graph algorithms, and data mutations.
 - [Features](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/features.md): Native tri-model data model, shared storage kernel, indexing, transactions, and retrieval capabilities.
 - [QuIVer vector index](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/quiver.md): Quantized graph navigation, vector reranking, automatic construction, and index configuration.
+- [Pelorus hyperbolic index](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/pelorus.md): Opt-in fixed-curvature Poincaré search, graph construction, exact distance and storage residency.
 - [Resource runtime](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/resource-runtime.md): Shared resource budgets, thread pools, task admission, and instance diagnostics.
 - [Shutdown, snapshots, and restore](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/lifecycle-snapshots.md): Instance lifecycle, consistent directory snapshots, verification, and restore.
 - [Best practices](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/best-practices.md): Data modeling, application integration, retrieval patterns, and resource configuration.
 
-- [Stable release notes](https://raw.githubusercontent.com/Astrmira/TriviumDB/v0.9.2/docs/changes/0.9.2.md) cover changes, compatibility, and upgrade steps in Chinese and English.
+- [Stable release notes](https://raw.githubusercontent.com/Astrmira/TriviumDB/v0.9.3/docs/changes/0.9.3.md) cover changes, compatibility, and upgrade steps in Chinese and English.
 
 ## Packages
 

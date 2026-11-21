@@ -30,7 +30,7 @@
 
 [**中文文档**](README.md) | **English**
 
-The current prerelease is **0.9.3-beta.1**. It adds opt-in Pelorus hyperbolic search and per-request QuIVer SSD I/O counters, and improves checkpoint recovery and graph query budgeting. The Python version is `0.9.3b1`, and npm uses the `beta` channel. See the [bilingual release notes](docs/changes/0.9.3-beta.1.md) for changes and upgrade steps.
+The current stable release is **0.9.3**. It adds opt-in Pelorus hyperbolic search and per-request QuIVer SSD I/O counters, and improves WAL recovery, TQL queries and graph budgets. See the [bilingual release notes](docs/changes/0.9.3.md) for changes, Rust API updates and upgrade steps.
 
 The [SDK contract inventory](docs/sdk-contract.md) describes supported interfaces. The [external migration tool](docs/migration.md) upgrades historical disk formats.
 
@@ -232,13 +232,13 @@ maturin develop --features python
 Recommended: use the blazing-fast [uv](https://github.com/astral-sh/uv) (millisecond install):
 
 ```bash
-uv pip install "triviumdb==0.9.3b1"
+uv pip install "triviumdb==0.9.3"
 ```
 
 Or traditional pip:
 
 ```bash
-pip install "triviumdb==0.9.3b1"
+pip install "triviumdb==0.9.3"
 ```
 
 ### 🌐 Node.js / Frontend Users
@@ -246,9 +246,9 @@ pip install "triviumdb==0.9.3b1"
 Cross-platform package includes pre-compiled `*.node` native extensions with full TypeScript completions:
 
 ```bash
-npm install triviumdb@0.9.3-beta.1
+npm install triviumdb@0.9.3
 # or
-pnpm add triviumdb@0.9.3-beta.1
+pnpm add triviumdb@0.9.3
 ```
 
 ### 🦀 Rust Native Users
@@ -256,10 +256,10 @@ pnpm add triviumdb@0.9.3-beta.1
 Use as a library dependency:
 
 ```bash
-cargo add triviumdb@0.9.3-beta.1
+cargo add triviumdb@0.9.3
 ```
 
-The examples on this page use `0.9.3-beta.1`. Current-format 0.9.2 databases open directly. If opening returns `TDB_MIGRATION_REQUIRED`, follow the [external migration guide](docs/migration.md) to create and verify a destination database.
+The examples on this page use `0.9.3`. Current-format 0.9.2 and 0.9.3-beta.1 databases open directly. If opening returns `TDB_MIGRATION_REQUIRED`, follow the [external migration guide](docs/migration.md) to create and verify a destination database.
 
 To add a management frontend to an embedded application, follow [Console host integration](docs/embedded-console.md) to reuse the same instance and file lock. The existing HTML still needs frontend-owned transport adaptation; the resource bundle declares that requirement and its CDN dependencies.
 
