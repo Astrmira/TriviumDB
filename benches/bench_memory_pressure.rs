@@ -18,8 +18,9 @@ struct Report {
     p99_ms: f64,
     rss_bytes_before: u64,
     rss_bytes_after: u64,
-    major_faults_delta: u64,
-    minor_faults_delta: u64,
+    major_faults_delta: Option<u64>,
+    total_faults_delta: Option<u64>,
+    minor_faults_delta: Option<u64>,
     database_bytes: u64,
 }
 
@@ -119,8 +120,18 @@ fn main() {
         p99_ms: percentile(0.99),
         rss_bytes_before: before.rss_bytes,
         rss_bytes_after: after.rss_bytes,
-        major_faults_delta: after.major_faults.saturating_sub(before.major_faults),
-        minor_faults_delta: after.minor_faults.saturating_sub(before.minor_faults),
+        major_faults_delta: after
+            .major_faults
+            .zip(before.major_faults)
+            .and_then(|(after, before)| after.checked_sub(before)),
+        total_faults_delta: after
+            .total_faults
+            .zip(before.total_faults)
+            .and_then(|(after, before)| after.checked_sub(before)),
+        minor_faults_delta: after
+            .minor_faults
+            .zip(before.minor_faults)
+            .and_then(|(after, before)| after.checked_sub(before)),
         database_bytes,
     };
     let json = serde_json::to_string_pretty(&report).expect("序列化观测报告失败");

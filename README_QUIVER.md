@@ -1,6 +1,6 @@
 # QuIVer — Reviewer and Reproducibility Guide
 
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/YoKONCy/TriviumDB)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Astrmira/TriviumDB)
 
 The repository provides the ICDE evaluation archive and the current QuIVer runtime in TriviumDB `0.9.2`. Each experiment retains its source, graph, query, metric, and hardware identities. Runtime interfaces and resource contracts are documented in the [QuIVer runtime guide](docs/quiver.md).
 

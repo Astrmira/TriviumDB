@@ -16,6 +16,155 @@ use triviumdb::storage::memtable::MemTable;
 
 const DIM: usize = 2;
 
+#[test]
+fn 并行子图算子的原始边预算覆盖被标签过滤的边() {
+    use triviumdb::graph::subset::*;
+    let mut graph = MemTable::new(1);
+    let nodes = std::collections::BTreeSet::from([1, 2, 3]);
+    for id in &nodes {
+        graph
+            .insert_with_id(*id, &[1f32], Default::default())
+            .unwrap();
+    }
+    for id in [2, 3] {
+        graph.link(1, id, "red".into(), 1.).unwrap();
+    }
+    let run = |limit| {
+        [
+            subset_pagerank_parallel(&graph, &nodes, Default::default(), Some("blue"), limit)
+                .map(|r| r.examined_edges),
+            subset_wcc_parallel(&graph, &nodes, Some("blue"), limit).map(|r| r.1),
+            subset_degree_centrality_parallel(&graph, &nodes, Some("blue"), limit).map(|r| r.1),
+            deterministic_label_propagation_parallel(
+                &graph,
+                &nodes,
+                LabelPropagationConfig {
+                    max_iterations: 4,
+                    min_community_size: 1,
+                },
+                Some("blue"),
+                limit,
+            )
+            .map(|r| r.examined_edges),
+        ]
+    };
+    for result in run(1) {
+        assert_eq!(result.unwrap_err().code(), "TDB_QUERY_EXECUTION");
+    }
+    for result in run(2) {
+        assert_eq!(result.unwrap(), 2);
+    }
+}
+
+#[test]
+fn 并行PageRank在收敛阈值附近保持确定() {
+    use triviumdb::graph::subset::{SubsetPageRankConfig, subset_pagerank_parallel};
+    let mut graph = MemTable::new(1);
+    let nodes = (1..=30).collect::<std::collections::BTreeSet<_>>();
+    for &id in &nodes {
+        graph
+            .insert_with_id(id, &[1f32], Default::default())
+            .unwrap();
+    }
+    for &id in &nodes {
+        for offset in 0..id % 7 {
+            graph
+                .link(id, (id * 11 + offset * 3) % 30 + 1, "e".into(), 1.)
+                .unwrap();
+        }
+    }
+    let run = |threads, tolerance| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(|| {
+                subset_pagerank_parallel(
+                    &graph,
+                    &nodes,
+                    SubsetPageRankConfig {
+                        damping: 0.85,
+                        max_iterations: 2,
+                        tolerance,
+                    },
+                    None,
+                    usize::MAX,
+                )
+                .unwrap()
+            })
+    };
+    assert_eq!(run(1, 0.22).scores[0].0, 12);
+    assert_eq!(run(4, 0.21).scores[0].0, 20);
+    let one = run(1, 0.21627777777777782);
+    let four = run(4, 0.21627777777777782);
+    assert_eq!(
+        (one.iterations, one.residual_l1, one.scores),
+        (four.iterations, four.residual_l1, four.scores)
+    );
+}
+
+fn 一跳扩散(
+    graph: &MemTable<f32>,
+    bias: Option<&[f32]>,
+    direction: triviumdb::EdgeDirection,
+) -> HashMap<u64, f32> {
+    triviumdb::graph::traversal::expand_graph_with_labels(
+        graph,
+        vec![triviumdb::SearchHit {
+            id: 1,
+            score: 1.,
+            payload: Default::default(),
+        }],
+        1,
+        0.,
+        false,
+        0,
+        false,
+        bias,
+        None,
+        0,
+        0.,
+        direction,
+    )
+    .into_iter()
+    .map(|hit| (hit.id, hit.score))
+    .collect()
+}
+
+#[test]
+fn 扩散的正交门控与完全抑制均保留原边份额() {
+    use triviumdb::EdgeDirection::Outgoing;
+    let mut graph = MemTable::new(2);
+    for (id, vector) in [(1, [1., 0.]), (2, [1e30, -1e30]), (3, [-1e30, -1e30])] {
+        graph
+            .insert_with_id(id, &vector, Default::default())
+            .unwrap();
+    }
+    graph.link(1, 2, "e".into(), 1.).unwrap();
+    graph.link(1, 3, "e".into(), 1.).unwrap();
+    assert_eq!(
+        一跳扩散(&graph, Some(&[1e30, 1e30]), Outgoing),
+        HashMap::from([(1, 1.), (2, 0.25)])
+    );
+}
+
+#[test]
+fn 双向扩散独立计入正反两条边且自环只计一次() {
+    let mut graph = MemTable::new(1);
+    for id in 1..=3 {
+        graph
+            .insert_with_id(id, &[1f32], Default::default())
+            .unwrap();
+    }
+    for (source, target) in [(1, 1), (1, 2), (2, 1), (1, 3)] {
+        graph.link(source, target, "e".into(), 1.).unwrap();
+    }
+    assert_eq!(
+        一跳扩散(&graph, None, triviumdb::EdgeDirection::Both),
+        HashMap::from([(1, 1.25), (2, 0.5), (3, 0.25)])
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 //  通用测试图谱构建器
 // ═══════════════════════════════════════════════════════════════════════
@@ -194,6 +343,48 @@ fn 可变长路径_结果数熔断() {
 // ═══════════════════════════════════════════════════════════════════════
 //  all_paths 测试
 // ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn 全路径_深链按原节点顺序返回() {
+    use triviumdb::graph::{
+        budget::TraversalBudget,
+        pathfinding::{BoundedPathConfig, bounded_all_paths},
+    };
+    let mut mt = MemTable::<f32>::new(1);
+    mt.set_auto_build_quiver(false);
+    let expected: Vec<_> = (1..=2048).collect();
+    for &id in &expected {
+        mt.insert_with_id(id, &[1.], serde_json::Value::Null)
+            .unwrap();
+        if id > 1 {
+            mt.link(id - 1, id, "chain".into(), 1.).unwrap();
+        }
+    }
+    let depth = expected.len() - 1;
+    let last = *expected.last().unwrap();
+    let paths = all_paths(&mt, 1, last, depth, Some("chain"), 1);
+    assert_eq!(paths.as_slice(), std::slice::from_ref(&expected));
+    let result = bounded_all_paths(
+        &mt,
+        1,
+        last,
+        &BoundedPathConfig {
+            max_depth: depth,
+            max_paths: 1,
+            label_sequence: None,
+            forbidden_nodes: Default::default(),
+        },
+        &TraversalBudget {
+            max_depth: depth,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(!result.truncated);
+    assert_eq!(result.metrics.examined_edges, depth);
+    assert_eq!(result.paths.len(), 1);
+    assert_eq!(result.paths[0].nodes, expected);
+}
 
 #[test]
 fn 全路径_双路由() {
@@ -457,7 +648,7 @@ fn Betweenness_采样模式() {
 fn PageRank_星形图_叶节点高于中心() {
     let mt = build_star_graph();
     let config = PageRankConfig::default();
-    let result = pagerank(&mt, &config, None);
+    let result = pagerank(&mt, &config, None).unwrap();
     let pr_map: HashMap<u64, f64> = result.into_iter().collect();
     assert!(
         pr_map[&1] < pr_map[&2],
@@ -469,7 +660,7 @@ fn PageRank_星形图_叶节点高于中心() {
 fn PageRank_总和收敛到1() {
     let mt = build_disconnected_graph();
     let config = PageRankConfig::default();
-    let result = pagerank(&mt, &config, None);
+    let result = pagerank(&mt, &config, None).unwrap();
     let total: f64 = result.iter().map(|(_, pr)| pr).sum();
     assert!(
         (total - 1.0).abs() < 0.01,
@@ -482,7 +673,7 @@ fn PageRank_总和收敛到1() {
 fn PageRank_空图() {
     let mt: MemTable<f32> = MemTable::new(DIM);
     let config = PageRankConfig::default();
-    let result = pagerank(&mt, &config, None);
+    let result = pagerank(&mt, &config, None).unwrap();
     assert!(result.is_empty());
 }
 
@@ -490,7 +681,7 @@ fn PageRank_空图() {
 fn PageRank_标签过滤() {
     let mt = build_disconnected_graph();
     let config = PageRankConfig::default();
-    let result = pagerank(&mt, &config, Some("knows"));
+    let result = pagerank(&mt, &config, Some("knows")).unwrap();
     let pr_map: HashMap<u64, f64> = result.into_iter().collect();
     assert!(
         pr_map[&3] > pr_map[&1],
@@ -502,7 +693,7 @@ fn PageRank_标签过滤() {
 fn PageRank_降序排列() {
     let mt = build_star_graph();
     let config = PageRankConfig::default();
-    let result = pagerank(&mt, &config, None);
+    let result = pagerank(&mt, &config, None).unwrap();
     for window in result.windows(2) {
         assert!(window[0].1 >= window[1].1, "PageRank 结果应按分数降序排列");
     }
@@ -515,7 +706,7 @@ fn 全图并列项按身份排序且零采样贡献为零() {
         mt.insert_with_id(id, &[0.], Default::default()).unwrap();
     }
     assert_eq!(
-        pagerank(&mt, &Default::default(), None),
+        pagerank(&mt, &Default::default(), None).unwrap(),
         [(1, 0.25), (2, 0.25), (7, 0.25), (9, 0.25)]
     );
     assert_eq!(
@@ -606,4 +797,28 @@ fn 质心精确抵消且实例配额在复制向量之前准入() {
         assert_eq!(center, &[1.; 256]);
     }
     db.close().unwrap();
+}
+
+#[test]
+fn 全图排名拒绝非法参数() {
+    let mt = build_star_graph();
+    for config in [
+        PageRankConfig {
+            damping: f64::NAN,
+            ..Default::default()
+        },
+        PageRankConfig {
+            max_iterations: 0,
+            ..Default::default()
+        },
+        PageRankConfig {
+            tolerance: 0.,
+            ..Default::default()
+        },
+    ] {
+        assert_eq!(
+            pagerank(&mt, &config, None).unwrap_err().code(),
+            "TDB_QUERY_EXECUTION"
+        );
+    }
 }

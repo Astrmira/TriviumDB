@@ -33,6 +33,21 @@ pub struct SubsetPageRankConfig {
     pub tolerance: f64,
 }
 
+impl SubsetPageRankConfig {
+    pub(super) fn validate(&self) -> Result<()> {
+        if !(0.0..1.0).contains(&self.damping)
+            || !self.tolerance.is_finite()
+            || self.tolerance <= 0.0
+            || self.max_iterations == 0
+        {
+            return Err(TriviumError::QueryExecution(
+            "PageRank 配置非法：damping 必须位于 [0,1)，迭代次数和 tolerance 必须为正 (Invalid PageRank configuration)".into(),
+        ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for SubsetPageRankConfig {
     fn default() -> Self {
         Self {
@@ -52,6 +67,22 @@ pub struct SubsetPageRankResult {
     pub examined_edges: usize,
 }
 
+/// 在分配诱导子图之前校验全部成员，并继承调用方的取消控制。
+fn validate_members<T: VectorType>(
+    mt: &impl GraphRead<T>,
+    nodes: &BTreeSet<NodeId>,
+) -> Result<crate::query::tql_executor::QueryControl> {
+    let control = crate::request::control().unwrap_or_default();
+    crate::graph::budget::check_control(&control)?;
+    for &id in nodes {
+        crate::graph::budget::check_control(&control)?;
+        if !mt.contains(id) {
+            return Err(TriviumError::NodeNotFound(id));
+        }
+    }
+    Ok(control)
+}
+
 pub fn subset_pagerank<T: VectorType>(
     mt: &MemTable<T>,
     nodes: &BTreeSet<NodeId>,
@@ -69,17 +100,8 @@ pub(crate) fn subset_pagerank_view<T: VectorType>(
     label_filter: Option<&str>,
     max_examined_edges: usize,
 ) -> Result<SubsetPageRankResult> {
-    let control = crate::request::control().unwrap_or_default();
-    crate::graph::budget::check_control(&control)?;
-    if !(0.0..1.0).contains(&config.damping)
-        || !config.tolerance.is_finite()
-        || config.tolerance <= 0.0
-        || config.max_iterations == 0
-    {
-        return Err(TriviumError::QueryExecution(
-            "PageRank 配置非法：damping 必须位于 [0,1)，迭代次数和 tolerance 必须为正 (Invalid PageRank configuration)".into(),
-        ));
-    }
+    let control = validate_members(mt, nodes)?;
+    config.validate()?;
     if nodes.is_empty() {
         return Ok(SubsetPageRankResult {
             scores: Vec::new(),
@@ -111,7 +133,6 @@ pub(crate) fn subset_pagerank_view<T: VectorType>(
             }
         }
         targets.sort_unstable();
-        targets.dedup();
         outgoing.insert(source, targets);
     }
 
@@ -174,6 +195,23 @@ pub(crate) fn subset_pagerank_view<T: VectorType>(
     })
 }
 
+// 读视图保持固定，先检查原始邻接表长度，再分配各线程的目标集合。
+fn admit_subset_edges<T: VectorType>(
+    graph: &impl GraphRead<T>,
+    nodes: &BTreeSet<NodeId>,
+    limit: usize,
+    control: &crate::query::tql_executor::QueryControl,
+    error: &str,
+) -> Result<usize> {
+    nodes.iter().try_fold(0usize, |total, &id| {
+        control.check()?;
+        total
+            .checked_add(graph.get_edges(id).map_or(0, <[_]>::len))
+            .filter(|&count| count <= limit)
+            .ok_or_else(|| TriviumError::QueryExecution(error.into()))
+    })
+}
+
 pub fn subset_pagerank_parallel<T: VectorType>(
     mt: &MemTable<T>,
     nodes: &BTreeSet<NodeId>,
@@ -191,18 +229,16 @@ pub(crate) fn subset_pagerank_parallel_view<T: VectorType>(
     label_filter: Option<&str>,
     max_examined_edges: usize,
 ) -> Result<SubsetPageRankResult> {
-    let control = crate::request::control().unwrap_or_default();
-    crate::graph::budget::check_control(&control)?;
+    let control = validate_members(mt, nodes)?;
     use rayon::prelude::*;
-    if !(0.0..1.0).contains(&config.damping)
-        || !config.tolerance.is_finite()
-        || config.tolerance <= 0.0
-        || config.max_iterations == 0
-    {
-        return Err(TriviumError::QueryExecution(
-            "PageRank 配置非法：damping 必须位于 [0,1)，迭代次数和 tolerance 必须为正 (Invalid PageRank configuration)".into(),
-        ));
-    }
+    config.validate()?;
+    let examined_edges = admit_subset_edges(
+        mt,
+        nodes,
+        max_examined_edges,
+        &control,
+        "PageRank 超过边访问预算 (PageRank exceeds edge examination budget)",
+    )?;
     let ids = nodes.iter().copied().collect::<Vec<_>>();
     if ids.is_empty() {
         return Ok(SubsetPageRankResult {
@@ -234,19 +270,13 @@ pub(crate) fn subset_pagerank_parallel_view<T: VectorType>(
                 })
                 .collect::<Vec<_>>();
             targets.sort_unstable();
-            targets.dedup();
-            Ok((targets, edges.len()))
+            Ok(targets)
         })
         .collect::<Result<Vec<_>>>()?;
-    let examined_edges = scanned.iter().map(|(_, n)| *n).sum::<usize>();
-    if examined_edges > max_examined_edges {
-        return Err(TriviumError::QueryExecution(
-            "PageRank 超过边访问预算 (PageRank exceeds edge examination budget)".into(),
-        ));
-    }
+
     let n = ids.len();
     let mut incoming = vec![Vec::<usize>::new(); n];
-    for (source, (targets, _)) in scanned.iter().enumerate() {
+    for (source, targets) in scanned.iter().enumerate() {
         crate::graph::budget::check_control(&control)?;
         for &target in targets {
             crate::graph::budget::check_control(&control)?;
@@ -264,7 +294,7 @@ pub(crate) fn subset_pagerank_parallel_view<T: VectorType>(
         crate::test_hooks::hit(crate::test_hooks::ConcurrencyPoint::GraphAlgorithmIteration);
         crate::graph::budget::check_control(&control)?;
         let dangling = (0..n)
-            .filter(|&i| scanned[i].0.is_empty())
+            .filter(|&i| scanned[i].is_empty())
             .map(|i| scores[i])
             .sum::<f64>();
         let base = teleport + config.damping * dangling / n as f64;
@@ -274,15 +304,11 @@ pub(crate) fn subset_pagerank_parallel_view<T: VectorType>(
                 crate::graph::budget::check_control(&control)?;
                 sources.iter().try_fold(base, |sum, &source| {
                     control.check()?;
-                    Ok(sum + config.damping * scores[source] / scanned[source].0.len() as f64)
+                    Ok(sum + config.damping * scores[source] / scanned[source].len() as f64)
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        residual_l1 = next
-            .par_iter()
-            .zip(&scores)
-            .map(|(a, b)| (a - b).abs())
-            .sum();
+        residual_l1 = next.iter().zip(&scores).map(|(a, b)| (a - b).abs()).sum();
         scores = next;
         iterations = iteration;
         if residual_l1 < config.tolerance {
@@ -325,14 +351,12 @@ pub(crate) fn subset_degree_centrality_view<T: VectorType>(
     label_filter: Option<&str>,
     max_examined_edges: usize,
 ) -> Result<(Vec<SubsetDegreeCentrality>, usize)> {
-    let control = crate::request::control().unwrap_or_default();
-    crate::graph::budget::check_control(&control)?;
+    let control = validate_members(mt, nodes)?;
     let mut in_degrees = BTreeMap::from_iter(nodes.iter().map(|&id| (id, 0usize)));
     let mut out_degrees = BTreeMap::from_iter(nodes.iter().map(|&id| (id, 0usize)));
     let mut examined = 0usize;
     for &source in nodes {
         crate::graph::budget::check_control(&control)?;
-        let mut targets = BTreeSet::new();
         for edge in mt.get_edges(source).unwrap_or_default() {
             crate::graph::budget::check_control(&control)?;
             examined = examined.saturating_add(1);
@@ -345,16 +369,14 @@ pub(crate) fn subset_degree_centrality_view<T: VectorType>(
             if nodes.contains(&edge.target_id)
                 && label_filter.is_none_or(|label| edge.label == label)
             {
-                targets.insert(edge.target_id);
+                *in_degrees
+                    .get_mut(&edge.target_id)
+                    .expect("目标属于诱导子图") += 1;
+                *out_degrees.get_mut(&source).expect("起点属于诱导子图") += 1;
             }
         }
-        out_degrees.insert(source, targets.len());
-        for target in targets {
-            crate::graph::budget::check_control(&control)?;
-            *in_degrees.get_mut(&target).expect("目标属于诱导子图") += 1;
-        }
     }
-    let denominator = nodes.len().saturating_sub(1).saturating_mul(2).max(1) as f64;
+    let denominator = nodes.len().saturating_sub(1).max(1) as f64;
     let mut output = nodes
         .iter()
         .map(|&id| {
@@ -394,11 +416,17 @@ pub(crate) fn subset_degree_centrality_parallel_view<T: VectorType>(
     label_filter: Option<&str>,
     max_examined_edges: usize,
 ) -> Result<(Vec<SubsetDegreeCentrality>, usize)> {
-    let control = crate::request::control().unwrap_or_default();
-    crate::graph::budget::check_control(&control)?;
+    let control = validate_members(mt, nodes)?;
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    let examined = admit_subset_edges(
+        mt,
+        nodes,
+        max_examined_edges,
+        &control,
+        "度中心性超过边访问预算 (Degree centrality exceeds edge examination budget)",
+    )?;
     let ids = nodes.iter().copied().collect::<Vec<_>>();
     let slots = ids
         .iter()
@@ -422,28 +450,20 @@ pub(crate) fn subset_degree_centrality_parallel_view<T: VectorType>(
                 .map(|edge| edge.target_id)
                 .collect::<Vec<_>>();
             targets.sort_unstable();
-            targets.dedup();
             for target in &targets {
                 crate::graph::budget::check_control(&control)?;
                 in_degrees[slots[target]].fetch_add(1, Ordering::Relaxed);
             }
-            Ok((targets.len(), edges.len()))
+            Ok(targets.len())
         })
         .collect::<Result<Vec<_>>>()?;
-    let examined = scanned
-        .iter()
-        .fold(0usize, |total, (_, count)| total.saturating_add(*count));
-    if examined > max_examined_edges {
-        return Err(TriviumError::QueryExecution(
-            "度中心性超过边访问预算 (Degree centrality exceeds edge examination budget)".into(),
-        ));
-    }
-    let denominator = nodes.len().saturating_sub(1).saturating_mul(2).max(1) as f64;
+
+    let denominator = nodes.len().saturating_sub(1).max(1) as f64;
     let mut output = ids
         .into_par_iter()
         .enumerate()
         .map(|(slot, id)| {
-            let out_degree = scanned[slot].0;
+            let out_degree = scanned[slot];
             let in_degree = in_degrees[slot].load(Ordering::Relaxed);
             let total_degree = out_degree + in_degree;
             SubsetDegreeCentrality {
@@ -479,8 +499,7 @@ pub(crate) fn subset_wcc_view<T: VectorType>(
     label_filter: Option<&str>,
     max_examined_edges: usize,
 ) -> Result<(Vec<Vec<NodeId>>, usize)> {
-    let control = crate::request::control().unwrap_or_default();
-    crate::graph::budget::check_control(&control)?;
+    let control = validate_members(mt, nodes)?;
     let mut adjacency = BTreeMap::from_iter(nodes.iter().map(|&id| (id, BTreeSet::new())));
     let mut examined = 0usize;
     for &source in nodes {
@@ -546,11 +565,17 @@ pub(crate) fn subset_wcc_parallel_view<T: VectorType>(
     label_filter: Option<&str>,
     max_examined_edges: usize,
 ) -> Result<(Vec<Vec<NodeId>>, usize)> {
-    let control = crate::request::control().unwrap_or_default();
-    crate::graph::budget::check_control(&control)?;
+    let control = validate_members(mt, nodes)?;
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    let examined = admit_subset_edges(
+        mt,
+        nodes,
+        max_examined_edges,
+        &control,
+        "WCC 超过边访问预算 (WCC exceeds edge examination budget)",
+    )?;
     let ids = nodes.iter().copied().collect::<Vec<_>>();
     let slots = ids
         .iter()
@@ -573,15 +598,9 @@ pub(crate) fn subset_wcc_parallel_view<T: VectorType>(
                 .collect::<Vec<_>>();
             targets.sort_unstable();
             targets.dedup();
-            Ok((source_slot, targets, edges.len()))
+            Ok((source_slot, targets))
         })
         .collect::<Result<Vec<_>>>()?;
-    let examined = scanned.iter().map(|(_, _, count)| *count).sum::<usize>();
-    if examined > max_examined_edges {
-        return Err(TriviumError::QueryExecution(
-            "WCC 超过边访问预算 (WCC exceeds edge examination budget)".into(),
-        ));
-    }
 
     let parents = (0..ids.len()).map(AtomicUsize::new).collect::<Vec<_>>();
     let find_root = |mut slot: usize| {
@@ -595,7 +614,7 @@ pub(crate) fn subset_wcc_parallel_view<T: VectorType>(
     };
     scanned
         .par_iter()
-        .try_for_each(|(source, targets, _)| -> Result<()> {
+        .try_for_each(|(source, targets)| -> Result<()> {
             for &target in targets {
                 crate::graph::budget::check_control(&control)?;
                 loop {
@@ -697,8 +716,7 @@ fn betweenness<T: VectorType>(
     use super::centrality::{brandes_source, normalize};
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let control = crate::request::control().unwrap_or_default();
-    crate::graph::budget::check_control(&control)?;
+    let control = validate_members(mt, nodes)?;
     if sample_size == Some(0) {
         return Err(TriviumError::QueryExecution(
             "中介中心性采样数必须大于 0 (Betweenness sample size must be positive)".into(),
@@ -741,7 +759,7 @@ fn betweenness<T: VectorType>(
     // 预算紧张时减少同时保留的源工作区；单源仍不足时返回原始额度错误。
     let _workspace = loop {
         let peak = base.saturating_add(per_worker.saturating_mul(workers));
-        match mt.facts().reserve_graph_workspace(peak) {
+        match mt.facts().reserve_instance_workspace(peak) {
             Ok(lease) => break lease,
             Err(
                 TriviumError::CapacityReservationRejected { .. }
@@ -827,8 +845,7 @@ pub(crate) fn deterministic_label_propagation_view<T: VectorType>(
     label_filter: Option<&str>,
     max_examined_edges: usize,
 ) -> Result<LabelPropagationResult> {
-    let control = crate::request::control().unwrap_or_default();
-    crate::graph::budget::check_control(&control)?;
+    let control = validate_members(mt, nodes)?;
     if config.max_iterations == 0 || config.min_community_size == 0 {
         return Err(TriviumError::QueryExecution(
             "标签传播迭代次数和最小社区大小必须大于 0 (Label propagation limits must be positive)"
@@ -961,8 +978,7 @@ pub(crate) fn deterministic_label_propagation_parallel_view<T: VectorType>(
     label_filter: Option<&str>,
     max_examined_edges: usize,
 ) -> Result<LabelPropagationResult> {
-    let control = crate::request::control().unwrap_or_default();
-    crate::graph::budget::check_control(&control)?;
+    let control = validate_members(mt, nodes)?;
     use rayon::prelude::*;
     if config.max_iterations == 0 || config.min_community_size == 0 {
         return Err(TriviumError::QueryExecution(
@@ -970,6 +986,13 @@ pub(crate) fn deterministic_label_propagation_parallel_view<T: VectorType>(
                 .into(),
         ));
     }
+    let examined = admit_subset_edges(
+        mt,
+        nodes,
+        max_examined_edges,
+        &control,
+        "标签传播超过边访问预算 (Label propagation exceeds edge examination budget)",
+    )?;
     let ids = nodes.iter().copied().collect::<Vec<_>>();
     let slots = ids
         .iter()
@@ -992,20 +1015,12 @@ pub(crate) fn deterministic_label_propagation_parallel_view<T: VectorType>(
                     *targets.entry(target).or_insert(0.0) += edge.weight as f64;
                 }
             }
-            Ok((targets, edges.len()))
+            Ok(targets)
         })
         .collect::<Result<Vec<_>>>()?;
-    let examined = scanned.iter().map(|(_, n)| *n).sum::<usize>();
-    if examined > max_examined_edges {
-        return Err(TriviumError::QueryExecution(
-            "标签传播超过边访问预算 (Label propagation exceeds edge examination budget)".into(),
-        ));
-    }
-    let mut adjacency = scanned
-        .iter()
-        .map(|(targets, _)| targets.clone())
-        .collect::<Vec<_>>();
-    for (source, (targets, _)) in scanned.iter().enumerate() {
+
+    let mut adjacency = scanned.clone();
+    for (source, targets) in scanned.iter().enumerate() {
         crate::graph::budget::check_control(&control)?;
         for (&target, &weight) in targets {
             crate::graph::budget::check_control(&control)?;

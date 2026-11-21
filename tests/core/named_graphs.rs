@@ -308,12 +308,11 @@ fn 非法成员重复边修订和零预算在写日志前结构化拒绝() {
     let a = db.put_named_graph(graph(0), None).unwrap();
     let mut bad = graph(0);
     bad.edges.push(bad.edges[0].clone());
-    assert_eq!(
-        db.put_named_graph(bad, Some(&a.revision))
-            .unwrap_err()
-            .code(),
-        "TDB_INVALID_INPUT"
-    );
+    let error = db.put_named_graph(bad, Some(&a.revision)).unwrap_err();
+    assert_eq!(error.code(), "TDB_INVALID_INPUT");
+    let write = error.info().write.unwrap();
+    assert_eq!(write.phase, triviumdb::error::WritePhase::Validation);
+    assert_eq!(write.outcome, triviumdb::error::WriteOutcome::NotCommitted);
     for limits in [
         NamedGraphLimits {
             max_nodes: 0,

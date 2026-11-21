@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "triviumdb"
-version = "0.9.3b1"
+version = "0.9.3"
 description = "AI-native embedded database: Vector + Graph + Relational in one file"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -21,6 +21,9 @@ classifiers = [
     "Topic :: Database",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+
+[project.urls]
+Repository = "https://github.com/Astrmira/TriviumDB"
 
 [tool.maturin]
 features = ["python"]

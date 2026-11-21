@@ -125,25 +125,26 @@ impl App {
 
         let start = Instant::now();
         // 预校验：带位置的解析错误高亮
-        let parse_res = if is_mutation(&q) {
-            triviumdb::query::tql_parser::parse_tql_statement_with_pos(&q).map(|_| ())
-        } else {
-            triviumdb::query::tql_parser::parse_tql_with_pos(&q).map(|_| ())
+        let statement = match triviumdb::query::tql_parser::parse_tql_statement_with_pos(&q) {
+            Ok(statement) => statement,
+            Err(err) => {
+                let diag = crate::diagnostics::Diagnostic::from_parse_error(&q, &err);
+                self.parse_error_loc = Some((diag.line, diag.col));
+                self.status = format!(
+                    "解析错误 line {}, col {}: {}",
+                    diag.line + 1,
+                    diag.col + 1,
+                    diag.msg
+                );
+                self.last_elapsed = Some(start.elapsed());
+                return;
+            }
         };
-        if let Err(err) = parse_res {
-            let diag = crate::diagnostics::Diagnostic::from_parse_error(&q, &err);
-            self.parse_error_loc = Some((diag.line, diag.col));
-            self.status = format!(
-                "解析错误 line {}, col {}: {}",
-                diag.line + 1,
-                diag.col + 1,
-                diag.msg
-            );
-            self.last_elapsed = Some(start.elapsed());
-            return;
-        }
         self.parse_error_loc = None;
-        if is_mutation(&q) {
+        if matches!(
+            statement,
+            triviumdb::query::tql_ast::TqlStatement::Mutation(_)
+        ) {
             match self.handle.tql_mut(&q) {
                 Ok(s) => {
                     self.status = match self.handle.flush() {
@@ -383,8 +384,8 @@ impl App {
 
     /// 以当前选中节点的向量为 query 做相似度检索（搜索 Playground）。
     fn run_search(&mut self) {
-        let (vector, qid) = match &self.detail {
-            Some(n) => (n.vector.clone(), n.id),
+        let qid = match &self.detail {
+            Some(n) => n.id,
             None => {
                 self.status = "无选中节点可作为检索样例".into();
                 return;
@@ -392,7 +393,7 @@ impl App {
         };
 
         let start = Instant::now();
-        match self.handle.search_f32(&vector, 20, 1, 0.0) {
+        match self.handle.search_by_node(qid, 20, 1, 0.0) {
             Ok(hits) => {
                 let mut rows: CliRows = Vec::new();
                 let mut scores: Vec<f32> = Vec::new();
@@ -471,12 +472,4 @@ impl App {
         self.graph_state.center.0 += dx / self.graph_state.zoom;
         self.graph_state.center.1 += dy / self.graph_state.zoom;
     }
-}
-
-/// 通过首关键词粗判是否为写操作。
-fn is_mutation(query: &str) -> bool {
-    let up = query.trim_start().to_ascii_uppercase();
-    ["CREATE", "SET", "DELETE", "DETACH", "MERGE", "REMOVE"]
-        .iter()
-        .any(|kw| up.starts_with(kw))
 }

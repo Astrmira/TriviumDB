@@ -383,3 +383,17 @@ fn with投影遵守共享配额并在拒绝后释放工作区() {
     assert_eq!(runtime.stats().reserved_workspace_bytes, 0);
     db.close().unwrap();
 }
+
+#[test]
+fn 返回节点别名的相似度按原始分数排序() {
+    let root = TestDir::new("metric_alias");
+    let mut db = Database::<f32>::open(&root.file("sort.tdb"), 2).unwrap();
+    for (id, v) in [(2, [0., 1.]), (8, [0.6, 0.8]), (4, [1., 0.])] {
+        db.insert_with_id(id, &v, json!({})).unwrap();
+    }
+    let result = rows(
+        &db,
+        "SEARCH VECTOR [1,0] TOP 3 RETURN _ AS picked, similarity(_) AS score ORDER BY similarity(picked) DESC LIMIT 1",
+    );
+    assert_eq!(result, json!([{"picked":{"node":4},"score":1.0}]));
+}

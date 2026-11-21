@@ -12,9 +12,15 @@ use serde::{Serialize, de::DeserializeOwned};
 impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
     pub fn parse_document(&self, input: &DocumentParseInput) -> Result<ParsedDocument> {
         self.read_operation(|| {
-            let extra = input.content.len().saturating_mul(64).saturating_add(4096);
-            self.ensure_incremental_memory_budget(extra)?;
-            let _workspace = self.resource_runtime.reserve_workspace(extra)?;
+            let extra = input
+                .content
+                .len()
+                .saturating_mul(64)
+                .saturating_add(input.source_id.len())
+                .saturating_add(input.source_revision.len())
+                .saturating_add(input.media_type.as_ref().map_or(0, String::len))
+                .saturating_add(4096);
+            let _workspace = self.reserve_request_workspace(extra)?;
             parsing::parse(input)
         })?
     }
@@ -197,10 +203,8 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
                 let upload = mt.document_publications.get(upload_id)?;
                 let extra = upload.workspace_bytes();
                 mt.ensure_additional_memory(self.memory_limit, extra)?;
-                (
-                    upload.clone(),
-                    self.resource_runtime.reserve_workspace(extra)?,
-                )
+                let workspace = self.resource_runtime.reserve_workspace(extra)?;
+                (upload.clone(), workspace)
             };
             if upload.published {
                 let mt = read_or_recover(&self.memtable);

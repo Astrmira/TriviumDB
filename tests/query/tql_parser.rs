@@ -182,7 +182,7 @@ fn FIND_带LIMIT_OFFSET() {
 
 #[test]
 fn FIND_带ORDER_BY() {
-    let q = parse_tql(r#"FIND {type: "event"} RETURN * ORDER BY a.score DESC LIMIT 5"#).unwrap();
+    let q = parse_tql(r#"FIND {type: "event"} RETURN * ORDER BY _.score DESC LIMIT 5"#).unwrap();
     assert_eq!(q.order_by.len(), 1);
     assert!(q.order_by[0].descending);
     assert_eq!(q.limit, Some(5));
@@ -478,7 +478,7 @@ fn SEARCH_带WHERE过滤() {
 #[test]
 fn SEARCH_完整三融合() {
     let q = parse_tql(
-        r#"SEARCH VECTOR [0.1, 0.2] TOP 20 EXPAND [:related*1..2] WHERE {heat: {$gte: 0.7}} RETURN * ORDER BY a.score DESC LIMIT 10"#
+        r#"SEARCH VECTOR [0.1, 0.2] TOP 20 EXPAND [:related*1..2] WHERE {heat: {$gte: 0.7}} RETURN * ORDER BY _.score DESC LIMIT 10"#
     ).unwrap();
     assert!(matches!(q.entry, QueryEntry::Search { .. }));
     assert!(q.predicate.is_some());

@@ -18,6 +18,15 @@ pub(super) struct Temporary<'a> {
     lease: Option<WorkspaceReservation>,
 }
 
+impl Temporary<'_> {
+    pub(super) fn retain(mut self) {
+        if let Some(lease) = self.lease.take() {
+            self.owner.leases.borrow_mut().push(lease);
+        }
+        self.bytes = 0;
+    }
+}
+
 impl Drop for Temporary<'_> {
     fn drop(&mut self) {
         self.owner.bytes.set(self.owner.bytes.get() - self.bytes);
@@ -96,12 +105,7 @@ impl QueryMemory {
     }
 
     pub(super) fn retain(&self, bytes: usize) -> crate::Result<()> {
-        let mut allocation = self.temporary(bytes)?;
-        if let Some(lease) = allocation.lease.take() {
-            self.leases.borrow_mut().push(lease);
-        }
-        // 凭证转移给查询作用域，临时句柄不再归还已转移的计数。
-        allocation.bytes = 0;
+        self.temporary(bytes)?.retain();
         Ok(())
     }
 

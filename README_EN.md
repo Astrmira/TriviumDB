@@ -5,7 +5,7 @@
 <div align="center">
 
 <!-- Dynamic Typing Slogan -->
-<a href="https://github.com/YoKONCy/TriviumDB">
+<a href="https://github.com/Astrmira/TriviumDB">
   <img src="https://readme-typing-svg.demolab.com?font=Inter&weight=600&size=24&duration=4000&pause=1000&color=1E90FF&center=true&vCenter=true&multiline=true&repeat=false&width=800&height=70&lines=A+Trinity+AI-Native+Embedded+Database;Vector+%C3%97+Graph+%C3%97+Document;High-Performance+Memory+Core+for+Agents" alt="Slogan" />
 </a>
 
@@ -24,12 +24,13 @@
 [![Rust](https://img.shields.io/badge/Rust-stable-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python 3.9–3.12](https://img.shields.io/badge/Python-3.9%E2%80%933.12-blue?logo=python)](https://pypi.org/)
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![arXiv](https://img.shields.io/badge/arXiv-2605.02171-b31b1b.svg)](https://arxiv.org/abs/2605.02171)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/YoKONCy/TriviumDB)
+[![QuIVer arXiv](https://img.shields.io/badge/QuIVer%20arXiv-2605.02171-b31b1b.svg)](https://arxiv.org/abs/2605.02171)
+[![Pelorus arXiv](https://img.shields.io/badge/Pelorus%20arXiv-2611.22159-b31b1b.svg)](https://arxiv.org/abs/2611.22159)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Astrmira/TriviumDB)
 
 [**中文文档**](README.md) | **English**
 
-The current prerelease is **0.9.3-beta.1**. It adds opt-in Pelorus hyperbolic search and per-request QuIVer SSD I/O counters, and improves checkpoint recovery and graph query budgeting. The Python version is `0.9.3b1`, and npm uses the `beta` channel. See the [bilingual release notes](docs/changes/0.9.3-beta.1.md) for changes and upgrade steps.
+The current stable release is **0.9.3**. It adds opt-in Pelorus hyperbolic search and per-request QuIVer SSD I/O counters, and improves WAL recovery, TQL queries and graph budgets. See the [bilingual release notes](docs/changes/0.9.3.md) for changes, Rust API updates and upgrade steps.
 
 The [SDK contract inventory](docs/sdk-contract.md) describes supported interfaces. The [external migration tool](docs/migration.md) upgrades historical disk formats.
 
@@ -203,6 +204,8 @@ ORDER BY score DESC, id
 
 For build instructions, exact search options and Hot, Mmap or SSD residency settings, see the [Pelorus guide](docs/pelorus.md).
 
+[Pelorus paper (arXiv)](https://arxiv.org/abs/2611.22159) · [Pelorus source repository (GitHub)](https://github.com/Astrmira/Pelorus)
+
 ---
 
 ## Hybrid retrieval and research boundaries
@@ -229,13 +232,13 @@ maturin develop --features python
 Recommended: use the blazing-fast [uv](https://github.com/astral-sh/uv) (millisecond install):
 
 ```bash
-uv pip install "triviumdb==0.9.3b1"
+uv pip install "triviumdb==0.9.3"
 ```
 
 Or traditional pip:
 
 ```bash
-pip install "triviumdb==0.9.3b1"
+pip install "triviumdb==0.9.3"
 ```
 
 ### 🌐 Node.js / Frontend Users
@@ -243,9 +246,9 @@ pip install "triviumdb==0.9.3b1"
 Cross-platform package includes pre-compiled `*.node` native extensions with full TypeScript completions:
 
 ```bash
-npm install triviumdb@0.9.3-beta.1
+npm install triviumdb@0.9.3
 # or
-pnpm add triviumdb@0.9.3-beta.1
+pnpm add triviumdb@0.9.3
 ```
 
 ### 🦀 Rust Native Users
@@ -253,10 +256,10 @@ pnpm add triviumdb@0.9.3-beta.1
 Use as a library dependency:
 
 ```bash
-cargo add triviumdb@0.9.3-beta.1
+cargo add triviumdb@0.9.3
 ```
 
-The examples on this page use `0.9.3-beta.1`. Current-format 0.9.2 databases open directly. If opening returns `TDB_MIGRATION_REQUIRED`, follow the [external migration guide](docs/migration.md) to create and verify a destination database.
+The examples on this page use `0.9.3`. Current-format 0.9.2 and 0.9.3-beta.1 databases open directly. If opening returns `TDB_MIGRATION_REQUIRED`, follow the [external migration guide](docs/migration.md) to create and verify a destination database.
 
 To add a management frontend to an embedded application, follow [Console host integration](docs/embedded-console.md) to reuse the same instance and file lock. The existing HTML still needs frontend-owned transport adaptation; the resource bundle declares that requirement and its CDN dependencies.
 
@@ -624,11 +627,23 @@ QuIVer research reference:
 
 ```bibtex
 @article{quiver2026,
-  title   = {QuIVer: Rethinking ANN Graph Topology via Training-Free Binary Quantization},
-  author  = {Xiao, Wenxuan and Wang, Zhiyou and Li, Chengcheng},
+  title   = {{QuIVer}: Efficient Graph Indexing with Two-Bit Construction and Navigation},
+  author  = {Xiao, Wenxuan and Zhu, Peidong and Li, Chengcheng and Cao, Xu},
   journal = {arXiv preprint arXiv:2605.02171},
   year    = {2026},
   url     = {https://arxiv.org/abs/2605.02171}
+}
+```
+
+### 📝 Citing Pelorus
+
+```bibtex
+@article{pelorus2026,
+  title   = {{Pelorus}: Warped-Product Graph Indexing for Hyperbolic Vector Search},
+  author  = {Xiao, Wenxuan and Cao, Xu},
+  journal = {arXiv preprint arXiv:2611.22159},
+  year    = {2026},
+  url     = {https://arxiv.org/abs/2611.22159}
 }
 ```
 
@@ -650,7 +665,7 @@ This project is linked to and recognizes the [LINUX DO community](https://linux.
 
 ## 🌟 Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=YoKONCy/TriviumDB&type=Date)](https://star-history.com/#YoKONCy/TriviumDB&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=Astrmira/TriviumDB&type=Date)](https://star-history.com/#Astrmira/TriviumDB&Date)
 
 <br/>
 

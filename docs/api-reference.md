@@ -1,6 +1,6 @@
 # TriviumDB API 完整参考
 
-> 本文记录 `0.9.3-beta.1` 的 Rust、Python（PyO3）和 Node.js（napi-rs）公共 API。版本说明见 [0.9.3-beta.1 变更](changes/0.9.3-beta.1.md)，后续开发见[未发布变更](changes/unreleased.md)。许可为 Apache-2.0。
+> 本文记录 `0.9.3` 的 Rust、Python（PyO3）和 Node.js（napi-rs）公共 API。版本说明见 [0.9.3 变更](changes/0.9.3.md)，后续开发见[未发布变更](changes/unreleased.md)。许可为 Apache-2.0。
 
 应用支持范围见 [SDK 正式接口清单](sdk-contract.md)。历史数据库由[外部迁移入口](migration.md)转换到当前文件组。普通打开通过 `TDB_MIGRATION_REQUIRED` 提供结构化指引。
 
@@ -125,7 +125,11 @@ with triviumdb.TriviumDB("my_data.tdb", dim=1536) as db:
 | `access_mode` | `str` | `"read_write"` | `read_write` 使用排他锁；`read_only` 使用共享锁；`immutable` 验证 manifest 后无锁打开 |
 | `runtime` | `ResourceRuntime \| None` | `None` | 所属共享资源运行时；默认使用进程共享运行时 |
 
-`search_with_context` / `searchWithContext` 返回的上下文除阶段耗时和候选数外，还包含 `observations`：`estimated_heap_bytes`、`mmap_vector_bytes`、`node_count`、查询路由与 QuIVer `ef_search`；Linux 额外提供进程 RSS、累计主缺页和次缺页。缺页计数是进程累计值，调用方应计算相邻采样差值。
+`search_with_context` / `searchWithContext` 的 `observations` 包含堆内存估算、mmap 向量字节数、节点数、查询路由与 QuIVer `ef_search`。在 Windows 和 Linux 上，`process_rss_bytes` 记录进程驻留内存，`process_total_faults` 记录进程累计缺页次数。Linux 还提供 `process_minor_faults` 和 `process_major_faults`。比较两次采样时，使用同一进程、同一字段的差值。
+
+Rust 的 `ProcessMemorySnapshot` 用 `Option<u64>` 表示 `total_faults`、`minor_faults` 和 `major_faults`。读取分类计数的 Rust 调用方需处理 `None`。基准 JSON 将平台缺失的计数及其差值记为 `null`。
+
+Rust 的 `storage_write_stats()` 按数据库实例累计写入量。`checkpoint_bytes` 覆盖主文件、实际追加或重写的向量、分代 Payload 和 Mmap 发布标记。`sidecar_bytes` 统计统一索引容器的目录和组件写入，`wal_bytes` 包含 WAL 帧及重置日志头。重复发布的内容逐次计入，重开后从新实例开始计量。写放大是这些逻辑文件写入与 WAL 业务记录字节数之比。操作系统回写、发布撤销副本及临时组件的 I/O 不在此指标范围内。
 
 > **维度提醒**：QuIVer 支持 1–3072 维。3073–65536 维数据库使用精确 BruteForce 检索，显式构建 QuIVer 返回错误。依赖 ANN 性能时，请选择最多 3072 维的 embedding 模型或先降维。
 
@@ -253,7 +257,11 @@ generations/
     └── data.tdb...
 ```
 
-`publish_current()` 使用临时文件、文件 `fsync`、原子 rename 和父目录同步，并在切换前验证 manifest、文件校验和、代际 ID 与实际节点数。`open_current()` 在解析 current 与获取代际共享租约期间持有管理共享锁，避免与切代或回收竞态。`GenerationReader` 在整个生命周期持有外部 runtime 共享租约。`reclaim_generation()` 取得排他租约后，校验当前库可用、回收目标是有效的旧代际且只包含该代际的数据库制品，然后删除旧目录。
+`publish_current()` 在切换前验证 manifest、文件校验和、代际 ID 与节点数，然后写入并同步临时文件、替换指针、同步父目录。发布阶段返回 `not_committed` 表示指针替换尚未完成。返回 `unknown` 时，指针已对当前读者可见，调用方可通过 `resolve_current()` 核对目标代际。
+
+`open_current()` 在解析 current 与获取代际共享租约期间持有管理共享锁，避免与切代或回收竞态。`GenerationReader` 在整个生命周期持有外部 runtime 共享租约。`reclaim_generation()` 取得排他租约后，校验当前库可用、回收目标是有效的旧代际且只包含该代际的数据库制品，然后删除旧目录。
+
+回收期间，库根目录保存旧代际的制品清单，并将已校验的目录原子移入回收区。文件被占用时，释放句柄后可用同一代际 ID 重试。回收完成后该名称可再次使用。`.tdb-reclaim-` 前缀由代际管理器保留。
 
 租约写入独立 runtime 目录，generation root 保持只读。默认 runtime 位于系统临时目录的 `triviumdb-runtime/store-<hash>`，也可使用 `GenerationStore::with_runtime_dir(root, runtime_dir)` 指定可写位置。
 
@@ -603,7 +611,7 @@ db.link(1, 2, "knows", 0.95)?;
 
 ### 精确边读取与 Upsert
 
-边的唯一键是 `(src, dst, label)`。`get_edge/getEdge` 精确读取单边；`upsert_edge/upsertEdge` 创建或覆盖 `weight` 与任意 JSON `metadata`；`update_edge/updateEdge` 只更新已存在边的指定字段。边元数据会贯穿 WAL、v7 `.tdb` 文件、迁移和各语言绑定。
+边的唯一键是 `(src, dst, label)`。`get_edge/getEdge` 精确读取单边；`upsert_edge/upsertEdge` 创建或覆盖 `weight` 与任意 JSON `metadata`；`update_edge/updateEdge` 只更新已存在边的指定字段。省略 `metadata` 保留原值。Rust 传 `Some(Value::Null)`、Python 显式传 `None`、Node 显式传 `null` 可将元数据设为 JSON 空值。边元数据随 WAL、检查点和维度迁移持久化。
 
 ```rust
 let metadata = serde_json::json!({"confidence": 0.98});
@@ -718,6 +726,8 @@ const paths = db.reachable(1, {
 `labels=None` 或省略表示全部 label，空列表表示禁止遍历。`min_depth=0` 可让源节点作为深度 0 结果返回。三个预算分别限制访问节点、结果和扫描边；详细接口在超限时保留已完成结果并设置 `truncated=true`。
 
 `max_edges` 在读取邻接表时扣减，`traversed_edges` 包含因标签、端点或去重而舍弃的扫描记录。出边按目标 ID 和标签扫描，反向来源按源 ID 扫描。详细结果只包含预算范围内已发现的路径。
+
+Rust 与 Python 使用 `max_frontier_size`，Node.js 使用 `maxFrontierSize`。该参数限制 BFS 每层新发现的节点数，默认 10,000。Python 的 `reachable`、`reachable_detailed` 和 `query_subgraph` 均接受这个关键字，Node.js 的对应方法通过遍历选项传入。
 
 - Rust：`reachable_detailed()`、`query_subgraph()`
 - Python：`reachable_detailed()`、`query_subgraph()`
@@ -1143,6 +1153,8 @@ print(ctx.custom_data)   # Hook 注入的自定义数据
 print(ctx.aborted)       # 管线是否被 Hook 提前终止
 ```
 
+每次 Python 检索从独立的空字典开始。回调可在 `ctx["custom_data"]` 中写入 JSON 值，后续回调与返回的 `ctx.custom_data` 可读取这些值。回调属性求值失败、返回类型错误或写入无效上下文时，检索返回 `TDB_HOOK_EXECUTION`。
+
 **Node.js：**
 ```javascript
 const { hits, context } = db.searchWithContext(queryVec, {
@@ -1324,6 +1336,10 @@ WITH 按行保存求值结果与实体身份，后续扩展、过滤和返回使
 MATCH 内联 `id` 和节点的 `.id` 属性使用完整无符号节点 ID；`FIND` 与 `MATCHES` 文档条件读取 Payload 字段。单跳边变量在 WHERE、RETURN、COALESCE、聚合和空值判断中保持边绑定；OPTIONAL MATCH 为符合起点条件且无合格边的记录补齐 Null 列。
 
 MATCH 按物理边保留结果行重数：不同标签的平行边分别计行，双向单跳中的同一自环计一次；属性索引与反向计划保持这一语义。路径采用显式栈执行，有边模式的节点、邻边扫描、路径展开和回溯共享 100,000 步预算，每步检查取消与期限；路径栈和 visited 集合的峰值参与工作区准入。
+
+无显式排序的 `MATCH … LIMIT/OFFSET` 从模式左端按起点 ID 升序枚举。具名边与匿名边使用相同的物理边遍历顺序。`MATCH … SET` 按赋值在语句中的书写次序处理全部匹配行。同一节点通过多个角色命中同一字段时，取最后一项适用赋值。
+
+`FIND` 中的裸字段和 `_.字段` 读取当前节点。显式变量前缀须在当前作用域内定义。`ORDER BY` 还可以引用投影列名或别名，例如 `RETURN _.nested AS picked ORDER BY picked.rank`。
 
 **Python：**
 ```python
@@ -1565,7 +1581,7 @@ print(info["property_index_format"])    # 8
 print(info["sidecars"])
 ```
 
-`tql_mut` 读查询、patch 普通对象简写、Node 数字构造参数分别返回迁移错误。Rust 同步配置通过 `Config.sync_mode` 提供。当前开发 WAL 为 v7，ReadWrite 按对应历史布局校验并原子升级 v2/v3/v4/v5/v6，流式恢复完整提交前缀。ReadOnly/Immutable 采用物理零写契约，旧格式升级由 Writer 完成。无头、未知版本及非法迁移输入返回结构化错误。
+`tql_mut` 读查询、patch 普通对象简写、Node 数字构造参数分别返回迁移错误。Rust 同步配置通过 `Config.sync_mode` 提供。当前内核校验 WAL v7 并恢复完整的已提交前缀。遇到受支持的旧格式时，普通打开返回 `TDB_MIGRATION_REQUIRED`。升级前停用来源库，使用[外部迁移工具](migration.md)核验并发布目标文件组，再以目标路径启动服务。
 
 `patch_payload`／`patchPayload` 先校验全部顶层操作符及操作数，再预览整份修改并执行写入。支持的操作符为 `$set`、`$inc` 和 `$unset`，操作数须为 JSON 对象。未知操作符或非法操作数返回 `TDB_INVALID_INPUT`，目标字段为对应的 `patch.<操作符>`，写入完成点为 `validation/not_committed`。`$inc` 成员继续执行数值类型、精确整数及溢出校验。
 
@@ -1738,7 +1754,7 @@ db.build_text_index()
 
 开发版本的 TMET v2 同时保存主文件 CRC、WAL 检查点封条和元数据 CRC。恢复先核对封条与主检查点，再划分旧删除和检查点后删除。TMET v1 的无封条文本在 ID 删除及复用造成恢复歧义时，返回 `TDB_RECOVERY_REQUIRED`，字段为 `text_index.recovery_boundary`。历史文本的必要加载与校验遵守实例和共享工作区预算。
 
-无待恢复日志的历史文本检查点在 Writer 打开时补齐封条和 TMET v2。元数据更新沿用已有文本 CRC，并按主文件绑定和原子替换完成发布。旧 WAL 的升级采用帧级及事务暂存准入，日志总量与单次恢复工作区分别计量。
+外部迁移工具在暂存副本中恢复历史 WAL 和文本检查点，并核对目标库的文本事实与索引定义。
 
 > **恢复提醒**　历史文本恢复歧义通过完整数据库备份恢复，或由宿主事实创建新库后登记正文与关键词。升级前保留完整备份，旧版本环境使用对应备份恢复。
 

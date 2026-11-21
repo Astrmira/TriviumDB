@@ -17,7 +17,13 @@ fn 精确扫描与图计算在内部检查点取消后归还资源并可重开()
         QueryExecutionStrategy::ForceSerial,
         QueryExecutionStrategy::ForceParallel,
     ] {
-        for operation in ["exact", "leiden", "pagerank", "label_propagation"] {
+        for operation in [
+            "exact",
+            "graph_first",
+            "leiden",
+            "pagerank",
+            "label_propagation",
+        ] {
             let root = TestDir::new("algorithm-cancel");
             let path = root.file("db.tdb");
             let runtime = triviumdb::ResourceRuntime::new(Default::default()).unwrap();
@@ -48,7 +54,7 @@ fn 精确扫描与图计算在内部检查点取消后归还资源并可重开()
             }
             let context = RequestContext::new("algorithm", QueryControl::default(), false).unwrap();
             let running_context = context.clone();
-            let hook = pause_at(if operation == "exact" {
+            let hook = pause_at(if matches!(operation, "exact" | "graph_first") {
                 ConcurrencyPoint::ExactScanStep
             } else {
                 ConcurrencyPoint::GraphAlgorithmIteration
@@ -57,6 +63,9 @@ fn 精确扫描与图计算在内部检查点取消后归还资源并可重开()
                 let _strategy = force_query_strategy(strategy);
                 let result = running_context.run(|| match operation {
                     "exact" => database.search_exact(&[1., 0.], 2).map(|_| ()),
+                    "graph_first" => database
+                        .search_graph_first(&[1., 0.], &[2, 3], 2, 2)
+                        .map(|_| ()),
                     "leiden" => database.leiden_cluster(1, Some(15), Some(true)).map(|_| ()),
                     _ => database.tql(&query).map(|_| ()),
                 });

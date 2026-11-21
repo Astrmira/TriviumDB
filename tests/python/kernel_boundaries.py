@@ -7,7 +7,7 @@ import triviumdb
 def expect_error(action, code):
     try:
         action()
-    except (triviumdb.TriviumDBError, triviumdb.CapacityError) as error:
+    except (triviumdb.TriviumDBError, triviumdb.CapacityError, triviumdb.InvalidInputError) as error:
         assert error.code == code
         return error
     raise AssertionError(f"必须返回结构化错误：{code}")
@@ -28,6 +28,9 @@ def run_kernel_boundaries(root):
             db.create_index("kind")
         for case in graph_contract["counts"]:
             assert [row.row for row in db.tql(case["query"])] == [{"total": case["expected"]}]
+        assert [row.row for row in db.tql(graph_contract["distinct"]["query"])] == graph_contract["distinct"]["rows"]
+    db.patch_payload(1, {"$set": {"value": 2 ** 52}})
+    expect_error(lambda: db.patch_payload(1, {"$inc": {"value": 1.5}, "$set": {"kind": "changed"}}), "TDB_INVALID_INPUT")
     for invalid in [float("nan"), float("inf"), -float("inf")]:
         for action in [
             lambda: db.search([invalid, 0], top_k=1, expand_depth=0, min_score=-1),
@@ -40,6 +43,7 @@ def run_kernel_boundaries(root):
     assert [hit.id for hit in db.search([1, 0], top_k=(1 << 64) - 1, expand_depth=0, min_score=-1)] == [1, 2, 3]
     db.close()
     reader = triviumdb.TriviumDB(file, dim=2, access_mode="read_only")
+    assert reader.get_payload(1) == {"value": 2 ** 52, "kind": "source"}
     for case in graph_contract["counts"]:
         assert [row.row for row in reader.tql(case["query"])] == [{"total": case["expected"]}]
     reader.close()

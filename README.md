@@ -5,7 +5,7 @@
 <div align="center">
 
 <!-- 动态打字效果 Slogan -->
-<a href="https://github.com/YoKONCy/TriviumDB">
+<a href="https://github.com/Astrmira/TriviumDB">
   <img src="https://readme-typing-svg.demolab.com?font=Noto+Serif+SC&weight=600&size=24&duration=4000&pause=1000&color=1E90FF&center=true&vCenter=true&multiline=true&repeat=false&width=800&height=70&lines=%E4%B8%89%E4%BD%8D%E4%B8%80%E4%BD%93%E7%9A%84+AI+%E5%8E%9F%E7%94%9F%E5%B5%8C%E5%85%A5%E5%BC%8F%E6%95%B0%E6%8D%AE%E5%BA%93;%E5%90%91%E9%87%8F+%C3%97+%E5%9B%BE%E8%B0%B1+%C3%97+%E5%85%B3%E7%B3%BB%E5%9E%8B;%E4%B8%BA+Agent+%E6%89%93%E9%80%A0%E7%9A%84%E9%AB%98%E6%80%A7%E8%83%BD%E8%AE%B0%E5%BF%86%E6%A0%B8%E5%BF%83" alt="Slogan" />
 </a>
 
@@ -24,12 +24,13 @@
 [![Rust](https://img.shields.io/badge/Rust-stable-orange?logo=rust)](https://www.rust-lang.org/)
 [![Python 3.9–3.12](https://img.shields.io/badge/Python-3.9%E2%80%933.12-blue?logo=python)](https://pypi.org/)
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![arXiv](https://img.shields.io/badge/arXiv-2605.02171-b31b1b.svg)](https://arxiv.org/abs/2605.02171)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/YoKONCy/TriviumDB)
+[![QuIVer arXiv](https://img.shields.io/badge/QuIVer%20arXiv-2605.02171-b31b1b.svg)](https://arxiv.org/abs/2605.02171)
+[![Pelorus arXiv](https://img.shields.io/badge/Pelorus%20arXiv-2611.22159-b31b1b.svg)](https://arxiv.org/abs/2611.22159)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Astrmira/TriviumDB)
 
 **中文** | [**English**](README_EN.md)
 
-当前预发布版本为 **0.9.3-beta.1**，新增可选的 Pelorus 双曲向量检索、QuIVer SSD 请求级 I/O 计量，并改进检查点恢复和图查询预算。Python 版本为 `0.9.3b1`，npm 使用 `beta` 通道。完整变更与升级步骤见[双语发布说明](docs/changes/0.9.3-beta.1.md)。
+当前正式版本为 **0.9.3**，提供可选的 Pelorus 双曲检索和 QuIVer SSD 请求级 I/O 计量，并改进 WAL 恢复、TQL 查询与图预算。完整变更、Rust 接口调整及升级步骤见[双语发布说明](docs/changes/0.9.3.md)。
 
 SDK 的支持范围见 [SDK 正式接口清单](docs/sdk-contract.md)，历史磁盘格式通过[外部迁移工具](docs/migration.md)升级。
 
@@ -160,13 +161,13 @@ flowchart TD
 推荐使用超快的 [uv](https://github.com/astral-sh/uv) （只需毫秒级）：
 
 ```bash
-uv pip install "triviumdb==0.9.3b1"
+uv pip install "triviumdb==0.9.3"
 ```
 
 或者使用传统 pip：
 
 ```bash
-pip install "triviumdb==0.9.3b1"
+pip install "triviumdb==0.9.3"
 ```
 
 ### 🌐 Node.js / 前端用户
@@ -174,9 +175,9 @@ pip install "triviumdb==0.9.3b1"
 跨平台包已自带 `*.node` 预编译拓展，并含有完整的 TypeScript 补全：
 
 ```bash
-npm install triviumdb@0.9.3-beta.1
+npm install triviumdb@0.9.3
 # 或者
-pnpm add triviumdb@0.9.3-beta.1
+pnpm add triviumdb@0.9.3
 ```
 
 ### 🦀 Rust 原生用户
@@ -184,10 +185,10 @@ pnpm add triviumdb@0.9.3-beta.1
 直接把我们当成 Library 依赖：
 
 ```bash
-cargo add triviumdb@0.9.3-beta.1
+cargo add triviumdb@0.9.3
 ```
 
-本页示例使用 `0.9.3-beta.1`。采用当前格式的 0.9.2 数据库可直接打开。打开时若返回 `TDB_MIGRATION_REQUIRED`，按[外部迁移指南](docs/migration.md)创建并核验目标库。
+本页示例使用 `0.9.3`。采用当前格式的 0.9.2 和 0.9.3-beta.1 数据库可直接打开。打开时若返回 `TDB_MIGRATION_REQUIRED`，按[外部迁移指南](docs/migration.md)创建并核验目标库。
 
 需要为嵌入式应用提供管理前端时，按[Console 宿主接入](docs/embedded-console.md)复用同一实例和文件锁；现有 HTML 仍需前端传输适配，资源包会标明这一条件及 CDN 依赖。
 
@@ -439,6 +440,8 @@ ORDER BY score DESC, id
 
 构建步骤、精确检索选项和 Hot／Mmap／SSD 驻留配置见 [Pelorus 使用说明](docs/pelorus.md)。
 
+[Pelorus 论文（arXiv）](https://arxiv.org/abs/2611.22159) · [Pelorus 源码仓库（GitHub）](https://github.com/Astrmira/Pelorus)
+
 ---
 
 ## 混合检索与研究边界
@@ -625,11 +628,23 @@ TriviumDB 的认知检索管线借鉴并实现了以下学术成果（均为本�
 
 ```bibtex
 @article{quiver2026,
-  title   = {QuIVer: Rethinking ANN Graph Topology via Training-Free Binary Quantization},
-  author  = {Xiao, Wenxuan and Wang, Zhiyou and Li, Chengcheng},
+  title   = {{QuIVer}: Efficient Graph Indexing with Two-Bit Construction and Navigation},
+  author  = {Xiao, Wenxuan and Zhu, Peidong and Li, Chengcheng and Cao, Xu},
   journal = {arXiv preprint arXiv:2605.02171},
   year    = {2026},
   url     = {https://arxiv.org/abs/2605.02171}
+}
+```
+
+### 📝 引用 Pelorus
+
+```bibtex
+@article{pelorus2026,
+  title   = {{Pelorus}: Warped-Product Graph Indexing for Hyperbolic Vector Search},
+  author  = {Xiao, Wenxuan and Cao, Xu},
+  journal = {arXiv preprint arXiv:2611.22159},
+  year    = {2026},
+  url     = {https://arxiv.org/abs/2611.22159}
 }
 ```
 
@@ -651,7 +666,7 @@ Apache-2.0
 
 ## 🌟 Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=YoKONCy/TriviumDB&type=Date)](https://star-history.com/#YoKONCy/TriviumDB&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=Astrmira/TriviumDB&type=Date)](https://star-history.com/#Astrmira/TriviumDB&Date)
 
 <br/>
 

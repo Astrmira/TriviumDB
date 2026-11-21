@@ -1,6 +1,6 @@
 # 嵌入式 Console 宿主接入
 
-> 本文说明 `0.9.3-beta.1` 嵌入式 Console 的宿主协议、权限、文件锁、生命周期和前端接入。版本记录见[变更说明](changes/0.9.3-beta.1.md)。
+> 本文说明 `0.9.3` 嵌入式 Console 的宿主协议、权限、文件锁、生命周期和前端接入。版本记录见[变更说明](changes/0.9.3.md)。
 
 ---
 
@@ -166,6 +166,8 @@ Python/Node 提供同步 JSON 调用入口。HTTP 或 IPC 包装、端口监听�
 | `maxOperations` | `1000` | `1..=1000`，限制读取工作集行数、批量记录、写计划、显式 `topK` 及图预算 |
 | `queryTimeoutMs` | `30000` | `1..=300000`，单位为毫秒；受外部 deadline 约束 |
 
+`edges` 在复制结果前检查实际需要读取的邻接表。查询入边时，预算覆盖来源节点中需要检查的全部出边。`path` 分别限制已发现节点数与已扫描原始边数，标签过滤前扫描的边也计入预算。超限由当前请求返回 `QueueFull`，详情字段 `resource` 为 `console_operations`。
+
 `features` 控制宿主开放的操作入口。例如开放 `query` 后，读 TQL 可以包含向量和图算子。只读权限由会话与内核共同执行。
 
 > **权限提醒**：表级、算子级或更细粒度的数据权限由宿主控制，包括限制可执行查询。
@@ -194,7 +196,7 @@ Python/Node 提供同步 JSON 调用入口。HTTP 或 IPC 包装、端口监听�
 }
 ```
 
-上面的写入要求宿主显式使用 `{"readOnly":false}`。协议显式节点 ID 字段以十进制字符串传入和返回，避免 JavaScript 精度丢失；TQL 整数字面量由内核解析，parameters 保留 TQL 的原生 JSON 参数规则。u64 向量分量以十进制字符串返回，大整数输入也必须使用字符串；f32/f16 向量使用 JSON 数字，入站统一经过内核 f32 转换通道，f16 再按 half 舍入；出站返回实际数值。Payload 保持 JSON 类型。
+上面的写入要求宿主显式使用 `{"readOnly":false}`。协议显式节点 ID 字段以十进制字符串传入和返回，避免 JavaScript 精度丢失。TQL 整数字面量由内核解析，parameters 保留 TQL 的原生 JSON 参数规则。u64 向量分量以十进制字符串返回，大整数输入也必须使用字符串。f32/f16 向量使用 JSON 数字，内核将解析后的数值直接舍入到目标 dtype，读取时返回实际存储值。Payload 保持 JSON 类型。
 
 > **精度提醒**：Payload 或参数包含大整数时，前端应采用无损 JSON 编解码。
 
@@ -206,7 +208,7 @@ Python/Node 提供同步 JSON 调用入口。HTTP 或 IPC 包装、端口监听�
 
 `linkFromInsert` 接收 `insertIndex`、`target`、`label`、`weight` 和可选 `metadata`。`insertIndex` 是本事务此前插入操作的零起点序号，包含显式 ID 和自动 ID 插入。Core 在事务写锁内解析真实源 ID，并按当前投影验证端点和权重；将节点插入放在连边之前，可引用本批后续记录。Rust 的 `Transaction`／`TxBuilder` 提供对应的 `upsert_edge_from_insert()`，Python／Node 通过相同的 Console 请求使用。非法序号返回 `TDB_INVALID_INPUT` 并定位到 `insert_index`，失败请求按原子事务规则处理。
 
-本协议复用内核默认排序、事务、持久化和关闭语义。读取行工作集预算取数据库与 maxOperations 的较小有效值，超限明确拒绝，不返回静默截断结果。写计划按模式每行的操作上界约束匹配集，在匹配集和写向量物化前准入，复杂模式可能需要拆分批次；确认响应预算在 WAL 前检查。TQL 读取与写计划可协作取消，已经开始的提交遵循原子完成语义。
+本协议复用内核默认排序、事务、持久化和关闭语义。`info` 响应的 `data.limits.maxQueryRows` 给出数据库与会话共同允许的读取行数。显式分页按 `LIMIT + OFFSET` 准入，超额返回 `TDB_QUERY_BUDGET`。写计划按模式每行的操作上界约束匹配集，在物化匹配集和写向量前校验额度。复杂模式可拆分批次。确认响应预算在写 WAL 前检查。TQL 读取与写计划支持协作取消，已经开始的提交遵循原子完成语义。
 
 Console RPC v1 使用整请求事务、全库版本校验和有界持久回执。请求与结果协议在 Rust、Python、Node 和嵌入 HTTP 之间共享。
 

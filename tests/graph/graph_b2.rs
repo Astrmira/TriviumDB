@@ -429,3 +429,98 @@ fn 公共图辅助函数拒绝虚构起点并尊重零结果上限() {
         std::collections::HashMap::from([(7, 0)])
     );
 }
+
+#[test]
+fn 双向直连路径只计两个不同的节点() {
+    let mut mt = triviumdb::storage::memtable::MemTable::<f32>::new(1);
+    for id in [1, 2] {
+        mt.insert_with_id(id, &[1.], serde_json::Value::Null)
+            .unwrap();
+    }
+    mt.link(1, 2, "r".into(), 1.).unwrap();
+    let budget = TraversalBudget {
+        max_visited_nodes: 2,
+        ..generous_budget()
+    };
+    let result =
+        triviumdb::graph::pathfinding::shortest_path_bidirectional(&mt, 1, 2, None, &budget)
+            .unwrap();
+    assert_eq!(result.path, Some(vec![1, 2]));
+    assert_eq!(result.metrics.visited_nodes, 2);
+    assert!(!result.truncated);
+}
+
+#[test]
+fn 串行和分层并行遍历按单层宽度准入() {
+    use triviumdb::graph::reachability::{
+        ReachabilityConfig, traverse_compact, traverse_compact_parallel,
+    };
+    let mut mt = triviumdb::storage::memtable::MemTable::<f32>::new(1);
+    for id in 1..=5 {
+        mt.insert_with_id(id, &[1.], serde_json::Value::Null)
+            .unwrap();
+    }
+    for (src, dst) in [(1, 2), (1, 3), (2, 4), (2, 5)] {
+        mt.link(src, dst, "r".into(), 1.).unwrap();
+    }
+    let config = ReachabilityConfig {
+        max_depth: 2,
+        max_frontier_size: 2,
+        ..Default::default()
+    };
+    for traversal in [traverse_compact, traverse_compact_parallel] {
+        let results = traversal(&mt, 1, &config).unwrap().results;
+        assert_eq!(
+            results
+                .iter()
+                .map(|hit| (hit.target_id, hit.depth))
+                .collect::<Vec<_>>(),
+            [(2, 1), (3, 1), (4, 2), (5, 2)]
+        );
+    }
+}
+
+#[test]
+fn 诱导图按平行物理边分配权重并拒绝缺失成员() {
+    use triviumdb::graph::subset::*;
+    let mut mt = triviumdb::storage::memtable::MemTable::<f32>::new(1);
+    for id in 1..=3 {
+        mt.insert_with_id(id, &[1.], serde_json::Value::Null)
+            .unwrap();
+    }
+    for (dst, label) in [(2, "a"), (2, "b"), (3, "b")] {
+        mt.link(1, dst, label.into(), 1.).unwrap();
+    }
+    let members = [1, 2, 3].into();
+    for rank in [subset_pagerank, subset_pagerank_parallel] {
+        let result = rank(
+            &mt,
+            &members,
+            SubsetPageRankConfig {
+                damping: 0.75,
+                max_iterations: 1,
+                ..Default::default()
+            },
+            None,
+            3,
+        )
+        .unwrap();
+        let scores: std::collections::BTreeMap<_, _> = result.scores.into_iter().collect();
+        for (id, score) in [(1, 0.25), (2, 5. / 12.), (3, 1. / 3.)] {
+            assert!((scores[&id] - score).abs() < 1e-12);
+        }
+        assert!(matches!(
+            rank(&mt, &[900].into(), Default::default(), None, 3),
+            Err(TriviumError::NodeNotFound(900))
+        ));
+    }
+    for degree in [subset_degree_centrality, subset_degree_centrality_parallel] {
+        let (rows, _) = degree(&mt, &members, None, 3).unwrap();
+        assert_eq!(
+            rows.into_iter()
+                .map(|r| (r.id, r.normalized))
+                .collect::<Vec<_>>(),
+            [(1, 1.5), (2, 1.), (3, 0.5)]
+        );
+    }
+}

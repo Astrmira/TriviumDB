@@ -11,6 +11,16 @@ use super::types::{PyEdge, PyIncomingEdge, PyReachabilityResult, to_py_reachabil
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
+// PyO3 的 Option 同时接受省略和 None；局部更新需要保留这两种语义。
+#[derive(Default)]
+struct EdgeMetadata<'py>(Option<Bound<'py, PyAny>>);
+
+impl<'py> FromPyObject<'py> for EdgeMetadata<'py> {
+    fn extract_bound(value: &Bound<'py, PyAny>) -> PyResult<Self> {
+        Ok(Self(Some(value.clone())))
+    }
+}
+
 #[pymethods]
 impl PyTriviumDB {
     #[pyo3(signature = (src, dst, label=string_argument("related"), weight=float_argument(1.0)), text_signature="($self, src, dst, label='related', weight=1.0)")]
@@ -79,14 +89,14 @@ impl PyTriviumDB {
             .map_err(to_py_error)
     }
 
-    #[pyo3(signature = (src, dst, label, weight=None, metadata=None))]
+    #[pyo3(signature = (src, dst, label, weight=None, metadata=EdgeMetadata::default()), text_signature="($self, src, dst, label, weight=None, metadata=...)")]
     fn update_edge(
         slf: &Bound<'_, Self>,
         src: Bound<'_, PyAny>,
         dst: Bound<'_, PyAny>,
         label: Bound<'_, PyAny>,
         weight: Option<Bound<'_, PyAny>>,
-        metadata: Option<&Bound<'_, PyAny>>,
+        metadata: EdgeMetadata<'_>,
     ) -> PyResult<()> {
         let (_request, mut borrowed) = database_write(slf).map_err(write_admission_error)?;
         let this = &mut *borrowed;
@@ -101,7 +111,7 @@ impl PyTriviumDB {
             dst,
             &label,
             weight,
-            metadata.map(|value| write_json(value, "metadata")).transpose()?,
+            metadata.0.as_ref().map(|value| write_json(value, "metadata")).transpose()?,
         ))
         .map_err(to_py_error)
     }
@@ -200,7 +210,7 @@ impl PyTriviumDB {
         })
     }
 
-    #[pyo3(signature = (id, min_depth=integer_argument(1), max_depth=integer_argument(1), labels=None, direction=string_argument("outgoing"), max_visited_nodes=integer_argument(10_000), max_results=integer_argument(10_000), max_edges=integer_argument(50_000)), text_signature="($self, id, min_depth=1, max_depth=1, labels=None, direction='outgoing', max_visited_nodes=10000, max_results=10000, max_edges=50000)")]
+    #[pyo3(signature = (id, min_depth=integer_argument(1), max_depth=integer_argument(1), labels=None, direction=string_argument("outgoing"), max_visited_nodes=integer_argument(10_000), max_results=integer_argument(10_000), max_edges=integer_argument(50_000), max_frontier_size=integer_argument(10_000)), text_signature="($self, id, min_depth=1, max_depth=1, labels=None, direction='outgoing', max_visited_nodes=10000, max_results=10000, max_edges=50000, max_frontier_size=10000)")]
     fn reachable(
         slf: &Bound<'_, Self>,
         py: Python<'_>,
@@ -212,6 +222,7 @@ impl PyTriviumDB {
         max_visited_nodes: Py<PyAny>,
         max_results: Py<PyAny>,
         max_edges: Py<PyAny>,
+        max_frontier_size: Py<PyAny>,
     ) -> PyResult<Vec<PyReachabilityResult>> {
         let (_request, borrowed) = database_read(slf)?;
         let this = &*borrowed;
@@ -222,6 +233,8 @@ impl PyTriviumDB {
             .map(|value| read_sequence(value, "labels", read_string))
             .transpose()?;
         let direction: String = extract_argument(py, direction.bind(py), "direction", None)?;
+        let max_frontier_size =
+            extract_argument(py, max_frontier_size.bind(py), "max_frontier_size", None)?;
         let max_visited_nodes =
             extract_argument(py, max_visited_nodes.bind(py), "max_visited_nodes", None)?;
         let max_results = extract_argument(py, max_results.bind(py), "max_results", None)?;
@@ -246,7 +259,7 @@ impl PyTriviumDB {
             max_visited_nodes,
             max_results,
             max_edges,
-            max_frontier_size: 10_000,
+            max_frontier_size,
             exhaustion_policy: crate::graph::budget::BudgetExhaustionPolicy::Partial,
         };
         dispatch!(this, db => db.reachable(id, &config))
@@ -259,7 +272,7 @@ impl PyTriviumDB {
             .map_err(to_py_error)?
     }
 
-    #[pyo3(signature = (id, min_depth=integer_argument(1), max_depth=integer_argument(1), labels=None, direction=string_argument("outgoing"), max_visited_nodes=integer_argument(10_000), max_results=integer_argument(10_000), max_edges=integer_argument(50_000)), text_signature="($self, id, min_depth=1, max_depth=1, labels=None, direction='outgoing', max_visited_nodes=10000, max_results=10000, max_edges=50000)")]
+    #[pyo3(signature = (id, min_depth=integer_argument(1), max_depth=integer_argument(1), labels=None, direction=string_argument("outgoing"), max_visited_nodes=integer_argument(10_000), max_results=integer_argument(10_000), max_edges=integer_argument(50_000), max_frontier_size=integer_argument(10_000)), text_signature="($self, id, min_depth=1, max_depth=1, labels=None, direction='outgoing', max_visited_nodes=10000, max_results=10000, max_edges=50000, max_frontier_size=10000)")]
     fn reachable_detailed(
         slf: &Bound<'_, Self>,
         py: Python<'_>,
@@ -271,6 +284,7 @@ impl PyTriviumDB {
         max_visited_nodes: Py<PyAny>,
         max_results: Py<PyAny>,
         max_edges: Py<PyAny>,
+        max_frontier_size: Py<PyAny>,
     ) -> PyResult<PyObject> {
         let (_request, borrowed) = database_read(slf)?;
         let this = &*borrowed;
@@ -281,6 +295,8 @@ impl PyTriviumDB {
             .map(|value| read_sequence(value, "labels", read_string))
             .transpose()?;
         let direction: String = extract_argument(py, direction.bind(py), "direction", None)?;
+        let max_frontier_size =
+            extract_argument(py, max_frontier_size.bind(py), "max_frontier_size", None)?;
         let max_visited_nodes =
             extract_argument(py, max_visited_nodes.bind(py), "max_visited_nodes", None)?;
         let max_results = extract_argument(py, max_results.bind(py), "max_results", None)?;
@@ -305,7 +321,7 @@ impl PyTriviumDB {
             max_visited_nodes,
             max_results,
             max_edges,
-            max_frontier_size: 10_000,
+            max_frontier_size,
             exhaustion_policy: crate::graph::budget::BudgetExhaustionPolicy::Partial,
         };
         let output =
@@ -315,7 +331,7 @@ impl PyTriviumDB {
         json_to_pyobject(py, &value)
     }
 
-    #[pyo3(signature = (id, min_depth=integer_argument(1), max_depth=integer_argument(1), labels=None, direction=string_argument("outgoing"), max_visited_nodes=integer_argument(10_000), max_results=integer_argument(10_000), max_edges=integer_argument(50_000)), text_signature="($self, id, min_depth=1, max_depth=1, labels=None, direction='outgoing', max_visited_nodes=10000, max_results=10000, max_edges=50000)")]
+    #[pyo3(signature = (id, min_depth=integer_argument(1), max_depth=integer_argument(1), labels=None, direction=string_argument("outgoing"), max_visited_nodes=integer_argument(10_000), max_results=integer_argument(10_000), max_edges=integer_argument(50_000), max_frontier_size=integer_argument(10_000)), text_signature="($self, id, min_depth=1, max_depth=1, labels=None, direction='outgoing', max_visited_nodes=10000, max_results=10000, max_edges=50000, max_frontier_size=10000)")]
     fn query_subgraph(
         slf: &Bound<'_, Self>,
         py: Python<'_>,
@@ -327,6 +343,7 @@ impl PyTriviumDB {
         max_visited_nodes: Py<PyAny>,
         max_results: Py<PyAny>,
         max_edges: Py<PyAny>,
+        max_frontier_size: Py<PyAny>,
     ) -> PyResult<PyObject> {
         let (_request, borrowed) = database_read(slf)?;
         let this = &*borrowed;
@@ -337,6 +354,8 @@ impl PyTriviumDB {
             .map(|value| read_sequence(value, "labels", read_string))
             .transpose()?;
         let direction: String = extract_argument(py, direction.bind(py), "direction", None)?;
+        let max_frontier_size =
+            extract_argument(py, max_frontier_size.bind(py), "max_frontier_size", None)?;
         let max_visited_nodes =
             extract_argument(py, max_visited_nodes.bind(py), "max_visited_nodes", None)?;
         let max_results = extract_argument(py, max_results.bind(py), "max_results", None)?;
@@ -361,7 +380,7 @@ impl PyTriviumDB {
             max_visited_nodes,
             max_results,
             max_edges,
-            max_frontier_size: 10_000,
+            max_frontier_size,
             exhaustion_policy: crate::graph::budget::BudgetExhaustionPolicy::Partial,
         };
         let output = dispatch!(this, db => db.query_subgraph(id, &config)).map_err(to_py_error)?;

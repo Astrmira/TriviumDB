@@ -6,10 +6,10 @@
 
 ## 中文说明
 
-当前预发布内容见 [0.9.3-beta.1 双语发布说明](0.9.3-beta.1.md)。
+最近正式版本见 [0.9.3 双语发布说明](0.9.3.md)。
 
 ---
 
 ## English
 
-See the [0.9.3-beta.1 bilingual release notes](0.9.3-beta.1.md) for the current prerelease.
+See the [0.9.3 bilingual release notes](0.9.3.md) for the latest stable release.

@@ -223,8 +223,14 @@ fn traverse_leased<T: VectorType>(
             steps: vec![],
         });
     }
+    let mut layer = 0;
+    let mut next_width = 0usize;
     'walk: while let Some(state) = queue.pop_front() {
         let depth = state.steps.len();
+        if depth != layer {
+            layer = depth;
+            next_width = 0;
+        }
         if depth >= config.max_depth {
             continue;
         }
@@ -247,6 +253,19 @@ fn traverse_leased<T: VectorType>(
                         visited_nodes: best_depth.len(),
                         examined_edges: traversed_edges,
                         peak_frontier_size,
+                        depth_reached,
+                    },
+                )?;
+                break 'walk;
+            }
+            if next_width >= config.max_frontier_size {
+                truncated = exhausted(
+                    &budget,
+                    BudgetDimension::FrontierSize,
+                    TraversalMetrics {
+                        visited_nodes: best_depth.len(),
+                        examined_edges: traversed_edges,
+                        peak_frontier_size: peak_frontier_size.max(next_width),
                         depth_reached,
                     },
                 )?;
@@ -292,19 +311,7 @@ fn traverse_leased<T: VectorType>(
                     steps: steps.clone(),
                 });
             }
-            if queue.len() >= config.max_frontier_size {
-                truncated = exhausted(
-                    &budget,
-                    BudgetDimension::FrontierSize,
-                    TraversalMetrics {
-                        visited_nodes: best_depth.len(),
-                        examined_edges: traversed_edges,
-                        peak_frontier_size: peak_frontier_size.max(queue.len()),
-                        depth_reached,
-                    },
-                )?;
-                break 'walk;
-            }
+            next_width += 1;
             queue.push_back(PathState {
                 node: step.to,
                 path,
@@ -312,7 +319,7 @@ fn traverse_leased<T: VectorType>(
                 heap_bytes,
                 _workspace: workspace,
             });
-            peak_frontier_size = peak_frontier_size.max(queue.len());
+            peak_frontier_size = peak_frontier_size.max(next_width);
         }
         if collected.truncated {
             truncated = exhausted(
@@ -386,7 +393,13 @@ pub(crate) fn traverse_compact_with_edge_budget<T: VectorType>(
         });
     }
     let mut traversed_edges = 0usize;
+    let mut layer = 0;
+    let mut next_width = 0usize;
     while let Some((current, depth)) = queue.pop_front() {
+        if depth != layer {
+            layer = depth;
+            next_width = 0;
+        }
         crate::graph::budget::check_control(&control)?;
         if depth >= config.max_depth {
             continue;
@@ -426,11 +439,12 @@ pub(crate) fn traverse_compact_with_edge_budget<T: VectorType>(
                     depth: next_depth,
                 });
             }
-            if queue.len() >= config.max_frontier_size {
+            if next_width >= config.max_frontier_size {
                 return Err(TriviumError::QueryExecution(
                     "图扩展前沿超过预算 (Graph expansion frontier budget exceeded)".into(),
                 ));
             }
+            next_width += 1;
             queue.push_back((target, next_depth));
         }
     }

@@ -63,6 +63,13 @@ fn 属性索引与反转计划保持平行边的完整行重数() {
                     "{mode:?}/{phase}/{case}"
                 );
             }
+            let case = &contract["distinct"];
+            let rows = db.tql(case["query"].as_str().unwrap()).unwrap();
+            let values: Vec<_> = rows
+                .iter()
+                .map(|row| json!({"x":number(&row["x"]), "y":number(&row["y"])}))
+                .collect();
+            assert_eq!(json!(values), case["rows"]);
         }
         db.close().unwrap();
     }
@@ -158,6 +165,85 @@ fn chain(length: u64, branches: bool) -> MemTable<f32> {
         }
     }
     mt
+}
+
+#[test]
+fn 轻量计数在重开后保持行重数且不读取正文() {
+    let root = TestDir::new("cold_count");
+    let path = root.file("data.tdb");
+    let config = Config {
+        dim: 1,
+        storage_mode: StorageMode::Mmap,
+        payload_cache_bytes: 0,
+        auto_build_quiver: false,
+        ..Default::default()
+    };
+    let mut db = Database::<f32>::open_with_config(&path, config).unwrap();
+    for id in 1..=8 {
+        db.insert_with_id(id, &[1.], json!("x".repeat(32768)))
+            .unwrap();
+    }
+    db.link(1, 2, "red", 1.).unwrap();
+    db.link(1, 2, "blue", 1.).unwrap();
+    db.close().unwrap();
+    let db = Database::<f32>::open_with_config(
+        &path,
+        Config {
+            memory_limit: 2400 * 1024,
+            ..config
+        },
+    )
+    .unwrap();
+    let before = db.payload_memory_stats();
+    for (query, expected) in [
+        ("MATCH (n) RETURN COUNT(*) AS total", 8),
+        (
+            "MATCH (a)-[e]->(b) RETURN COUNT(*) AS total ORDER BY total",
+            2,
+        ),
+        ("OPTIONAL MATCH (a)-[e]->(b) RETURN COUNT(*) AS total", 9),
+    ] {
+        let rows = db.tql(query).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(number(&rows[0]["total"]), expected);
+    }
+    let after = db.payload_memory_stats();
+    assert_eq!(
+        (after.payload_lookups, after.payload_parsed_bytes),
+        (before.payload_lookups, before.payload_parsed_bytes)
+    );
+}
+
+#[test]
+fn 兼容节点接口区分同函数的多个聚合列() {
+    let root = TestDir::new("aggregate_columns");
+    let mut db = Database::<f32>::open(&root.file("data.tdb"), 1).unwrap();
+    db.insert_with_id(1, &[1.], json!({})).unwrap();
+    let rows = db
+        .tql_nodes("MATCH (n) RETURN COUNT(*), COUNT(n.missing)")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].len(), 2);
+    for (key, value) in [("Count(*)", 1), ("Count(n.missing)", 0)] {
+        assert_eq!(rows[0][key].payload[key], value);
+    }
+}
+
+#[test]
+fn 数值减法与行注释支持不同空白形式() {
+    let root = TestDir::new("expression_spacing");
+    let mut db = Database::<f32>::open(&root.file("data.tdb"), 1).unwrap();
+    db.insert_with_id(1, &[1.], json!({"rank":3})).unwrap();
+    for newline in ["\r", "\r\n", "\n"] {
+        for expr in ["3-1", "3 -1", "3- 1", "n.rank-1", "3+-1"] {
+            let query = format!("MATCH (n) -- 注释{newline}RETURN {expr} AS result");
+            assert_eq!(number(&db.tql(&query).unwrap()[0]["result"]), 2);
+        }
+    }
+    let rows = db
+        .tql("MATCH (n) RETURN -9223372036854775808 AS result")
+        .unwrap();
+    assert!(matches!(rows[0]["result"], TqlValue::Int(i64::MIN)));
 }
 
 #[test]
@@ -306,4 +392,121 @@ fn 路径已经开始展开后取消和期限耗尽仍会终止执行() {
             }
         );
     }
+}
+
+#[test]
+fn 同一数据的向量过滤与范围分页在建索引和重开后保持结果() {
+    for mode in [StorageMode::Mmap, StorageMode::Rom] {
+        let root = TestDir::new("filtered_pages");
+        let path = root.file("data.tdb");
+        let config = Config {
+            dim: 2,
+            storage_mode: mode,
+            auto_build_quiver: false,
+            ..Default::default()
+        };
+        let mut db = Database::<f32>::open_with_config(&path, config).unwrap();
+        for (id, v, cat, x) in [
+            (1, [1., 0.], "a", 40),
+            (2, [0.8, 0.6], "a", 30),
+            (3, [0., 1.], "b", 20),
+            (4, [-1., 0.], "b", 10),
+        ] {
+            db.insert_with_id(id, &v, json!({"cat":cat,"x":x})).unwrap();
+        }
+        for phase in 0..3 {
+            if phase == 1 {
+                db.create_index("cat").unwrap();
+                db.create_ordered_index("x").unwrap();
+            }
+            if phase == 2 {
+                db.close().unwrap();
+                db = Database::open_read_only(&path, 2).unwrap();
+            }
+            for (query, expected) in [
+                (
+                    r#"SEARCH VECTOR [1,0] TOP 1 WHERE {cat:"b"} RETURN _.id AS id"#,
+                    vec![3],
+                ),
+                ("FIND {x:{$gt:0}} RETURN _.id AS id LIMIT 2", vec![1, 2]),
+                (
+                    "FIND {x:{$gt:0}} RETURN _.id AS id LIMIT 2 OFFSET 2",
+                    vec![3, 4],
+                ),
+                (
+                    r#"FIND {cat:"a"} RETURN _.id AS id ORDER BY _.x ASC LIMIT 1"#,
+                    vec![2],
+                ),
+            ] {
+                let ids: Vec<_> = db
+                    .tql(query)
+                    .unwrap()
+                    .iter()
+                    .map(|row| number(&row["id"]))
+                    .collect();
+                assert_eq!(ids, expected, "{mode:?}/{phase}/{query}");
+            }
+            let explanation = db
+                .tql_nodes(r#"EXPLAIN SEARCH VECTOR [1,0] TOP 1 WHERE {cat:"b"} RETURN *"#)
+                .unwrap();
+            let plan = &explanation[0]["plan"].payload;
+            assert_eq!(plan["filter_before_top_k"], true);
+            assert_eq!(plan["vector_access_path"], "exact_fallback");
+            assert_eq!(
+                plan["access_path"]["kind"],
+                if phase == 0 {
+                    "full_node_scan"
+                } else {
+                    "property_index"
+                }
+            );
+        }
+        db.close().unwrap();
+    }
+}
+
+#[test]
+fn 匹配写按目标计数并在创建任何实体前拒绝无效输入() {
+    let root = TestDir::new("matched-write-targets");
+    let path = root.file("data.tdb");
+    let mut db = Database::<f32>::open(&path, 2).unwrap();
+    for id in 1..=4 {
+        db.insert_with_id(id, &[1., 0.], json!({"n":id})).unwrap();
+    }
+    for id in 2..=4 {
+        db.link(1, id, "r", 1.).unwrap();
+    }
+    let changed = db
+        .tql_mut("MATCH (a)-[:r]->(b) SET VECTOR(a) == [0,1]")
+        .unwrap();
+    assert_eq!(changed.affected, 1);
+    for query in [
+        r#"MATCH (a {id:1}) CREATE (a {newkey:"x"})-[:q]->(z {x:9})"#,
+        r#"MATCH (a {id:99}) CREATE (a {newkey:"x"})-[:q]->(z {x:9})"#,
+        "CREATE (a {first:1 second:[2,3]})",
+        "CREATE (a {first:1,second:[2 3]})",
+    ] {
+        assert!(db.tql_mut(query).is_err(), "{query}");
+    }
+    db.close().unwrap();
+    let db = Database::<f32>::open_read_only(&path, 2).unwrap();
+    assert_eq!(db.all_node_ids().unwrap(), [1, 2, 3, 4]);
+    let node = db.get(1).unwrap().unwrap();
+    assert_eq!(node.vector, [0., 1.]);
+    assert_eq!(node.payload, json!({"n":1}));
+    assert_eq!(
+        node.edges
+            .iter()
+            .map(|e| (e.target_id, e.label.as_str()))
+            .collect::<Vec<_>>(),
+        [(2, "r"), (3, "r"), (4, "r")]
+    );
+}
+
+#[test]
+fn 深链路径只产出指定深度的完整节点序列() {
+    let mt = chain(2048, false);
+    let paths =
+        triviumdb::graph::pathfinding::variable_length_paths(&mt, 1, 2048, 2048, Some("next"), 1);
+    assert_eq!(paths, [(2049, (1..=2049).collect::<Vec<_>>())]);
 }

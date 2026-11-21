@@ -1,6 +1,6 @@
 # TriviumDB
 
-Current stable release is 0.9.1 across Rust, Python, Node.js, CLI, and Server source. Full bilingual release notes are available at https://github.com/YoKONCy/TriviumDB/blob/master/docs/changes/0.9.1.md . Frozen ICDE measurements and source identities are available at https://github.com/YoKONCy/TriviumDB/tree/master/evaluation .
+The latest stable release is [0.9.3](https://github.com/Astrmira/TriviumDB/releases/tag/v0.9.3). The [ICDE evaluation archive](https://github.com/Astrmira/TriviumDB/tree/master/evaluation) contains frozen measurements and source identities.
 
 Document APIs provide source revisions, logical blocks, grouped text/vector/hybrid retrieval, phrase and proximity evidence, parser mappings, and staged publication. DOCUMENTS sources and GRAPH scopes integrate documents and named graphs into TQL, Prepared queries, and Planner. QuIVer offers centered INT8/INT4 reranking, FP32/INT8/INT4 query representations, SSD/Hot residency, byte-bounded caches, native I/O, and aligned window reuse. Document ANN can select compressed reranking per request. Rust, Python, and Node share Core semantics.
 
@@ -22,17 +22,18 @@ TriviumDB runs inside the host application. Applications use it for AI agent mem
 
 ## Documentation
 
-- [English overview](https://raw.githubusercontent.com/YoKONCy/TriviumDB/master/README_EN.md): Product overview, installation, examples, and usage patterns.
-- [Chinese overview](https://raw.githubusercontent.com/YoKONCy/TriviumDB/master/README.md): Chinese product overview, installation, and examples.
-- [API reference](https://raw.githubusercontent.com/YoKONCy/TriviumDB/master/docs/api-reference.md): Rust, Python, and Node.js APIs, configuration, parameters, and return values.
-- [TQL reference](https://raw.githubusercontent.com/YoKONCy/TriviumDB/master/docs/tql-reference.md): Unified Cascades planning, cross-model query syntax, pipeline operators, graph algorithms, and data mutations.
-- [Features](https://raw.githubusercontent.com/YoKONCy/TriviumDB/master/docs/features.md): Native tri-model data model, shared storage kernel, indexing, transactions, and retrieval capabilities.
-- [QuIVer vector index](https://raw.githubusercontent.com/YoKONCy/TriviumDB/master/docs/quiver.md): Quantized graph navigation, vector reranking, automatic construction, and index configuration.
-- [Resource runtime](https://raw.githubusercontent.com/YoKONCy/TriviumDB/master/docs/resource-runtime.md): Shared resource budgets, thread pools, task admission, and instance diagnostics.
-- [Shutdown, snapshots, and restore](https://raw.githubusercontent.com/YoKONCy/TriviumDB/master/docs/lifecycle-snapshots.md): Instance lifecycle, consistent directory snapshots, verification, and restore.
-- [Best practices](https://raw.githubusercontent.com/YoKONCy/TriviumDB/master/docs/best-practices.md): Data modeling, application integration, retrieval patterns, and resource configuration.
+- [English overview](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/README_EN.md): Product overview, installation, examples, and usage patterns.
+- [Chinese overview](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/README.md): Chinese product overview, installation, and examples.
+- [API reference](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/api-reference.md): Rust, Python, and Node.js APIs, configuration, parameters, and return values.
+- [TQL reference](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/tql-reference.md): Unified Cascades planning, cross-model query syntax, pipeline operators, graph algorithms, and data mutations.
+- [Features](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/features.md): Native tri-model data model, shared storage kernel, indexing, transactions, and retrieval capabilities.
+- [QuIVer vector index](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/quiver.md): Quantized graph navigation, vector reranking, automatic construction, and index configuration.
+- [Pelorus hyperbolic index](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/pelorus.md): Opt-in fixed-curvature Poincaré search, graph construction, exact distance and storage residency.
+- [Resource runtime](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/resource-runtime.md): Shared resource budgets, thread pools, task admission, and instance diagnostics.
+- [Shutdown, snapshots, and restore](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/lifecycle-snapshots.md): Instance lifecycle, consistent directory snapshots, verification, and restore.
+- [Best practices](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/best-practices.md): Data modeling, application integration, retrieval patterns, and resource configuration.
 
-- [0.9.1 release notes](https://raw.githubusercontent.com/YoKONCy/TriviumDB/master/docs/changes/0.9.1.md) provide bilingual changes, format and upgrade conditions, configuration, and installation versions.
+- [Stable release notes](https://raw.githubusercontent.com/Astrmira/TriviumDB/v0.9.3/docs/changes/0.9.3.md) cover changes, compatibility, and upgrade steps in Chinese and English.
 
 ## Packages
 
@@ -42,8 +43,8 @@ TriviumDB runs inside the host application. Applications use it for AI agent mem
 
 ## Optional
 
-- [Hook guide](https://raw.githubusercontent.com/YoKONCy/TriviumDB/master/docs/hook-guide.md): Search-pipeline extensions, custom recall, reranking, and FFI integration.
-- [CLI guide](https://raw.githubusercontent.com/YoKONCy/TriviumDB/master/crates/triviumdb-cli/README.md): The tdb command-line tool, database inspection, REPL, and terminal UI.
-- [Storage integrity and concurrency](https://raw.githubusercontent.com/YoKONCy/TriviumDB/master/docs/security.md): Transaction atomicity, generation publication, concurrent access, and FFI contracts.
-- [Source repository](https://github.com/YoKONCy/TriviumDB): Rust engine, language bindings, and examples.
-- [Apache-2.0 license](https://raw.githubusercontent.com/YoKONCy/TriviumDB/master/LICENSE): Software license.
+- [Hook guide](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/hook-guide.md): Search-pipeline extensions, custom recall, reranking, and FFI integration.
+- [CLI guide](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/crates/triviumdb-cli/README.md): The tdb command-line tool, database inspection, REPL, and terminal UI.
+- [Storage integrity and concurrency](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/security.md): Transaction atomicity, generation publication, concurrent access, and FFI contracts.
+- [Source repository](https://github.com/Astrmira/TriviumDB): Rust engine, language bindings, and examples.
+- [Apache-2.0 license](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/LICENSE): Software license.

@@ -1,6 +1,6 @@
 # 外部迁移工具
 
-> 本文说明 `0.9.3-beta.1` 的外部迁移流程。`scripts/migrate.py` 调用独立的 `triviumdb-migrate` 原生执行器，在副本中恢复旧数据，核对完整事实后发布新目录。版本变更见[发布说明](changes/0.9.3-beta.1.md)。
+> 本文说明 `0.9.3` 的外部迁移流程。`scripts/migrate.py` 调用独立的 `triviumdb-migrate` 原生执行器，在副本中恢复旧数据，核对完整事实后发布新目录。版本变更见[发布说明](changes/0.9.3.md)。
 
 ---
 
@@ -22,7 +22,7 @@
 | 工具身份 | `tdb-migrate-2`，编排协议 `1` |
 | 来源 | 主格式 `5` 至 `15`，`f32`、`f16`、`u64`，Rom/Mmap |
 | 目标 | 当前主格式 `15`、文档结构 `2` 与统一 `.idx` 文件组，Rom/Mmap 可选 |
-| 数据范围 | 节点、向量位模式、Payload、默认图边及元数据、登记文本与关键词、索引定义和唯一约束、文档及上传状态、命名图、持久回执 |
+| 数据范围 | 节点、向量位模式、Payload、默认图边及元数据、登记文本与关键词、索引定义和唯一约束、文档及上传状态、命名图、持久回执、Pelorus 度量配置 |
 | 交付位置 | 新目标目录内的 `database.tdb` 及配套文件 |
 
 历史解码与来源恢复后端位于 [`crates/triviumdb-migrate/source`](../crates/triviumdb-migrate/source/Cargo.toml)，源码身份记录于 [`provenance.json`](../crates/triviumdb-migrate/source/provenance.json)。来源后端拥有独立源码与模块装配，恢复副本后通过版本化逻辑事实协议交付数据。当前内核负责目标写入及核验，生产源码维护当前格式的读取、写入和恢复。
@@ -56,7 +56,7 @@ python scripts/migrate.py --source /data/legacy.tdb --source-dtype f32 --destina
 python scripts/migrate.py --source /data/legacy.tdb --source-dtype f32 --destination /data/current --execute
 ```
 
-检查模式在目标父目录的独占临时目录完成同样的恢复、转换和内容核验，成功后清理临时副本。来源文件集合、长度和内容保持不变。执行模式在核验后发布新目录，原来源数据保留。
+检查模式在目标父目录的独占临时目录完成同样的恢复、转换和内容核验，正常返回或报错时清理本次临时副本。目标名称须避开源数据库及其保留制品（如 `old.tdb.migration`）。已有同源目标时，检查与执行都会核对请求的存储布局和迁移报告。来源文件集合、长度和内容保持不变。执行模式在核验后发布新目录，原来源数据保留。
 
 > **操作提醒**：停止持有来源的 Writer 和 ReadOnly 实例，暂停上层切换来源的任务。检查模式要求来源已经有 `.lock`；缺少时先用来源版本正常打开并关闭数据库。执行模式允许创建来源协调锁文件，数据制品仍保持不变。
 
@@ -71,6 +71,8 @@ python scripts/migrate.py --source /data/legacy.tdb --source-dtype f32 --destina
 `u64` 向量按原始整数位模式保留，浮点向量按实际 dtype 字节保留。登记文本与关键词属于持久事实，随 `.idx` 交付。压缩热内存/SSD 制品属于派生缓存，迁移目标清除旧压缩缓存；宿主按自己的编码、查询精度和缓存预算重新配置。原始向量事实始终保留。
 
 目标是普通数据库文件组。来源快照 manifest 留在来源，目标需要作为 Immutable 代际分发时，再通过当前 SDK 发布新快照或代际。
+
+当前格式的来源副本由当前内核恢复。启用了 Pelorus 的库保留曲率、导航、构建和精排配置，目标索引用恢复后的向量重建，来源和重开后的目标均核对曲率摘要。
 
 | 限制 | 默认值与行为 |
 | --- | --- |
@@ -89,9 +91,9 @@ python scripts/migrate.py --source /data/legacy.tdb --source-dtype f32 --destina
 
 迁移全程持有来源排他锁；执行模式同时持有目标父目录中的 `.<目标名>.migration.lock`。目标暂存目录保留 `owner.json`，记录工具身份、规范来源路径、目标路径和来源摘要。重试仅清理归属完全匹配、且后代均为普通文件/目录的暂存区。
 
-提交点是将已同步的候选目录原子、排他地重命名为目标目录。候选包含 `database.tdb.migration` 发布标记，普通 SDK 看到它会拒绝打开。目录发布后，工具取得目标数据库共享锁、复核制品清单、移除并同步标记，再用当前 SDK 重开核验。该顺序适配 Windows 目录重命名与文件锁规则。
+工具将已同步的候选目录原子、排他地重命名为目标目录，并在目标父目录同步成功后确认提交。候选中的 `database.tdb.migration` 标记在此期间阻止普通 SDK 打开目标。随后工具取得目标数据库共享锁、核对制品清单、发布正式报告、移除并同步标记，再用当前 SDK 重开核验。
 
-发布前中断保留来源和归属明确的暂存目录；发布后中断保留已提交目标及发布标记。使用相同来源和目标重新执行原命令，工具重新转换来源副本、核对归属和目标事实后完成确认。已经成功发布且事实相同的重试返回 `reused: true`。
+发布前中断保留来源和归属明确的暂存目录。发布后中断保留已提交目标及发布标记。使用相同来源和目标重新执行原命令时，工具核对归属、目标事实和主文件头中的存储布局。三者一致时返回 `reused: true`。向同一目标请求另一种布局会返回 `TDB_MIGRATION_CONFLICT`。需要另一份 Rom 或 Mmap 库时，指定新的目标目录。
 
 > **重试提醒**：已存在的其他目录、归属不匹配、目标已被业务修改或目标制品损坏均保留现场并返回错误。保留协调锁文件；直接删除正在使用的锁文件会破坏进程间互斥。
 
@@ -101,14 +103,14 @@ python scripts/migrate.py --source /data/legacy.tdb --source-dtype f32 --destina
 
 成功 JSON 写到 stdout，包括 `protocol`、`tool`、`source_format`、`target_format`、`dtype`、`checked`、`committed`、`reused`、`database` 和 `facts`。`facts` 含计数、下一节点 ID、各事实组 SHA-256 及总摘要。目标目录保存 `migration-source.json` 和 `migration-report.json`；报告中的提交状态对应目录提交点，SDK 可打开性还取决于发布标记完成确认。
 
-失败 JSON 写到 stderr 的 `error` 字段，包含 `code`、`message`、`phase`、`outcome` 和 `details`，命令退出码为 `1`。发布后的失败标记 `outcome: "committed"`，调用方按重试流程核验目标。
+失败 JSON 写到 stderr 的 `error` 字段，包含 `code`、`message`、`phase`、`outcome` 和 `details`，命令退出码为 `1`。重命名成功但父目录同步失败时返回 `publish/unknown`。提交确认后的收尾失败返回 `publish/committed`。两种情况都可以用相同命令重试并核验目标。
 
 | 工具错误码 | 含义 |
 | --- | --- |
 | `TDB_MIGRATION_LEASE_REQUIRED` | 检查模式缺少既有来源锁文件 |
 | `TDB_MIGRATION_BUDGET` | 来源数量、字节或工作空间预算不足 |
 | `TDB_MIGRATION_TARGET_EXISTS` | 目标存在且归属不匹配 |
-| `TDB_MIGRATION_CONFLICT` | 来源摘要变化、暂存归属冲突或已交付事实变化 |
+| `TDB_MIGRATION_CONFLICT` | 来源摘要变化、暂存归属冲突、已交付事实变化或请求的存储布局与目标文件头不符 |
 | `TDB_MIGRATION_UNSUPPORTED_SOURCE` | 工具支持范围外的来源格式 |
 | `TDB_MIGRATION_DTYPE_REQUIRED` | 无类型头的旧空检查点需要宿主显式确认 dtype |
 | `TDB_DATABASE_LOCKED` | 来源/目标正在使用或等待发布确认 |
@@ -138,7 +140,7 @@ python scripts/migrate.py --source /data/legacy.tdb --source-dtype f32 --destina
 迁移验收核对向量、Payload、边元数据、文本、索引约束及再次重开，另覆盖当前文档/命名图事实、未提交事务与截断 WAL 尾帧、租约冲突、预算、损坏、发布中断和重试。
 
 ```bash
-cargo test --locked --manifest-path crates/triviumdb-migrate/Cargo.toml --target-dir target/migration -- --test-threads=1
+cargo test --locked --manifest-path crates/triviumdb-migrate/Cargo.toml --target-dir target/migration --features test-hooks -- --test-threads=1
 ```
 
 各平台运行结果以对应提交的 CI 为准。本地与 CI 的验收范围见[测试实践](testing.md)。

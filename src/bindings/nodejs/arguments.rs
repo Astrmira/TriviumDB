@@ -87,43 +87,6 @@ pub(super) fn parse_usize_argument(
     })
 }
 
-pub(super) fn parse_management_string(
-    env: Env,
-    value: Either<String, JsUnknown>,
-    field: &str,
-) -> napi::Result<String> {
-    parse_string_argument(
-        env,
-        value,
-        field,
-        Some(crate::error::WriteErrorInfo::MAINTENANCE_VALIDATION),
-    )
-}
-
-pub(super) fn parse_string_argument(
-    env: Env,
-    value: Either<String, JsUnknown>,
-    field: &str,
-    write: Option<crate::error::WriteErrorInfo>,
-) -> napi::Result<String> {
-    match value {
-        Either::A(value) => Ok(value),
-        Either::B(_) => {
-            let error = crate::TriviumError::InvalidInput(format!(
-                "参数必须是字符串 (Argument must be a string): {field}"
-            ))
-            .at_field(field);
-            Err(to_napi_error(
-                env,
-                match write {
-                    Some(write) => error.with_write_info(write),
-                    None => error,
-                },
-            ))
-        }
-    }
-}
-
 pub(super) fn write_number(env: Env, value: JsUnknown, field: &str) -> napi::Result<f64> {
     number_value(
         env,

@@ -344,9 +344,14 @@ struct IdempotencyCache {
     entries: HashMap<String, IdempotencyEntry>,
 }
 
+struct IdempotencyRequest {
+    key: String,
+    fingerprint: [u8; 32],
+}
+
 #[derive(Clone)]
 struct IdempotencyEntry {
-    fingerprint: Vec<u8>,
+    fingerprint: [u8; 32],
     result: StoredWriteResult,
 }
 
@@ -361,8 +366,7 @@ struct WriteCommand {
     control: QueryControl,
     enqueued_at: Instant,
     telemetry: Option<Arc<RequestTelemetry>>,
-    idempotency_key: Option<String>,
-    fingerprint: Vec<u8>,
+    idempotency: Option<IdempotencyRequest>,
     operation: WriteOperation,
     response: oneshot::Sender<Result<StoredWriteResult, ApiError>>,
 }
@@ -403,7 +407,15 @@ impl EngineHandle {
                 "调度容量超过信号量上限 (Scheduling capacity exceeds semaphore limit)",
             ));
         }
-        let path = config.database_path.to_string_lossy().into_owned();
+        let path = config
+            .database_path
+            .to_str()
+            .ok_or_else(|| {
+                ApiError::invalid_request(
+                    "数据库路径必须为 UTF-8 (Database path must be valid UTF-8)",
+                )
+            })?
+            .to_owned();
         let database = tokio::task::spawn_blocking(move || {
             Database::<f32>::open_with_config(&path, config.database).map_err(ApiError::from)
         })
@@ -779,55 +791,16 @@ impl EngineHandle {
         id: u64,
         direction: triviumdb::graph::reachability::ReachabilityDirection,
         label: Option<String>,
+        offset: usize,
+        limit: usize,
         deadline: Instant,
-    ) -> Result<(Vec<SubgraphEdge>, VersionSnapshot), ApiError> {
+    ) -> Result<(Vec<SubgraphEdge>, usize, VersionSnapshot), ApiError> {
         let versions = self.inner.versions.clone();
         let control = QueryControl::with_deadline(deadline);
         self.run_read(deadline, control, move |database| {
-            if database.get(id).map_err(ApiError::from)?.is_none() {
-                return Err(ApiError::from(
-                    triviumdb::error::TriviumError::NodeNotFound(id),
-                ));
-            }
-            let mut edges = Vec::new();
-            if direction != triviumdb::graph::reachability::ReachabilityDirection::Incoming {
-                for edge in database.get_edges(id).map_err(ApiError::from)? {
-                    if label.as_ref().is_none_or(|label| label == &edge.label) {
-                        edges.push(SubgraphEdge {
-                            source_id: id,
-                            target_id: edge.target_id,
-                            label: edge.label,
-                            weight: edge.weight,
-                            metadata: edge.metadata,
-                        });
-                    }
-                }
-            }
-            if direction != triviumdb::graph::reachability::ReachabilityDirection::Outgoing {
-                for edge in database
-                    .get_incoming_edges(id, label.as_deref())
-                    .map_err(ApiError::from)?
-                {
-                    edges.push(SubgraphEdge {
-                        source_id: edge.source_id,
-                        target_id: edge.target_id,
-                        label: edge.label,
-                        weight: edge.weight,
-                        metadata: edge.metadata,
-                    });
-                }
-            }
-            edges.sort_by(|a, b| {
-                (a.source_id, a.target_id, a.label.as_str()).cmp(&(
-                    b.source_id,
-                    b.target_id,
-                    b.label.as_str(),
-                ))
-            });
-            edges.dedup_by(|a, b| {
-                a.source_id == b.source_id && a.target_id == b.target_id && a.label == b.label
-            });
-            Ok((edges, lock_or_recover(&versions).snapshot()))
+            let (page, total) =
+                database.edge_page(id, direction, label.as_deref(), offset, limit)?;
+            Ok((page, total, lock_or_recover(&versions).snapshot()))
         })
         .await
     }
@@ -839,16 +812,15 @@ impl EngineHandle {
         idempotency_key: Option<String>,
         deadline: Instant,
     ) -> Result<WriteResult, ApiError> {
-        let fingerprint = serde_json::to_vec(&(query.as_str(), expected_generation.as_deref()))
-            .map_err(|error| ApiError::internal(error.to_string()))?;
+        let idempotency =
+            idempotency_request(idempotency_key, &("tql", &query, &expected_generation))?;
         match self
             .send_write(
                 WriteOperation::Tql {
                     query,
                     expected_generation,
                 },
-                idempotency_key,
-                fingerprint,
+                idempotency,
                 deadline,
             )
             .await?
@@ -871,10 +843,7 @@ impl EngineHandle {
         } else {
             WriteOperation::DropIndex(request)
         };
-        match self
-            .send_write(operation, None, Vec::new(), deadline)
-            .await?
-        {
+        match self.send_write(operation, None, deadline).await? {
             StoredWriteResult::Mutation(result) => Ok(result.version),
             StoredWriteResult::Transaction(_) => Err(ApiError::internal(
                 "索引操作结果类型不匹配 (Index operation result type mismatch)",
@@ -888,12 +857,7 @@ impl EngineHandle {
         deadline: Instant,
     ) -> Result<VersionSnapshot, ApiError> {
         match self
-            .send_write(
-                WriteOperation::BuildPelorus(config),
-                None,
-                Vec::new(),
-                deadline,
-            )
+            .send_write(WriteOperation::BuildPelorus(config), None, deadline)
             .await?
         {
             StoredWriteResult::Mutation(result) => Ok(result.version),
@@ -920,80 +884,10 @@ impl EngineHandle {
                 Ok(db.quiver_build_handle())
             })
             .await?;
-        self.inner
-            .metrics
-            .warmup_state
-            .store(WarmupState::Preparing as usize, Ordering::Release);
-        self.inner
-            .metrics
-            .active_blocking_tasks
-            .fetch_add(1, Ordering::AcqRel);
-        let inner = self.inner.clone();
-        let task = tokio::task::spawn_blocking(move || {
-            let _operation = operation;
-            let _blocking_guard =
-                AtomicGaugeGuard::enter_existing(&inner.metrics.active_blocking_tasks);
-            let build = match handle.prepare_auto_build() {
-                Ok(Some(build)) => build,
-                Ok(None) => {
-                    inner
-                        .metrics
-                        .warmup_state
-                        .store(WarmupState::Skipped as usize, Ordering::Release);
-                    return Ok(false);
-                }
-                Err(error) => {
-                    inner
-                        .metrics
-                        .warmup_state
-                        .store(WarmupState::Failed as usize, Ordering::Release);
-                    return Err(ApiError::from(error));
-                }
-            };
-            inner
-                .metrics
-                .warmup_state
-                .store(WarmupState::Building as usize, Ordering::Release);
-            match build.execute() {
-                Ok(published) => {
-                    let state = if published {
-                        WarmupState::Ready
-                    } else {
-                        WarmupState::Skipped
-                    };
-                    inner
-                        .metrics
-                        .warmup_state
-                        .store(state as usize, Ordering::Release);
-                    Ok(published)
-                }
-                Err(error) => {
-                    inner
-                        .metrics
-                        .warmup_state
-                        .store(WarmupState::Failed as usize, Ordering::Release);
-                    Err(ApiError::from(error))
-                }
-            }
-        });
-        tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), task)
-            .await
-            .map_err(|_| {
-                self.inner
-                    .metrics
-                    .warmup_state
-                    .store(WarmupState::Failed as usize, Ordering::Release);
-                ApiError::timeout()
-            })?
-            .map_err(|error| {
-                self.inner
-                    .metrics
-                    .warmup_state
-                    .store(WarmupState::Failed as usize, Ordering::Release);
-                ApiError::internal(format!(
-                    "QuIVer 构建任务失败 (QuIVer build task failed): {error}"
-                ))
-            })?
+        let Some(task) = spawn_quiver_build(self.inner.clone(), operation, Some(handle)) else {
+            return Ok(false);
+        };
+        wait_for_quiver_build(task, deadline).await
     }
 
     pub async fn conditional_mutation(
@@ -1006,7 +900,6 @@ impl EngineHandle {
             .send_write(
                 WriteOperation::CompareAndSet { id, request },
                 None,
-                Vec::new(),
                 deadline,
             )
             .await?
@@ -1024,12 +917,7 @@ impl EngineHandle {
         deadline: Instant,
     ) -> Result<WriteResult, ApiError> {
         match self
-            .send_write(
-                WriteOperation::DeleteMany(request),
-                None,
-                Vec::new(),
-                deadline,
-            )
+            .send_write(WriteOperation::DeleteMany(request), None, deadline)
             .await?
         {
             StoredWriteResult::Mutation(result) => Ok(result),
@@ -1045,15 +933,9 @@ impl EngineHandle {
         idempotency_key: Option<String>,
         deadline: Instant,
     ) -> Result<TransactionResult, ApiError> {
-        let fingerprint =
-            serde_json::to_vec(&request).map_err(|error| ApiError::internal(error.to_string()))?;
+        let idempotency = idempotency_request(idempotency_key, &("transaction", &request))?;
         match self
-            .send_write(
-                WriteOperation::Transaction(request),
-                idempotency_key,
-                fingerprint,
-                deadline,
-            )
+            .send_write(WriteOperation::Transaction(request), idempotency, deadline)
             .await?
         {
             StoredWriteResult::Transaction(result) => Ok(result),
@@ -1198,15 +1080,13 @@ impl EngineHandle {
     async fn send_write(
         &self,
         operation: WriteOperation,
-        idempotency_key: Option<String>,
-        fingerprint: Vec<u8>,
+        idempotency: Option<IdempotencyRequest>,
         deadline: Instant,
     ) -> Result<StoredWriteResult, ApiError> {
         let _operation = self
             .inner
             .enter_operation()
             .map_err(write_admission_error)?;
-        validate_idempotency_key(idempotency_key.as_deref()).map_err(write_admission_error)?;
         if Instant::now() >= deadline {
             return Err(write_admission_error(ApiError::timeout()));
         }
@@ -1224,8 +1104,7 @@ impl EngineHandle {
             control,
             enqueued_at,
             telemetry,
-            idempotency_key,
-            fingerprint,
+            idempotency,
             operation,
             response,
         }) {
@@ -1275,76 +1154,97 @@ fn start_writer_supervisor(inner: Arc<EngineInner>, receiver: mpsc::Receiver<Wri
     });
 }
 
-fn start_quiver_warmup(inner: Arc<EngineInner>) {
-    let Ok(operation) = inner.enter_operation() else {
-        return;
-    };
+/// 构建任务持有状态发布权，等待者超时或重复请求均不改变任务状态。
+struct QuiverJob {
+    inner: Arc<EngineInner>,
+    terminal: WarmupState,
+}
+
+async fn wait_for_quiver_build(
+    task: tokio::task::JoinHandle<triviumdb::Result<bool>>,
+    deadline: Instant,
+) -> Result<bool, ApiError> {
+    tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), task)
+        .await
+        .map_err(|_| ApiError::timeout())?
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "QuIVer 构建任务失败 (QuIVer build task failed): {error}"
+            ))
+        })?
+        .map_err(ApiError::from)
+}
+
+impl Drop for QuiverJob {
+    fn drop(&mut self) {
+        self.inner
+            .metrics
+            .warmup_state
+            .store(self.terminal as usize, Ordering::Release);
+        self.inner
+            .metrics
+            .active_blocking_tasks
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn spawn_quiver_build(
+    inner: Arc<EngineInner>,
+    operation: OwnedRwLockReadGuard<()>,
+    handle: Option<triviumdb::database::QuiverBuildHandle<f32>>,
+) -> Option<tokio::task::JoinHandle<triviumdb::Result<bool>>> {
     inner
         .metrics
         .warmup_state
-        .store(WarmupState::Preparing as usize, Ordering::Release);
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+            (!matches!(
+                WarmupState::from_usize(old),
+                WarmupState::Preparing | WarmupState::Building
+            ))
+            .then_some(WarmupState::Preparing as usize)
+        })
+        .ok()?;
     inner
         .metrics
         .active_blocking_tasks
         .fetch_add(1, Ordering::AcqRel);
-    tokio::task::spawn_blocking(move || {
+    let job = QuiverJob {
+        inner,
+        terminal: WarmupState::Failed,
+    };
+    Some(tokio::task::spawn_blocking(move || {
         let _operation = operation;
-        let _blocking_guard =
-            AtomicGaugeGuard::enter_existing(&inner.metrics.active_blocking_tasks);
-        let handle = read_or_recover(&inner.database).quiver_build_handle();
-        let build = match handle.prepare_auto_build() {
-            Ok(Some(build)) => build,
-            Ok(None) => {
-                inner
-                    .metrics
-                    .warmup_state
-                    .store(WarmupState::Skipped as usize, Ordering::Release);
-                return;
-            }
-            Err(error) => {
-                inner
-                    .metrics
-                    .warmup_state
-                    .store(WarmupState::Failed as usize, Ordering::Release);
-                tracing::warn!(%error, "QuIVer 后台预热准备失败 (background QuIVer warmup preparation failed)");
-                return;
-            }
-        };
-        inner
-            .metrics
-            .warmup_state
-            .store(WarmupState::Building as usize, Ordering::Release);
+        let mut job = job;
+        let handle =
+            handle.unwrap_or_else(|| read_or_recover(&job.inner.database).quiver_build_handle());
         let started = Instant::now();
-        match build.execute() {
+        let result = handle.prepare_auto_build().and_then(|build| {
+            let Some(build) = build else { return Ok(false) };
+            job.inner
+                .metrics
+                .warmup_state
+                .store(WarmupState::Building as usize, Ordering::Release);
+            build.execute()
+        });
+        match &result {
             Ok(true) => {
-                inner
-                    .metrics
-                    .warmup_state
-                    .store(WarmupState::Ready as usize, Ordering::Release);
+                job.terminal = WarmupState::Ready;
                 tracing::info!(
                     elapsed_ms = started.elapsed().as_millis() as u64,
-                    "QuIVer 后台预热完成 (background QuIVer warmup finished)"
-                )
+                    "QuIVer 构建完成 (QuIVer build finished)"
+                );
             }
-            Ok(false) => {
-                inner
-                    .metrics
-                    .warmup_state
-                    .store(WarmupState::Skipped as usize, Ordering::Release);
-                tracing::info!(
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "QuIVer 后台预热因向量代际变化而放弃发布 (background QuIVer warmup skipped publishing after vector generation changed)"
-                )
-            }
-            Err(error) => {
-                inner
-                    .metrics
-                    .warmup_state
-                    .store(WarmupState::Failed as usize, Ordering::Release);
-                tracing::warn!(%error, "QuIVer 后台预热失败 (background QuIVer warmup failed)")
-            }
+            Ok(false) => job.terminal = WarmupState::Skipped,
+            Err(error) => tracing::warn!(%error, "QuIVer 构建失败 (QuIVer build failed)"),
         }
-    });
+        result
+    }))
+}
+
+fn start_quiver_warmup(inner: Arc<EngineInner>) {
+    if let Ok(operation) = inner.enter_operation() {
+        drop(spawn_quiver_build(inner, operation, None));
+    }
 }
 
 async fn run_writer(inner: Arc<EngineInner>, mut receiver: mpsc::Receiver<WriteCommand>) {
@@ -1398,7 +1298,13 @@ async fn collect_write_batch(
     if *stopping.borrow_and_update() {
         receiver.close();
     }
-    if receiver.is_empty() && !inner.max_write_batch_delay.is_zero() {
+    let now = Instant::now();
+    if receiver.is_empty()
+        && !inner.max_write_batch_delay.is_zero()
+        && batch.iter().all(|command| {
+            command.deadline.saturating_duration_since(now) > inner.max_write_batch_delay
+        })
+    {
         let command = tokio::select! {
             biased;
             _ = stopping.changed() => {
@@ -1529,6 +1435,12 @@ async fn process_write_batch(inner: &Arc<EngineInner>, mut batch: Vec<WriteComma
             .take()
             .map(triviumdb::test_hooks::fail_io_at);
         let mut outcomes = Vec::with_capacity(batch.len());
+        // 同组请求可以复用暂定回执；跨组可见的缓存只接受已同步的结果。
+        let mut pending = IdempotencyCache::new(if versions.idempotency.capacity == 0 {
+            0
+        } else {
+            batch.len()
+        });
         let sync_result = database
             .group_commit(|database| {
                 for command in batch.drain(..) {
@@ -1542,9 +1454,15 @@ async fn process_write_batch(inner: &Arc<EngineInner>, mut batch: Vec<WriteComma
                             execution_started.duration_since(command.enqueued_at),
                         );
                     }
+                    let mut confirmed = false;
                     let outcome = if execution_started >= command.deadline {
                         Err(write_admission_error(ApiError::timeout()))
-                    } else if let Some(result) = lookup_idempotent_locked(&versions, &command) {
+                    } else if let Some(result) =
+                        lookup_idempotent_locked(&versions.idempotency, &command)
+                    {
+                        confirmed = true;
+                        result
+                    } else if let Some(result) = lookup_idempotent_locked(&pending, &command) {
                         result
                     } else {
                         let request_id = command
@@ -1558,10 +1476,8 @@ async fn process_write_batch(inner: &Arc<EngineInner>, mut batch: Vec<WriteComma
                             command.control,
                             request_id,
                         );
-                        if let (Ok(result), Some(key)) = (&result, command.idempotency_key) {
-                            versions
-                                .idempotency
-                                .insert(key, command.fingerprint, result.clone());
+                        if let (Ok(result), Some(identity)) = (&result, command.idempotency) {
+                            pending.insert(identity.key, identity.fingerprint, result.clone());
                         }
                         result
                     };
@@ -1569,6 +1485,7 @@ async fn process_write_batch(inner: &Arc<EngineInner>, mut batch: Vec<WriteComma
                         command.response,
                         command.telemetry,
                         execution_started,
+                        confirmed,
                         outcome,
                     ));
                     #[cfg(all(test, feature = "test-hooks"))]
@@ -1582,6 +1499,17 @@ async fn process_write_batch(inner: &Arc<EngineInner>, mut batch: Vec<WriteComma
             })
             .map(|(_, synced)| synced)
             .map_err(ApiError::from);
+        if sync_result.is_ok() {
+            for key in pending.order {
+                let entry = pending
+                    .entries
+                    .remove(&key)
+                    .expect("暂定回执与写入顺序一致");
+                versions
+                    .idempotency
+                    .insert(key, entry.fingerprint, entry.result);
+            }
+        }
         (outcomes, sync_result, batch)
     })
     .await;
@@ -1600,13 +1528,14 @@ async fn process_write_batch(inner: &Arc<EngineInner>, mut batch: Vec<WriteComma
             if synced {
                 inner.metrics.wal_sync_total.fetch_add(1, Ordering::Relaxed);
             }
-            for (response, telemetry, execution_started, outcome) in outcomes {
+            for (response, telemetry, execution_started, confirmed, outcome) in outcomes {
                 if let Some(telemetry) = telemetry {
                     telemetry.record_execution(execution_started.elapsed());
                 }
                 // 保留已经明确的操作错误；仅成功但尚未完成组同步的请求改为未知结果。
                 let outcome = match (outcome, &failure) {
-                    (Ok(_), Some(error)) => Err(error.clone()),
+                    (Ok(_), Some(error)) if !confirmed => Err(error.clone()),
+                    (Err(prior), Some(error)) if prior.is_committed() => Err(error.clone()),
                     (outcome, _) => outcome,
                 };
                 let _ = response.send(outcome);
@@ -1647,15 +1576,25 @@ fn execute_write(
     control: QueryControl,
     request_id: &str,
 ) -> Result<StoredWriteResult, ApiError> {
+    let context = RequestContext::new(request_id, control, true).map_err(ApiError::from)?;
+    context.check_admission().map_err(ApiError::from)?;
+    context
+        .run(|| Ok(execute_write_inner(database, versions, operation)))
+        .map_err(ApiError::from)?
+}
+
+fn execute_write_inner(
+    database: &mut Database<f32>,
+    versions: &mut VersionState,
+    operation: WriteOperation,
+) -> Result<StoredWriteResult, ApiError> {
     match operation {
         WriteOperation::Tql {
             query,
             expected_generation,
         } => {
             validate_global_precondition(versions, expected_generation.as_deref())?;
-            let mutation = RequestContext::new(request_id, control, true)
-                .and_then(|context| context.run(|| database.tql_mut(&query)))
-                .map_err(ApiError::from)?;
+            let mutation = database.tql_mut(&query).map_err(ApiError::from)?;
             versions.generation = versions.generation.saturating_add(1);
             // TQL 暂不返回完整 write-set，因此保守失效此前签发的全部细粒度 ETag。
             versions.invalidate_entity_versions();
@@ -1686,15 +1625,19 @@ fn execute_write(
             }))
         }
         WriteOperation::DeleteMany(request) => {
-            let mut touched_edges = Vec::new();
-            for &id in &request.ids {
+            let ids = request
+                .ids
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>();
+            database.validate_delete_set(&ids).map_err(ApiError::from)?;
+            let mut touched_edges = HashSet::new();
+            for &id in &ids {
                 touched_edges.extend(incident_edge_keys(database, id)?);
             }
-            let affected = database
-                .delete_many_atomic(&request.ids)
-                .map_err(ApiError::from)?;
+            let ids = ids.into_iter().collect::<Vec<_>>();
+            let affected = database.delete_many_atomic(&ids).map_err(ApiError::from)?;
             versions.generation = versions.generation.saturating_add(1);
-            versions.update_entities(database, request.ids, touched_edges)?;
+            versions.update_entities(database, ids, touched_edges);
             Ok(StoredWriteResult::Mutation(WriteResult {
                 mutation: MutationResponse {
                     affected,
@@ -1705,54 +1648,22 @@ fn execute_write(
             }))
         }
         WriteOperation::CreateIndex(request) => {
-            apply_index_change(database, &request, true)?;
-            versions.generation = versions.generation.saturating_add(1);
-            Ok(StoredWriteResult::Mutation(WriteResult {
-                mutation: MutationResponse {
-                    affected: 1,
-                    created_ids: Vec::new(),
-                },
-                version: versions.snapshot(),
-                replayed: false,
-            }))
-        }
-        WriteOperation::BuildPelorus(config) => {
-            let result = RequestContext::new(request_id, control, true)
-                .and_then(|context| context.run(|| database.build_pelorus_index(config)));
-            if result.as_ref().err().is_none_or(|error| {
-                error
-                    .info()
-                    .write
-                    .is_some_and(|write| write.outcome == triviumdb::error::WriteOutcome::Committed)
-            }) {
-                versions.generation = versions.generation.saturating_add(1);
-            }
-            result.map_err(ApiError::from)?;
-            Ok(StoredWriteResult::Mutation(WriteResult {
-                mutation: MutationResponse {
-                    affected: 1,
-                    created_ids: Vec::new(),
-                },
-                version: versions.snapshot(),
-                replayed: false,
-            }))
+            index_write_result(versions, apply_index_change(database, &request, true))
         }
         WriteOperation::DropIndex(request) => {
-            apply_index_change(database, &request, false)?;
-            versions.generation = versions.generation.saturating_add(1);
-            Ok(StoredWriteResult::Mutation(WriteResult {
-                mutation: MutationResponse {
-                    affected: 1,
-                    created_ids: Vec::new(),
-                },
-                version: versions.snapshot(),
-                replayed: false,
-            }))
+            index_write_result(versions, apply_index_change(database, &request, false))
         }
+        WriteOperation::BuildPelorus(config) => index_write_result(
+            versions,
+            database
+                .build_pelorus_index(config)
+                .map(|_| ())
+                .map_err(ApiError::from),
+        ),
         WriteOperation::Transaction(request) => {
             validate_transaction_preconditions(database, versions, &request)?;
             // 在借用事务前读取实际边，覆盖已持久化且尚未登记进版本表的关联边。
-            let mut touched_edges = Vec::new();
+            let mut touched_edges = HashSet::new();
             for operation in &request.operations {
                 match operation {
                     TransactionOperation::Delete { id } => {
@@ -1807,7 +1718,7 @@ fn execute_write(
                     } => {
                         transaction.link(*source, *target, label, *weight);
                         touched_nodes.extend([*source, *target]);
-                        touched_edges.push(EdgeKey::new(*source, *target, label));
+                        touched_edges.insert(EdgeKey::new(*source, *target, label));
                     }
                     TransactionOperation::Unlink {
                         source,
@@ -1816,7 +1727,7 @@ fn execute_write(
                     } => {
                         if let Some(label) = label {
                             transaction.unlink_label(*source, *target, label);
-                            touched_edges.push(EdgeKey::new(*source, *target, label));
+                            touched_edges.insert(EdgeKey::new(*source, *target, label));
                         } else {
                             transaction.unlink(*source, *target);
                         }
@@ -1827,7 +1738,7 @@ fn execute_write(
             let created_ids = transaction.commit().map_err(ApiError::from)?;
             versions.generation = versions.generation.saturating_add(1);
             touched_nodes.extend(created_ids.iter().copied());
-            versions.update_entities(database, touched_nodes, touched_edges)?;
+            versions.update_entities(database, touched_nodes, touched_edges);
             Ok(StoredWriteResult::Transaction(TransactionResult {
                 created_ids: created_ids.into_iter().map(|id| id.to_string()).collect(),
                 version: versions.snapshot(),
@@ -1852,6 +1763,28 @@ fn incident_edge_keys(database: &Database<f32>, id: u64) -> Result<Vec<EdgeKey>,
             .map(|edge| EdgeKey::new(edge.source_id, id, &edge.label)),
     );
     Ok(edges)
+}
+
+fn index_write_result(
+    versions: &mut VersionState,
+    result: Result<(), ApiError>,
+) -> Result<StoredWriteResult, ApiError> {
+    if result
+        .as_ref()
+        .err()
+        .is_none_or(|error| error.is_committed())
+    {
+        versions.generation = versions.generation.saturating_add(1);
+    }
+    result?;
+    Ok(StoredWriteResult::Mutation(WriteResult {
+        mutation: MutationResponse {
+            affected: 1,
+            created_ids: Vec::new(),
+        },
+        version: versions.snapshot(),
+        replayed: false,
+    }))
 }
 
 fn apply_index_change(
@@ -1952,13 +1885,12 @@ fn validate_transaction_preconditions(
 }
 
 fn lookup_idempotent_locked(
-    versions: &VersionState,
+    cache: &IdempotencyCache,
     command: &WriteCommand,
 ) -> Option<Result<StoredWriteResult, ApiError>> {
-    let key = command.idempotency_key.as_ref()?;
-    versions
-        .idempotency
-        .get(key, &command.fingerprint)
+    let identity = command.idempotency.as_ref()?;
+    cache
+        .get(&identity.key, &identity.fingerprint)
         .map(|result| {
             result.map(|mut result| {
                 match &mut result {
@@ -2003,11 +1935,12 @@ impl VersionState {
         &mut self,
         database: &Database<f32>,
         nodes: Vec<u64>,
-        edges: Vec<EdgeKey>,
-    ) -> Result<(), ApiError> {
+        edges: HashSet<EdgeKey>,
+    ) {
         let mut nodes: HashSet<_> = nodes.into_iter().collect();
-        let edges: HashSet<_> = edges.into_iter().collect();
         let result = (|| -> triviumdb::Result<()> {
+            #[cfg(all(test, feature = "test-hooks"))]
+            triviumdb::test_hooks::io_result(triviumdb::test_hooks::IoPoint::ServerVersionRefresh)?;
             for edge in edges {
                 nodes.extend([edge.source, edge.target]);
                 if database
@@ -2029,17 +1962,10 @@ impl VersionState {
             Ok(())
         })();
         if let Err(error) = result {
+            // 实体版本属于派生缓存。写入已经应用，整体失效仍能阻止全部旧 ETag。
             self.invalidate_entity_versions();
-            return Err(ApiError::from(triviumdb::TriviumError::WriteFailure {
-                source: Box::new(error),
-                write: triviumdb::error::WriteErrorInfo {
-                    phase: triviumdb::error::WritePhase::Response,
-                    outcome: triviumdb::error::WriteOutcome::Committed,
-                    transaction_consumed: None,
-                },
-            }));
+            tracing::debug!(%error, "已失效实体版本缓存 (Entity version cache invalidated)");
         }
-        Ok(())
     }
 
     fn snapshot(&self) -> VersionSnapshot {
@@ -2112,9 +2038,13 @@ impl IdempotencyCache {
         }
     }
 
-    fn get(&self, key: &str, fingerprint: &[u8]) -> Option<Result<StoredWriteResult, ApiError>> {
+    fn get(
+        &self,
+        key: &str,
+        fingerprint: &[u8; 32],
+    ) -> Option<Result<StoredWriteResult, ApiError>> {
         let entry = self.entries.get(key)?;
-        Some(if entry.fingerprint == fingerprint {
+        Some(if &entry.fingerprint == fingerprint {
             Ok(entry.result.clone())
         } else {
             Err(ApiError::new(
@@ -2127,7 +2057,7 @@ impl IdempotencyCache {
         })
     }
 
-    fn insert(&mut self, key: String, fingerprint: Vec<u8>, result: StoredWriteResult) {
+    fn insert(&mut self, key: String, fingerprint: [u8; 32], result: StoredWriteResult) {
         if self.capacity == 0 {
             return;
         }
@@ -2149,15 +2079,24 @@ impl IdempotencyCache {
     }
 }
 
-fn validate_idempotency_key(key: Option<&str>) -> Result<(), ApiError> {
-    if let Some(key) = key
-        && (key.is_empty() || key.len() > 128 || !key.is_ascii())
-    {
-        return Err(ApiError::invalid_request(
+fn idempotency_request(
+    key: Option<String>,
+    request: &impl serde::Serialize,
+) -> Result<Option<IdempotencyRequest>, ApiError> {
+    use sha2::{Digest, Sha256};
+    let Some(key) = key else { return Ok(None) };
+    if key.is_empty() || key.len() > 128 || !key.is_ascii() {
+        return Err(write_admission_error(ApiError::invalid_request(
             "Idempotency-Key 必须是 1..=128 字节 ASCII (Idempotency-Key must be 1..=128 ASCII bytes)",
-        ));
+        )));
     }
-    Ok(())
+    let mut digest = Sha256::new();
+    serde_json::to_writer(&mut digest, request)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    Ok(Some(IdempotencyRequest {
+        key,
+        fingerprint: digest.finalize().into(),
+    }))
 }
 
 fn read_or_recover<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
@@ -2180,6 +2119,59 @@ fn engine_stopped() -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "test-hooks")]
+    #[tokio::test]
+    async fn 唯一约束发布后清理失败仍推进全局版本() {
+        use triviumdb::test_hooks::{IoPoint, fail_io_at};
+        for create in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("constraint.tdb");
+            let mut db = Database::<f32>::open(path.to_str().unwrap(), 1).unwrap();
+            db.insert(&[1.], serde_json::json!({"key":"a"})).unwrap();
+            if !create {
+                db.create_unique_index("key").unwrap();
+            }
+            let mut versions = VersionState {
+                epoch: "constraint".into(),
+                generation: 3,
+                fine_grained_generation: 0,
+                node_versions: HashMap::new(),
+                edge_versions: HashMap::new(),
+                idempotency: IdempotencyCache::new(4),
+            };
+            let request = IndexRequest {
+                kind: IndexKind::Unique,
+                fields: vec!["key".into()],
+            };
+            let op = if create {
+                WriteOperation::CreateIndex(request)
+            } else {
+                WriteOperation::DropIndex(request)
+            };
+            let failure = fail_io_at(IoPoint::CheckpointWalClear);
+            let error = execute_write(
+                &mut db,
+                &mut versions,
+                op,
+                QueryControl::default(),
+                "index-etag",
+            )
+            .err()
+            .unwrap();
+            drop(failure);
+            assert_eq!(error_body(error).await["write"]["outcome"], "committed");
+            assert_eq!(versions.generation, 4);
+            drop(db);
+            let mut reopened = Database::<f32>::open(path.to_str().unwrap(), 1).unwrap();
+            let duplicate = reopened.insert(&[1.], serde_json::json!({"key":"a"}));
+            if create {
+                assert_eq!(duplicate.unwrap_err().code(), "TDB_UNIQUE_CONSTRAINT");
+            } else {
+                assert_eq!(duplicate.unwrap(), 2);
+            }
+        }
+    }
 
     #[cfg(feature = "test-hooks")]
     #[tokio::test]
@@ -2347,8 +2339,7 @@ mod tests {
                 control: QueryControl::default(),
                 enqueued_at: Instant::now(),
                 telemetry: None,
-                idempotency_key: None,
-                fingerprint: Vec::new(),
+                idempotency: None,
                 operation: WriteOperation::Tql {
                     query: format!("CREATE ({{state: '{state}'}})"),
                     expected_generation: None,
@@ -2513,11 +2504,64 @@ mod tests {
 
     #[cfg(feature = "test-hooks")]
     #[tokio::test]
+    async fn 实体版本读取失败后同键重试取得同一条已同步回执() {
+        let (engine, directory) = test_engine("derived-receipt", 4, 1).await;
+        let tx: TransactionRequest = serde_json::from_value(serde_json::json!({
+            "operations":[{"op":"insert","vector":[1.,0.],"payload":{"source":"once"}}]
+        }))
+        .unwrap();
+        *lock_or_recover(&engine.inner.batch_io_failure) =
+            Some(triviumdb::test_hooks::IoPoint::ServerVersionRefresh);
+        let first = engine
+            .transaction(
+                tx.clone(),
+                Some("one".into()),
+                Instant::now() + Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        assert!(!first.replayed);
+        assert_eq!(first.created_ids, ["1"]);
+        assert_eq!(
+            first.version.fine_grained_generation,
+            first.version.generation
+        );
+        let replay = engine
+            .transaction(
+                tx,
+                Some("one".into()),
+                Instant::now() + Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.created_ids, first.created_ids);
+        engine.shutdown().await.unwrap();
+        let path = directory.path().join("derived-receipt.tdb");
+        let db = Database::<f32>::open_read_only(path.to_str().unwrap(), 2).unwrap();
+        assert_eq!(db.all_node_ids().unwrap(), [1]);
+        let node = db.get(1).unwrap().unwrap();
+        assert_eq!(node.vector, [1., 0.]);
+        assert_eq!(node.payload, serde_json::json!({"source":"once"}));
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[tokio::test]
     async fn 分组同步失败逐请求交回未知结果并保留独立校验错误() {
         let (engine, directory) = test_engine("group-outcome", 4, 1).await;
-        write_or_recover(&engine.inner.database)
-            .insert_with_id(1, &[1., 0.], serde_json::json!({"state":"saved"}))
+        let saved: TransactionRequest = serde_json::from_value(serde_json::json!({
+            "operations":[{"op":"insert","id":1,"vector":[1.,0.],"payload":{"state":"saved"}}]
+        }))
+        .unwrap();
+        let confirmed = engine
+            .transaction(
+                saved.clone(),
+                Some("saved".into()),
+                Instant::now() + Duration::from_secs(30),
+            )
+            .await
             .unwrap();
+        assert_eq!(confirmed.created_ids, ["1"]);
         *lock_or_recover(&engine.inner.batch_io_failure) =
             Some(triviumdb::test_hooks::IoPoint::WalFlush);
         let mut batch = Vec::new();
@@ -2530,8 +2574,7 @@ mod tests {
                 control: QueryControl::default(),
                 enqueued_at: Instant::now(),
                 telemetry: None,
-                idempotency_key: None,
-                fingerprint: Vec::new(),
+                idempotency: idempotency_request(Some(query.into()), &query).unwrap(),
                 operation: WriteOperation::Tql {
                     query: query.into(),
                     expected_generation: None,
@@ -2539,6 +2582,17 @@ mod tests {
                 response,
             });
         }
+        let (response, replay) = oneshot::channel();
+        batch.push(WriteCommand {
+            deadline: Instant::now() + Duration::from_secs(30),
+            control: QueryControl::default(),
+            enqueued_at: Instant::now(),
+            telemetry: None,
+            idempotency: idempotency_request(Some("saved".into()), &("transaction", &saved))
+                .unwrap(),
+            operation: WriteOperation::Transaction(saved),
+            response,
+        });
         process_write_batch(&engine.inner, batch).await;
         let mut receivers = receivers.into_iter();
         let error = receivers
@@ -2569,6 +2623,16 @@ mod tests {
             body["write"],
             serde_json::json!({"phase":"validation","outcome":"not_committed"})
         );
+        let StoredWriteResult::Transaction(receipt) = replay.await.unwrap().unwrap() else {
+            panic!("需要事务回执")
+        };
+        assert!(receipt.replayed);
+        assert_eq!(receipt.created_ids, confirmed.created_ids);
+        {
+            let versions = lock_or_recover(&engine.inner.versions);
+            assert_eq!(versions.idempotency.entries.len(), 1);
+            assert!(versions.idempotency.entries.contains_key("saved"));
+        }
         assert!(engine.inner.metrics.writer_failed.load(Ordering::Acquire));
         let shutdown = error_body(engine.shutdown().await.unwrap_err()).await;
         assert_eq!(shutdown["code"], "TDB_WAL_CLOSED");
@@ -2607,18 +2671,29 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(1);
         let (response, result) = oneshot::channel();
         let mut batch = vec![WriteCommand {
-            deadline: Instant::now() + Duration::from_secs(30),
+            deadline: Instant::now() + Duration::from_secs(7200),
             control: QueryControl::default(),
             enqueued_at: Instant::now(),
             telemetry: None,
-            idempotency_key: None,
-            fingerprint: Vec::new(),
+            idempotency: None,
             operation: WriteOperation::Tql {
                 query: "CREATE ({name: \"batched\"})".into(),
                 expected_generation: None,
             },
             response,
         }];
+        // 合批窗口大于剩余期限时，空队列立即归还首条命令。
+        batch[0].deadline = Instant::now() + Duration::from_secs(30);
+        assert!(
+            futures_util::poll!(Box::pin(collect_write_batch(
+                &engine.inner,
+                &mut receiver,
+                &mut batch
+            )))
+            .is_ready()
+        );
+        assert_eq!(batch.len(), 1);
+        batch[0].deadline = Instant::now() + Duration::from_secs(7200);
         {
             let collecting = collect_write_batch(&engine.inner, &mut receiver, &mut batch);
             tokio::pin!(collecting);
@@ -2884,6 +2959,33 @@ mod tests {
         (engine, directory)
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn 非utf8数据库路径在启动前返回参数错误() {
+        use axum::response::IntoResponse;
+        use std::os::unix::ffi::OsStringExt;
+        let directory = tempfile::tempdir().unwrap();
+        let result = EngineHandle::start(EngineConfig {
+            database_path: directory
+                .path()
+                .join(std::ffi::OsString::from_vec(vec![0xff])),
+            database: Config {
+                dim: 2,
+                ..Config::default()
+            },
+            write_queue_capacity: 1,
+            max_concurrent_reads: 1,
+            idempotency_capacity: 1,
+            max_write_batch_size: 1,
+            max_write_batch_delay: Duration::ZERO,
+            prepared_cache_capacity: 1,
+        })
+        .await;
+        let error = result.err().expect("非 UTF-8 路径必须在打开前被拒绝");
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+        assert_eq!(directory.path().read_dir().unwrap().count(), 0);
+    }
+
     #[test]
     fn 后台quiver任务不持有server外层database读锁() {
         let directory = tempfile::tempdir().unwrap();
@@ -2935,6 +3037,44 @@ mod tests {
             .await
             .unwrap();
         assert!(!published);
+        assert_eq!(engine.metrics().warmup_state, WarmupState::Skipped);
+    }
+
+    #[tokio::test]
+    async fn 构建等待者离开后仍由后台任务发布终态() {
+        let (engine, _directory) = test_engine("build_waiter", 4, 1).await;
+        while engine.metrics().warmup_state == WarmupState::Preparing {
+            tokio::task::yield_now().await;
+        }
+        let inner = engine.inner.clone();
+        let (held, acquired) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _guard = write_or_recover(&inner.database);
+            held.send(()).unwrap();
+            let _ = wait.blocking_recv();
+        });
+        acquired.await.unwrap();
+        let start = || {
+            spawn_quiver_build(
+                engine.inner.clone(),
+                engine.inner.enter_operation().unwrap(),
+                None,
+            )
+        };
+        let task = start().unwrap();
+        assert!(start().is_none());
+        let error = wait_for_quiver_build(task, Instant::now())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error_body(error).await["code"],
+            "TDB_QUERY_DEADLINE_EXCEEDED"
+        );
+        assert_eq!(engine.metrics().warmup_state, WarmupState::Preparing);
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        engine.shutdown().await.unwrap();
         assert_eq!(engine.metrics().warmup_state, WarmupState::Skipped);
     }
 
@@ -3014,11 +3154,13 @@ mod tests {
             },
             replayed: false,
         });
-        cache.insert("a".into(), vec![1], result.clone());
-        assert!(cache.get("a", &[1]).unwrap().is_ok());
-        assert!(cache.get("a", &[2]).unwrap().is_err());
-        cache.insert("b".into(), vec![2], result);
-        assert!(cache.get("a", &[1]).is_none());
+        let first = [1; 32];
+        let second = [2; 32];
+        cache.insert("a".into(), first, result.clone());
+        assert!(cache.get("a", &first).unwrap().is_ok());
+        assert!(cache.get("a", &second).unwrap().is_err());
+        cache.insert("b".into(), second, result);
+        assert!(cache.get("a", &first).is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3241,8 +3383,7 @@ mod tests {
                     control: QueryControl::default(),
                     enqueued_at: Instant::now(),
                     telemetry: None,
-                    idempotency_key: None,
-                    fingerprint: Vec::new(),
+                    idempotency: None,
                     operation: WriteOperation::Tql {
                         query: "CREATE ({name: 'cancelled'})".into(),
                         expected_generation: None,

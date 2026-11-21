@@ -6,6 +6,12 @@
 
 ### 分支模型
 
+[项目仓库](https://github.com/Astrmira/TriviumDB)已迁至 Astrmira 组织。如果本地 `origin` 指向原官方仓库，可在仓库目录中运行：
+
+```bash
+git remote set-url origin https://github.com/Astrmira/TriviumDB.git
+```
+
 项目采用 `master` + `dev` 双长期分支模型：
 
 ```text
@@ -67,7 +73,7 @@ cargo check --features python
 cargo check --features nodejs
 cargo fmt --manifest-path crates/triviumdb-migrate/Cargo.toml --all -- --check
 cargo clippy --locked --manifest-path crates/triviumdb-migrate/Cargo.toml --target-dir target/migration --all-targets -- -D warnings
-cargo test --locked --manifest-path crates/triviumdb-migrate/Cargo.toml --target-dir target/migration -- --test-threads=1
+cargo test --locked --manifest-path crates/triviumdb-migrate/Cargo.toml --target-dir target/migration --features test-hooks -- --test-threads=1
 git diff --check
 ```
 
@@ -129,6 +135,8 @@ Rust Embedded Core 是产品主体和公共语义权威。Python、Node、CLI �
 
 所有正式制品写入必须遵循：临时文件 → flush → fsync → 原子 rename → 同步父目录 → 最后发布 marker/manifest。marker 是提交点：发布前失败不得破坏旧 generation，发布后失败不得回滚新 generation。不得原地替换仍可能被 mmap 的文件；Windows mmap 生命周期是正式设计边界。cleanup 只能回收已证明不可见且未被引用的旧代文件。
 
+发布日志引用的恢复备份须保留到日志退役越过持久化屏障。测试在屏障失败处核对备份内容，并在重开后核对当前代的事实。
+
 #### A5. 磁盘格式必须版本化并保留历史 oracle
 
 格式变更必须同时提供：显式版本号、最小长度与几何边界校验、checked arithmetic、分配前计数校验、CRC 等完整性保护，以及 truncation、bit flip、恶意计数与跨代组合测试。历史独立 fixture、来源与内容预期保留给显式离线迁移验收。正常内核测试聚焦当前格式的数据往返、恢复和结构化拒绝；自动回退或自动升级历史格式的测试移出其维护范围。
@@ -149,6 +157,8 @@ Rust Embedded Core 是产品主体和公共语义权威。Python、Node、CLI �
 
 删除 cache 或设置 cache=0 后结果必须完全相同；cache 淘汰不得使进行中的查询持有悬空引用；索引候选必须经完整谓词验证；索引缺失、损坏或重建不得污染事实数据。QuIVer、BQ、属性 posting、文本倒排与图目录按已保存的事实重建。统一 `.idx` 容器同时保存登记正文、关键词和属性索引定义等持久化事实，缓存清理与索引重建必须保留这些内容。完整布局见[数据库文件组](docs/storage-format.md)。
 
+过滤、排序、Top-K 和分页的逻辑顺序由查询定义。有索引、无索引与重开后的执行计划应使用同一组独立预期核对每一页的节点身份和顺序。
+
 #### A10. Late Materialization 是强制不变量
 
 纯向量候选阶段必须满足 `payload_lookup_count = 0` 且 `payload_parsed_bytes = 0`。正确顺序是：BQ/QuIVer/Exact 候选生成 → 精确精排 → Top-K/rerank pool 截断 → 必要时 Payload hydrate。只有 Payload 谓词、字段排序/聚合或公共返回值确实需要时才允许解析。
@@ -156,6 +166,8 @@ Rust Embedded Core 是产品主体和公共语义权威。Python、Node、CLI �
 #### A11. 事务与 WAL 保持全原子语义
 
 尽可能把所有可能失败的检查前置到 WAL 之前；批量操作不得产生半批状态；CAS、Unique、Atomic Delete 与普通 CRUD 共享同一事务事实；未提交事务与截断尾帧不得泄漏；恢复后结果必须确定且可再次打开。
+
+使用组提交的宿主在内核完成组同步后确认本组回执。写入后刷新 ETag 等派生状态失败时，宿主应保留已分配的 ID，并按内核的最终写入状态答复请求。已确认回执与尚待同步回执分别处理。
 
 #### A12. 三端必须同步变更
 

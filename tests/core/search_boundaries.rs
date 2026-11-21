@@ -742,3 +742,88 @@ fn 加权混合检索端点与原始向量排序和文本匹配一致() {
         assert_eq!(run(invalid).unwrap_err().code(), "TDB_INVALID_INPUT");
     }
 }
+
+#[test]
+fn 精确余弦在大分量抵消后保留小分量排名() {
+    let dir = support::TestDir::new("exact_cancellation");
+    let mut db = Database::<f32>::open(&dir.file("db.tdb"), 4).unwrap();
+    db.insert_with_id(12, &[1e8, 1., -1e8, 1.], json!({}))
+        .unwrap();
+    db.insert_with_id(13, &[1e8, 0., -1e8, 1.5], json!({}))
+        .unwrap();
+    let hits = db.search_exact(&[1.; 4], 2).unwrap();
+    let expected = [
+        (12, 1.0 / (2e16f64 + 2.).sqrt()),
+        (13, 0.75 / (2e16f64 + 2.25).sqrt()),
+    ];
+    assert_eq!(
+        hits.into_iter()
+            .map(|h| (h.id, h.score))
+            .collect::<Vec<_>>(),
+        expected.map(|(id, v)| (id, v as f32))
+    );
+}
+
+#[test]
+fn 实例预算在检索解码和解析身份复制前生效() {
+    use triviumdb::document::parsing::{DocumentFormat, DocumentParseInput};
+    use triviumdb::index::pelorus::PelorusSearchOptions;
+    let dir = support::TestDir::new("payload_request_limit");
+    let mut db = Database::<f32>::open_with_config(
+        &dir.file("db.tdb"),
+        Config {
+            dim: 2,
+            payload_cache_bytes: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.insert(&[0.25, 0.], json!({"s":"x".repeat(65536)}))
+        .unwrap();
+    db.build_pelorus_index(Default::default()).unwrap();
+    let base = db.instance_stats().memory.unwrap().estimated_memory_bytes;
+    db.set_memory_limit(base + 8192).unwrap();
+    let before = db.payload_memory_stats().payload_parsed_bytes;
+    assert_eq!(
+        db.search_exact(&[0.25, 0.], 1).unwrap_err().code(),
+        "TDB_CAPACITY_RESERVATION_REJECTED"
+    );
+    for filter in [None, Some(triviumdb::Filter::eq("missing", true.into()))] {
+        let options = PelorusSearchOptions {
+            exact: true,
+            top_k: 1,
+            payload_filter: filter,
+            ..Default::default()
+        };
+        assert_eq!(
+            db.search_pelorus(&[0.25, 0.], &options).unwrap_err().code(),
+            "TDB_CAPACITY_RESERVATION_REJECTED"
+        );
+    }
+    assert_eq!(db.payload_memory_stats().payload_parsed_bytes, before);
+    for (source_id, source_revision) in [
+        ("x".repeat(65536), "r".into()),
+        ("x".into(), "r".repeat(65536)),
+    ] {
+        let input = DocumentParseInput {
+            source_id,
+            source_revision,
+            content: "a".into(),
+            format: DocumentFormat::Plain,
+            media_type: None,
+            config: Default::default(),
+        };
+        assert_eq!(
+            db.parse_document(&input).unwrap_err().code(),
+            "TDB_CAPACITY_RESERVATION_REJECTED"
+        );
+    }
+    db.set_memory_limit(0).unwrap();
+    assert_eq!(
+        db.search_exact(&[0.25, 0.], 1).unwrap()[0].payload["s"]
+            .as_str()
+            .unwrap()
+            .len(),
+        65536
+    );
+}

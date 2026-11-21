@@ -199,7 +199,7 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
         options: &PelorusSearchOptions,
     ) -> Result<(Vec<PelorusHit>, RequestWorkspace)> {
         let _operation = self.enter_operation()?;
-        self.prepare_pelorus_search(options)?;
+        self.prepare_pelorus_search(std::iter::once(query), options)?;
         let mt = read_or_recover(&self.memtable);
         let mut response = mt.reserve_request_workspace(self.memory_limit, 0)?;
         let hits = search_locked(&mt, query, options, self.memory_limit, &mut response)?;
@@ -223,7 +223,7 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
     ) -> Result<(Vec<Vec<PelorusHit>>, RequestWorkspace)> {
         let _operation = self.enter_operation()?;
         pelorus::validate_dtype::<T>()?;
-        self.prepare_pelorus_search(options)?;
+        self.prepare_pelorus_search(queries.iter().map(Vec::as_slice), options)?;
         let mt = read_or_recover(&self.memtable);
         let response_bytes = queries
             .len()
@@ -236,17 +236,31 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
         Ok((hits, response))
     }
 
-    fn prepare_pelorus_search(&self, options: &PelorusSearchOptions) -> Result<()> {
+    fn prepare_pelorus_search<'a>(
+        &self,
+        queries: impl ExactSizeIterator<Item = &'a [T]>,
+        options: &PelorusSearchOptions,
+    ) -> Result<()> {
         options.validate()?;
-        if !options.exact && self.missing_index_policy == MissingIndexPolicy::BuildInMemory {
+        if queries.len() != 0
+            && !options.exact
+            && self.missing_index_policy == MissingIndexPolicy::BuildInMemory
+        {
             let pending = {
                 let mt = read_or_recover(&self.memtable);
                 mt.pelorus
                     .as_ref()
                     .filter(|state| state.index.is_none())
-                    .map(|state| (state.config, mt.vector_generation()))
+                    .map(|state| (state.config, mt.vector_generation(), mt.dim()))
             };
-            if let Some((config, generation)) = pending {
+            if let Some((config, generation, dim)) = pending {
+                pelorus::validate_dtype::<T>()?;
+                for query in queries {
+                    crate::request::check_current()?;
+                    crate::vector::validate_query_vector(query, dim)?;
+                    pelorus::boundary_factor(config.curvature, query)
+                        .map_err(|e| e.at_field("query"))?;
+                }
                 #[cfg(feature = "test-hooks")]
                 crate::test_hooks::hit(
                     crate::test_hooks::ConcurrencyPoint::PelorusBeforeLazyRebuild,
@@ -271,9 +285,13 @@ fn search_locked<T: VectorType>(
         options,
         mt.pelorus_policy != MissingIndexPolicy::Error,
         |id| match &options.payload_filter {
-            Some(filter) => Ok(mt
-                .try_get_payload(id)?
-                .is_some_and(|value| filter.matches(&value))),
+            Some(filter) => {
+                let _decoded =
+                    mt.reserve_request_workspace(memory_limit, mt.payload_query_peak(id)?)?;
+                Ok(mt
+                    .try_get_payload(id)?
+                    .is_some_and(|value| filter.matches(&value)))
+            }
             None => Ok(true),
         },
     )?;
@@ -292,14 +310,17 @@ fn search_locked<T: VectorType>(
     hits.into_iter()
         .map(|(id, distance)| {
             crate::request::check_current()?;
+            let _decoded =
+                mt.reserve_request_workspace(memory_limit, mt.payload_query_peak(id)?)?;
             let payload = mt.try_get_payload(id)?.ok_or_else(|| {
                 TriviumError::CorruptedFile(
                     "Pelorus 命中缺少 Payload (Pelorus hit has no payload)".into(),
                 )
             })?;
+            // 解码峰值只在处理本条记录时占用；批量回执持续持有实际副本的额度。
             grow(
                 response,
-                crate::storage::payload_store::estimate_json_memory(&payload),
+                crate::storage::payload_store::query_clone_peak(&payload),
             )?;
             Ok(PelorusHit {
                 id,

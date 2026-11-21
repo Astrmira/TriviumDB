@@ -92,6 +92,7 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
                 };
                 let snapshot = read_snapshot_checked(&mt, id, Some(&mut read))?
                     .ok_or(TriviumError::NodeNotFound(id))?;
+                let base = read.base;
                 let expanded = context_ranges(&snapshot, &seeds, query, &mut visits)?;
                 let mut keys = Vec::new();
                 returned = returned

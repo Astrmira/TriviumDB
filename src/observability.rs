@@ -6,8 +6,9 @@
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct ProcessMemorySnapshot {
     pub rss_bytes: u64,
-    pub minor_faults: u64,
-    pub major_faults: u64,
+    pub total_faults: Option<u64>,
+    pub minor_faults: Option<u64>,
+    pub major_faults: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
@@ -43,6 +44,13 @@ pub struct StorageWriteStats {
     pub logical_bytes: u64,
 }
 
+/// 发布线程与数据库句柄共享累计值，查询统计无需取得存储数据锁。
+#[derive(Debug, Default)]
+pub(crate) struct PublishedWriteBytes {
+    pub checkpoint: std::sync::atomic::AtomicU64,
+    pub index: std::sync::atomic::AtomicU64,
+}
+
 impl StorageWriteStats {
     pub fn total_written_bytes(self) -> u64 {
         self.wal_bytes
@@ -62,8 +70,8 @@ pub fn process_memory_snapshot() -> Option<ProcessMemorySnapshot> {
         let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
         let end = stat.rfind(')')?;
         let fields: Vec<&str> = stat[end + 2..].split_whitespace().collect();
-        let minor_faults = fields.get(7)?.parse().ok()?;
-        let major_faults = fields.get(9)?.parse().ok()?;
+        let minor_faults = fields.get(7)?.parse::<u64>().ok()?;
+        let major_faults = fields.get(9)?.parse::<u64>().ok()?;
         let status = std::fs::read_to_string("/proc/self/status").ok()?;
         let rss_kib = status
             .lines()
@@ -74,8 +82,9 @@ pub fn process_memory_snapshot() -> Option<ProcessMemorySnapshot> {
             .ok()?;
         Some(ProcessMemorySnapshot {
             rss_bytes: rss_kib.saturating_mul(1024),
-            minor_faults,
-            major_faults,
+            total_faults: minor_faults.checked_add(major_faults),
+            minor_faults: Some(minor_faults),
+            major_faults: Some(major_faults),
         })
     }
     #[cfg(target_os = "windows")]
@@ -127,8 +136,9 @@ pub fn process_memory_snapshot() -> Option<ProcessMemorySnapshot> {
         };
         (success != 0).then_some(ProcessMemorySnapshot {
             rss_bytes: counters.working_set_size as u64,
-            minor_faults: counters.page_fault_count as u64,
-            major_faults: 0,
+            total_faults: Some(u64::from(counters.page_fault_count)),
+            minor_faults: None,
+            major_faults: None,
         })
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -147,9 +157,17 @@ mod tests {
         {
             let snapshot = process_memory_snapshot().unwrap();
             assert!(snapshot.rss_bytes > 0);
+            assert_eq!(
+                snapshot.total_faults.unwrap(),
+                snapshot.minor_faults.unwrap() + snapshot.major_faults.unwrap()
+            );
         }
         #[cfg(target_os = "windows")]
-        assert!(process_memory_snapshot().is_some_and(|snapshot| snapshot.rss_bytes > 0));
+        {
+            let snapshot = process_memory_snapshot().unwrap();
+            assert!(snapshot.rss_bytes > 0 && snapshot.total_faults.is_some());
+            assert_eq!((snapshot.minor_faults, snapshot.major_faults), (None, None));
+        }
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         assert!(process_memory_snapshot().is_none());
     }

@@ -55,7 +55,13 @@ pub(super) fn parse_reachability_options(
             false,
         )?,
         max_edges: parse_search_usize(env, object.get("maxEdges")?, 50_000.0, "maxEdges", false)?,
-        max_frontier_size: 10_000,
+        max_frontier_size: parse_search_usize(
+            env,
+            object.get("maxFrontierSize")?,
+            10_000.0,
+            "maxFrontierSize",
+            false,
+        )?,
         exhaustion_policy: crate::graph::budget::BudgetExhaustionPolicy::Partial,
     })
 }

@@ -2,6 +2,7 @@
 
 use super::FactFingerprint;
 use crate::database::{Config, Database, StorageMode, write_or_recover};
+use crate::index::property::PropertyIndexKind;
 use crate::{Result, TriviumError, VectorType};
 use bincode::Options;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -17,8 +18,10 @@ pub struct Manifest {
     pub nodes: usize,
     pub next_id: u64,
     pub storage_id: [u8; 16],
-    pub indexes: Vec<(String, Vec<String>)>,
+    pub indexes: Vec<(PropertyIndexKind, Vec<String>)>,
     pub unique: Vec<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pelorus: Option<crate::index::pelorus::PelorusConfig>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -52,6 +55,80 @@ pub fn finish(mut writer: BufWriter<File>) -> Result<()> {
     writer.flush()?;
     writer.get_ref().sync_all()?;
     Ok(())
+}
+
+/// 当前来源使用当前内核在受租约保护的工作副本中恢复，包括 WAL 和 Pelorus 度量。
+pub fn export_current<T: VectorType + Serialize + DeserializeOwned>(
+    path: &str,
+    dimension: usize,
+    memory: usize,
+    directory: &Path,
+) -> Result<FactFingerprint> {
+    let mut db = Database::<T>::open_with_config(
+        path,
+        Config {
+            dim: dimension,
+            memory_limit: memory,
+            auto_build_quiver: false,
+            load_text_index: true,
+            missing_index_policy: crate::database::MissingIndexPolicy::Fallback,
+            ..Default::default()
+        },
+    )?;
+    let expected = super::fingerprint(&db)?;
+    {
+        let mt = crate::database::read_or_recover(&db.memtable);
+        let peak = mt
+            .estimated_memory_bytes()
+            .saturating_mul(3)
+            .saturating_add(1024 * 1024);
+        mt.ensure_additional_memory(memory, peak)?;
+        let _workspace = db.resource_runtime.reserve_workspace(peak)?;
+        let manifest = Manifest {
+            protocol: 1,
+            dimension,
+            nodes: mt.node_count(),
+            next_id: mt.next_id_value(),
+            storage_id: mt.storage_id,
+            indexes: mt.property_indexes().index_definitions(),
+            unique: mt.unique_index_definitions(),
+            pelorus: mt.pelorus.as_ref().map(|state| state.config),
+        };
+        let mut writer = create(&directory.join("manifest.json"))?;
+        serde_json::to_writer(&mut writer, &manifest).map_err(|e| invalid(&e.to_string()))?;
+        finish(writer)?;
+        let mut writer = create(&directory.join("nodes.bin"))?;
+        for id in mt.active_node_ids() {
+            crate::request::check_current()?;
+            let payload = mt
+                .try_get_payload(id)?
+                .ok_or_else(|| invalid("node payload"))?;
+            let vector = mt.get_vector(id).ok_or_else(|| invalid("node vector"))?;
+            write_node(
+                &mut writer,
+                &NodeRecord {
+                    id,
+                    vector: bytemuck::cast_slice(vector).to_vec(),
+                    payload: payload.to_string(),
+                    edges: serde_json::to_string(mt.get_edges(id).unwrap_or_default())
+                        .map_err(|e| invalid(&e.to_string()))?,
+                },
+            )?;
+        }
+        finish(writer)?;
+        mt.text_engine().save_to_file(&directory.join("text.bin"))?;
+        let mut writer = create(&directory.join("graphs.bin"))?;
+        crate::storage::named_graphs::save(&mt.named_graphs, &mut writer)?;
+        finish(writer)?;
+        let mut writer = create(&directory.join("documents.bin"))?;
+        crate::storage::document_publications::save(&mt.document_publications, &mut writer)?;
+        finish(writer)?;
+        let mut writer = create(&directory.join("receipts.bin"))?;
+        writer.write_all(&mt.editing.checkpoint()?)?;
+        finish(writer)?;
+    }
+    db.close()?;
+    Ok(expected)
 }
 
 fn bounded_read(path: &Path, memory: usize) -> Result<Vec<u8>> {
@@ -192,12 +269,12 @@ pub fn restore<T: VectorType + Serialize + DeserializeOwned>(
         }
     }
     for (kind, fields) in &manifest.indexes {
-        match (kind.as_str(), fields.as_slice()) {
-            ("hash", [field]) => db.create_index(field)?,
-            ("ordered", [field]) => db.create_ordered_index(field)?,
-            ("bitmap", [field]) => db.create_bitmap_index(field)?,
-            ("ngram", [field]) => db.create_ngram_index(field)?,
-            ("composite", _) => db.create_composite_index(fields)?,
+        match (kind, fields.as_slice()) {
+            (PropertyIndexKind::Hash, [field]) => db.create_index(field)?,
+            (PropertyIndexKind::Ordered, [field]) => db.create_ordered_index(field)?,
+            (PropertyIndexKind::Bitmap, [field]) => db.create_bitmap_index(field)?,
+            (PropertyIndexKind::Ngram, [field]) => db.create_ngram_index(field)?,
+            (PropertyIndexKind::Composite, _) => db.create_composite_index(fields)?,
             _ => return Err(invalid("index definition")),
         }
     }
@@ -243,6 +320,9 @@ pub fn restore<T: VectorType + Serialize + DeserializeOwned>(
             }
         }
         mt.mark_checkpoint_dirty();
+    }
+    if let Some(config) = manifest.pelorus {
+        db.build_pelorus_index(config)?;
     }
     let fingerprint = super::fingerprint(&db)?;
     db.close()?;

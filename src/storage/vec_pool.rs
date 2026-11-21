@@ -213,15 +213,37 @@ impl<T: VectorType> VecPool<T> {
     // ════════ 写操作（均使缓存失效） ════════
 
     /// 追加一个新向量到增量层
-    pub fn push(&mut self, vector: &[T]) {
-        self.delta.extend_from_slice(vector);
+    pub fn push(&mut self, vector: &[T]) -> Result<()> {
+        self.validate_width(vector)?;
+        self.append_records(vector)
+    }
+
+    fn validate_width(&self, vector: &[T]) -> Result<()> {
+        if self.dim == 0 || vector.len() != self.dim {
+            return Err(TriviumError::DimensionMismatch {
+                expected: self.dim,
+                got: vector.len(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn append_records(&mut self, vectors: &[T]) -> Result<()> {
+        if self.dim == 0 || !vectors.len().is_multiple_of(self.dim) {
+            return Err(TriviumError::CorruptedFile(
+                "向量块未按维度对齐 (Vector block is not aligned to its dimension)".into(),
+            ));
+        }
+        self.delta.extend_from_slice(vectors);
         self.invalidate_cache();
+        Ok(())
     }
 
     /// 逻辑删除：将指定索引的向量置零
     /// - 如果在 mmap 区域：通过 MAP_PRIVATE COW 写入私有页（不影响磁盘文件）
     /// - 如果在增量区域：直接修改 Vec
-    pub fn zero_out(&mut self, index: usize) {
+    pub fn zero_out(&mut self, index: usize) -> Result<()> {
+        self.validate_slot(index)?;
         let offset = index * self.dim;
         if index < self.mmap_count {
             // mmap 基础层：COW 写入（仅影响进程私有页，磁盘文件未变）
@@ -244,10 +266,22 @@ impl<T: VectorType> VecPool<T> {
             }
         }
         self.invalidate_cache();
+        Ok(())
+    }
+
+    fn validate_slot(&self, index: usize) -> Result<()> {
+        if index >= self.total_count() {
+            return Err(TriviumError::InvalidInput(
+                "向量槽越界 (Vector slot out of range)".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// 就地更新指定索引的向量
-    pub fn update(&mut self, index: usize, vector: &[T]) {
+    pub fn update(&mut self, index: usize, vector: &[T]) -> Result<()> {
+        self.validate_width(vector)?;
+        self.validate_slot(index)?;
         let offset = index * self.dim;
         if index < self.mmap_count {
             // mmap 基础层：COW 写入（仅影响进程私有页，磁盘文件未变）
@@ -265,6 +299,7 @@ impl<T: VectorType> VecPool<T> {
             self.delta[delta_offset..delta_offset + self.dim].copy_from_slice(vector);
         }
         self.invalidate_cache();
+        Ok(())
     }
 
     // ════════ 读操作 ════════
@@ -282,12 +317,10 @@ impl<T: VectorType> VecPool<T> {
             })
         } else {
             let delta_index = index - self.mmap_count;
-            let delta_offset = delta_index * self.dim;
-            if delta_offset + self.dim <= self.delta.len() {
-                Some(&self.delta[delta_offset..delta_offset + self.dim])
-            } else {
-                None
-            }
+            let delta_offset = delta_index.checked_mul(self.dim)?;
+            (self.dim > 0).then_some(())?;
+            self.delta
+                .get(delta_offset..delta_offset.checked_add(self.dim)?)
         }
     }
 
@@ -404,6 +437,11 @@ impl<T: VectorType> VecPool<T> {
     }
 
     pub fn flush(&mut self, vec_path: &Path) -> Result<usize> {
+        self.flush_measured(vec_path).map(|(count, _)| count)
+    }
+
+    /// 返回发布后的槽位数，以及本次实际写入向量文件的字节数。
+    pub(crate) fn flush_measured(&mut self, vec_path: &Path) -> Result<(usize, u64)> {
         if self.recovery_required {
             return Err(TriviumError::WalClosed);
         }
@@ -424,7 +462,7 @@ impl<T: VectorType> VecPool<T> {
             self.delta.clear();
             self.has_dirty_base = false;
             self.invalidate_cache();
-            return Ok(0);
+            return Ok((0, 0));
         }
 
         // ── 策略分支 ──
@@ -435,11 +473,16 @@ impl<T: VectorType> VecPool<T> {
         if !self.has_dirty_base && self.mmap.is_some() {
             if self.delta.is_empty() {
                 // 既无脏页也无新增，无需任何 I/O
-                return Ok(self.mmap_count);
+                return Ok((self.mmap_count, 0));
             }
-            self.flush_append(vec_path)
+            let bytes = std::mem::size_of_val(self.delta.as_slice()) as u64;
+            self.flush_append(vec_path).map(|count| (count, bytes))
         } else {
-            self.flush_rewrite(vec_path)
+            let count = self.flush_rewrite(vec_path)?;
+            Ok((
+                count,
+                count as u64 * self.dim as u64 * std::mem::size_of::<T>() as u64,
+            ))
         }
     }
 
@@ -717,9 +760,9 @@ mod startup_tests {
             #[cfg(windows)]
             let previous_address = pool.mmap.as_ref().unwrap().as_ptr();
             if dirty {
-                pool.update(0, &updated);
+                pool.update(0, &updated).unwrap();
             }
-            pool.push(&updated);
+            pool.push(&updated).unwrap();
             pool.finish_loading().unwrap();
             assert_eq!(
                 pool.get(0).unwrap(),

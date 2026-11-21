@@ -121,10 +121,13 @@ pub fn fingerprint<T: VectorType + serde::Serialize + serde::de::DeserializeOwne
 pub fn publish_directory(source: &std::path::Path, target: &std::path::Path) -> Result<()> {
     crate::error::WriteErrorInfo::capture_destination(|write| {
         crate::storage::fs::sync_parent_directory(&source.join("database.tdb"))?;
-        crate::storage::fs::rename_new(source, target)?;
         write.phase = crate::error::WritePhase::Publish;
-        write.outcome = crate::error::WriteOutcome::Committed;
+        crate::storage::fs::rename_new(source, target)?;
+        write.outcome = crate::error::WriteOutcome::Unknown;
+        #[cfg(feature = "test-hooks")]
+        crate::test_hooks::io_result(crate::test_hooks::IoPoint::MigrationDirectorySync)?;
         crate::storage::fs::sync_parent_directory(target)?;
+        write.outcome = crate::error::WriteOutcome::Committed;
         Ok(())
     })
 }

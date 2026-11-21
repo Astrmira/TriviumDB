@@ -278,19 +278,17 @@ impl Wal {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
             Err(error) => return Err(error.into()),
         };
-        if existing_len == 0 {
-            Self::publish_base(&wal_path, token, false)?;
-        }
+        let base_written = if existing_len == 0 {
+            Self::publish_base(&wal_path, token, false)?
+        } else {
+            0
+        };
         let file = OpenOptions::new().append(true).open(&wal_path)?;
         Ok(Self {
             wal_path,
             writer: Some(BufWriter::new(file)),
             sync_mode,
-            cumulative_written_bytes: if existing_len == 0 {
-                WAL_HEADER_SIZE + if token.is_some() { 28 } else { 0 }
-            } else {
-                0
-            },
+            cumulative_written_bytes: base_written,
             cumulative_logical_bytes: 0,
             group_commit_active: false,
             group_commit_pending: false,
@@ -348,7 +346,9 @@ impl Wal {
             write_framed_entry(writer, entry)?
         };
         self.cumulative_written_bytes = self.cumulative_written_bytes.saturating_add(8 + len);
-        self.cumulative_logical_bytes = self.cumulative_logical_bytes.saturating_add(len);
+        if !matches!(entry, WalEntry::Checkpoint { .. }) {
+            self.cumulative_logical_bytes = self.cumulative_logical_bytes.saturating_add(len);
+        }
         if self.group_commit_active {
             self.group_commit_pending = true;
         } else {
@@ -397,22 +397,25 @@ impl Wal {
         tx_id: u64,
         entries: &[WalEntry<T>],
     ) -> Result<()> {
-        let batch_bytes = {
+        let (batch_bytes, logical_bytes) = {
             let writer = self.writer.as_mut().ok_or(TriviumError::WalClosed)?;
             let mut batch_bytes =
                 8 + write_framed_entry(writer, &WalEntry::<T>::TxBegin { tx_id })?;
+            let mut logical_bytes = 0u64;
             for entry in entries {
-                batch_bytes = batch_bytes.saturating_add(8 + write_framed_entry(writer, entry)?);
+                let len = write_framed_entry(writer, entry)?;
+                batch_bytes = batch_bytes.saturating_add(8 + len);
+                logical_bytes = logical_bytes.saturating_add(len);
             }
-            batch_bytes
-                .saturating_add(8 + write_framed_entry(writer, &WalEntry::<T>::TxCommit { tx_id })?)
+            batch_bytes = batch_bytes.saturating_add(
+                8 + write_framed_entry(writer, &WalEntry::<T>::TxCommit { tx_id })?,
+            );
+            (batch_bytes, logical_bytes)
         };
 
         // 字节已经写入 BufWriter；必须先更新指标，避免后续 flush/sync 失败时漏报。
         self.cumulative_written_bytes = self.cumulative_written_bytes.saturating_add(batch_bytes);
-        self.cumulative_logical_bytes = self
-            .cumulative_logical_bytes
-            .saturating_add(batch_bytes.saturating_sub(8 * (entries.len() as u64 + 2)));
+        self.cumulative_logical_bytes = self.cumulative_logical_bytes.saturating_add(logical_bytes);
 
         // Group Commit 中只追加完整事务帧，组尾统一执行同步。
         if self.group_commit_active {
@@ -845,14 +848,15 @@ impl Wal {
     pub fn clear(&mut self) -> Result<()> {
         self.ensure_writable()?;
         self.writer.take();
-        Self::publish_base(&self.wal_path, self.checkpoint_token, true)?;
+        let written = Self::publish_base(&self.wal_path, self.checkpoint_token, true)?;
+        self.cumulative_written_bytes = self.cumulative_written_bytes.saturating_add(written);
         self.writer = Some(BufWriter::new(
             OpenOptions::new().append(true).open(&self.wal_path)?,
         ));
         Ok(())
     }
 
-    fn publish_base(path: &std::path::Path, token: Option<[u8; 16]>, replace: bool) -> Result<()> {
+    fn publish_base(path: &std::path::Path, token: Option<[u8; 16]>, replace: bool) -> Result<u64> {
         let stage = path.with_added_extension("tmp");
         // 单写租约保护固定暂存名；上次中断遗留的暂存文件从未作为正式日志发布。
         match std::fs::remove_file(&stage) {
@@ -863,8 +867,9 @@ impl Wal {
         let mut file = File::create_new(&stage)?;
         file.write_all(WAL_MAGIC)?;
         file.write_all(&WAL_VERSION.to_le_bytes())?;
+        let mut written = WAL_HEADER_SIZE;
         if let Some(token) = token {
-            write_framed_entry(&mut file, &WalEntry::<u8>::Checkpoint { token })?;
+            written += 8 + write_framed_entry(&mut file, &WalEntry::<u8>::Checkpoint { token })?;
         }
         file.sync_all()?;
         drop(file);
@@ -879,7 +884,7 @@ impl Wal {
             super::fs::rename_new(&stage, path)?;
             super::fs::sync_parent_directory(path)?;
         }
-        Ok(())
+        Ok(written)
     }
 
     /// 显式 flush BufWriter 中缓冲的数据到磁盘

@@ -64,7 +64,7 @@ impl Default for HookContext {
 impl HookContext {
     pub fn new() -> Self {
         Self {
-            custom_data: serde_json::Value::Null,
+            custom_data: serde_json::json!({}),
             stage_timings: Vec::new(),
             stage_counts: Vec::new(),
             observations: Vec::new(),
@@ -728,7 +728,7 @@ mod tests {
     #[test]
     fn test_hook_context() {
         let mut ctx = HookContext::new();
-        assert!(ctx.custom_data.is_null());
+        assert_eq!(ctx.custom_data, serde_json::json!({}));
         assert!(ctx.stage_timings.is_empty());
         assert!(!ctx.abort);
 
@@ -819,7 +819,7 @@ mod tests {
     #[test]
     fn test_hook_context_default() {
         let ctx = HookContext::default();
-        assert!(ctx.custom_data.is_null());
+        assert_eq!(ctx.custom_data, serde_json::json!({}));
         assert!(!ctx.abort);
     }
 

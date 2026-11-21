@@ -336,6 +336,8 @@ fn inc溢出和类型错误原子拒绝包括同补丁其他字段() {
         (Value::Null, json!(1)),
         (json!("1"), json!(1)),
         (json!(9007199254740993u64), json!(0.5)),
+        (json!(1u64 << 52), json!(1.5)),
+        (json!(1.5), json!(1u64 << 52)),
     ] {
         let original = json!({"value":initial, "keep":"original"});
         db.upsert_with_id(1, &[1., 0.], original.clone()).unwrap();

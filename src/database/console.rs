@@ -786,11 +786,19 @@ impl<T: VectorType + Serialize + serde::de::DeserializeOwned> Database<T> {
                 struct Edges<'a> {
                     edges: Vec<EdgeOutput<'a>>,
                 }
+                let mt = super::read_or_recover(&self.memtable);
+                mt.ensure_readable()?;
                 if incoming {
-                    let edges = self.get_incoming_edges(node_id, None)?;
-                    if !edges.is_empty() {
-                        check_count(edges.len(), options.max_operations)?;
+                    let mut examined = 0usize;
+                    for &source in mt.get_incoming_sources(node_id) {
+                        active.control.check()?;
+                        examined =
+                            examined.saturating_add(mt.get_edges(source).map_or(0, <[_]>::len));
+                        if examined > options.max_operations {
+                            check_count(examined, options.max_operations)?;
+                        }
                     }
+                    let edges = mt.get_incoming_edges(node_id, None);
                     let output = Edges {
                         edges: edges
                             .iter()
@@ -807,7 +815,7 @@ impl<T: VectorType + Serialize + serde::de::DeserializeOwned> Database<T> {
                     };
                     encode_response(&request.request_id, &output, limit, false, &runtime)
                 } else {
-                    let edges = self.get_edges(node_id)?;
+                    let edges = mt.get_edges(node_id).unwrap_or_default();
                     if !edges.is_empty() {
                         check_count(edges.len(), options.max_operations)?;
                     }
@@ -834,8 +842,22 @@ impl<T: VectorType + Serialize + serde::de::DeserializeOwned> Database<T> {
                 max_depth,
                 label,
             } => {
-                let path =
-                    self.shortest_path(id(&source)?, id(&target)?, max_depth, label.as_deref())?;
+                let mt = super::read_or_recover(&self.memtable);
+                mt.ensure_readable()?;
+                let path = crate::graph::pathfinding::shortest_path_checked(
+                    &*mt,
+                    id(&source)?,
+                    id(&target)?,
+                    max_depth,
+                    label.as_deref(),
+                    |visited, examined| {
+                        active.control.check()?;
+                        if visited.max(examined) > options.max_operations {
+                            check_count(visited.max(examined), options.max_operations)?;
+                        }
+                        Ok::<_, TriviumError>(())
+                    },
+                )?;
                 respond(&json!({"path":path.map(strings)}), false)
             }
             Command::Indexes => respond(&json!({"indexes":self.index_info()?}), false),
@@ -1194,9 +1216,8 @@ fn decode_vector<T: VectorType + serde::de::DeserializeOwned>(
 ) -> Result<Vec<T>> {
     values.into_iter().map(|value| {
         if !crate::vector::is_binary_vector::<T>() {
-            let number=value.as_f64().ok_or_else(||invalid("浮点向量分量必须是数字 (Floating vector components must be numbers)"))?;
-            // 浮点入站复用内核 f32 通道；half 的 serde 位模式不属于公开数值协议。
-            return Ok(T::from_f32(number as f32));
+            let number=value.as_number().ok_or_else(||invalid("浮点向量分量必须是数字 (Floating vector components must be numbers)"))?;
+            return T::from_json_number(number);
         }
         let number=match value {
             Value::String(raw) if !raw.is_empty() && raw.bytes().all(|byte|byte.is_ascii_digit()) => raw.parse::<u64>().map_err(|_| invalid("u64 向量分量无效 (Invalid u64 vector component)"))?,

@@ -755,9 +755,32 @@ fn 返回别名排序在同名事实索引存在时仍按投影求值() {
         db.insert_with_id(id, &[1.], json!({"rank":rank,"nested":{"rank":nested}}))
             .unwrap();
     }
-    for indexed in [false, true] {
-        if indexed {
+    for phase in 0..3 {
+        if phase == 1 {
             db.create_ordered_index("rank").unwrap();
+        }
+        if phase == 2 {
+            db.close().unwrap();
+            db = Database::<f32>::open_with_config(&dir.file("data.tdb"), config(StorageMode::Rom))
+                .unwrap();
+        }
+        let indexed = phase > 0;
+        for (order, offset, id) in [("ASC", 0, 3), ("ASC", 1, 2), ("DESC", 0, 1)] {
+            let query = format!(
+                "FIND {{rank: {{$gt:0}}}} RETURN nested, _.id AS id ORDER BY nested.rank {order} LIMIT 1 OFFSET {offset}"
+            );
+            let prepared = db.prepare_tql(&query).unwrap();
+            for rows in [
+                db.tql(&query).unwrap(),
+                db.execute_prepared_tql(&prepared, &Default::default())
+                    .unwrap(),
+            ] {
+                assert_eq!(rows.len(), 1);
+                assert!(
+                    matches!(rows[0]["id"], TqlValue::Int(value) if value == id),
+                    "{query}: {rows:?}"
+                );
+            }
         }
         for alias in ["picked", "_"] {
             for (direction, expected) in [("ASC", 10), ("DESC", 30)] {

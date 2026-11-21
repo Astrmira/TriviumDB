@@ -16,7 +16,10 @@ function runKernelBoundaries(root, TriviumDB = require('../../index.js').Trivium
     for (const indexed of [false, true]) {
       if (indexed) db.createIndex('kind')
       for (const { query, expected } of graphContract.counts) assert.deepEqual(db.tql(query), [{ total: expected }])
+      assert.deepEqual(db.tql(graphContract.distinct.query), graphContract.distinct.rows)
     }
+    db.patchPayload(1, { $set: { value: 2 ** 52 } })
+    assert.throws(() => db.patchPayload(1, { $inc: { value: 1.5 }, $set: { kind: 'changed' } }), error => error.code === 'TDB_INVALID_INPUT')
     for (const invalid of [NaN, Infinity, -Infinity]) {
       for (const action of [
         () => db.search([invalid, 0], 1, 0, -1),
@@ -28,6 +31,7 @@ function runKernelBoundaries(root, TriviumDB = require('../../index.js').Trivium
     assert.deepEqual(db.search([1, 0], Number.MAX_SAFE_INTEGER, 0, -1).map(hit => hit.id), [1, 2, 3])
     db.close()
     const reader = new TriviumDB(file, { dim: 2, storageMode, accessMode: 'readOnly' })
+    assert.deepEqual(reader.getPayload(1), { value: 2 ** 52, kind: 'source' })
     for (const { query, expected } of graphContract.counts) assert.deepEqual(reader.tql(query), [{ total: expected }])
     reader.close()
   }

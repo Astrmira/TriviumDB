@@ -94,6 +94,31 @@ pub(crate) fn write_or_recover<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
     })
 }
 
+fn verified_property_matches<T: VectorType>(
+    mt: &MemTable<T>,
+    candidates: impl IntoIterator<Item = NodeId>,
+    max_results: usize,
+    matches: impl Fn(&serde_json::Value) -> bool,
+) -> Result<Vec<NodeId>> {
+    let mut ids = Vec::new();
+    for id in candidates {
+        crate::request::check_current()?;
+        if mt
+            .try_get_payload(id)?
+            .is_some_and(|payload| matches(&payload))
+        {
+            if ids.len() == max_results {
+                return Err(TriviumError::QueryRowBudgetExceeded {
+                    budget: max_results,
+                });
+            }
+            ids.push(id);
+        }
+    }
+    ids.sort_unstable();
+    Ok(ids)
+}
+
 fn normalized_database_path(path: &str) -> Result<PathBuf> {
     let requested = Path::new(path);
     if requested.try_exists()? {
@@ -625,6 +650,7 @@ pub struct StorageInfo {
 pub struct Database<T: VectorType> {
     pub(crate) db_path: String,
     pub(crate) memtable: Arc<RwLock<MemTable<T>>>,
+    published_bytes: Arc<crate::observability::PublishedWriteBytes>,
     pub(crate) wal: Arc<Mutex<Wal>>,
     pub(crate) compaction: Option<CompactionThread>,
     /// 文件锁：防止多进程同时打开同一个数据库
@@ -1165,6 +1191,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         let recovery_required = memtable.recovery_latch();
         Ok(Self {
             db_path: normalized_path.to_string_lossy().into_owned(),
+            published_bytes: Arc::clone(&memtable.published_bytes),
             memtable: Arc::new(RwLock::new(memtable)),
             wal: Arc::new(Mutex::new(wal)),
             compaction: None,
@@ -2084,7 +2111,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                 target,
                 max_depth,
                 label,
-                crate::request::check_current,
+                |_, _| crate::request::check_current(),
             )
         })?
     }
@@ -2260,20 +2287,12 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         })
     }
 
-    /// 原子删除去重后的节点集合；任一节点不存在时不执行任何删除。
-    pub fn delete_many_atomic(&mut self, ids: &[NodeId]) -> Result<usize> {
-        Self::write_operation(|write| {
-            let _operation = self.enter_operation()?;
-            self.require_write_access("delete_many_atomic")?;
-            lock_or_recover(&self.wal).ensure_writable()?;
-            write.phase = WritePhase::Validation;
+    /// 校验去重删除集的节点、WAL 和关联边预算，供需要预读关联关系的宿主使用。
+    pub fn validate_delete_set(&self, ids: &std::collections::BTreeSet<NodeId>) -> Result<()> {
+        self.read_operation(|| {
             const MAX_DELETE_NODES: usize = 100_000;
             const MAX_DELETE_INCIDENT_EDGES: usize = 1_000_000;
             const MAX_DELETE_WAL_BYTES: usize = 8 * 1024 * 1024;
-            let ids = ids
-                .iter()
-                .copied()
-                .collect::<std::collections::BTreeSet<_>>();
             if ids.len() > MAX_DELETE_NODES {
                 return Err(TriviumError::InvalidInput(format!(
                     "批量删除超过节点预算 {MAX_DELETE_NODES} (Delete set exceeds node budget)"
@@ -2288,7 +2307,8 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
             let incident_edges = {
                 let mt = read_or_recover(&self.memtable);
                 let mut total = 0usize;
-                for id in &ids {
+                for id in ids {
+                    crate::request::check_current()?;
                     if !mt.contains(*id) {
                         return Err(TriviumError::NodeNotFound(*id));
                     }
@@ -2305,7 +2325,22 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                 estimated_wal_bytes
                     .saturating_add(ids.len().saturating_mul(24))
                     .saturating_add(incident_edges.saturating_mul(16)),
-            )?;
+            )
+        })?
+    }
+
+    /// 原子删除去重后的节点集合；任一节点不存在时不执行任何删除。
+    pub fn delete_many_atomic(&mut self, ids: &[NodeId]) -> Result<usize> {
+        Self::write_operation(|write| {
+            let _operation = self.enter_operation()?;
+            self.require_write_access("delete_many_atomic")?;
+            lock_or_recover(&self.wal).ensure_writable()?;
+            write.phase = WritePhase::Validation;
+            let ids = ids
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            self.validate_delete_set(&ids)?;
             let count = ids.len();
             let mut tx = transaction::TxBuilder::new();
             for id in ids {
@@ -2671,6 +2706,72 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         })
     }
 
+    /// 在同一读视图中按来源、目标、标签分页，仅为返回页复制边元数据。
+    pub fn edge_page(
+        &self,
+        id: NodeId,
+        direction: crate::graph::reachability::ReachabilityDirection,
+        label: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<crate::graph::reachability::SubgraphEdge>, usize)> {
+        use crate::graph::reachability::{ReachabilityDirection, SubgraphEdge};
+        let _operation = self.enter_operation()?;
+        let mt = read_or_recover(&self.memtable);
+        if !mt.contains(id) {
+            return Err(TriviumError::NodeNotFound(id));
+        }
+        let mut page = Vec::new();
+        let mut total = 0usize;
+        let mut visit = |source, outgoing: bool| -> Result<()> {
+            crate::request::check_current()?;
+            let edges = mt.get_edges(source).unwrap_or_default();
+            // 邻接表按目标和标签排序，入边只需访问该目标的连续区间。
+            let edges = if outgoing {
+                edges
+            } else {
+                let first = edges.partition_point(|edge| edge.target_id < id);
+                let last = edges.partition_point(|edge| edge.target_id <= id);
+                &edges[first..last]
+            };
+            for edge in edges {
+                crate::request::check_current()?;
+                if label.is_some_and(|expected| expected != edge.label) {
+                    continue;
+                }
+                if total >= offset && page.len() < limit {
+                    page.push(SubgraphEdge {
+                        source_id: source,
+                        target_id: edge.target_id,
+                        label: edge.label.clone(),
+                        weight: edge.weight,
+                        metadata: edge.metadata.clone(),
+                    });
+                }
+                total += 1;
+            }
+            Ok(())
+        };
+        let sources = mt.get_incoming_sources(id);
+        let split = sources.partition_point(|source| *source < id);
+        if direction != ReachabilityDirection::Outgoing {
+            for &source in &sources[..split] {
+                visit(source, false)?;
+            }
+        }
+        if direction != ReachabilityDirection::Incoming {
+            visit(id, true)?;
+        }
+        if direction != ReachabilityDirection::Outgoing {
+            for &source in &sources[split..] {
+                if source != id || direction == ReachabilityDirection::Incoming {
+                    visit(source, false)?;
+                }
+            }
+        }
+        Ok((page, total))
+    }
+
     pub fn get_incoming_edges(
         &self,
         id: NodeId,
@@ -3023,20 +3124,11 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
     }
 
     pub fn storage_write_stats(&self) -> crate::observability::StorageWriteStats {
-        let file_len = |suffix: &str| {
-            std::fs::metadata(format!("{}{}", self.db_path, suffix))
-                .map(|metadata| metadata.len())
-                .unwrap_or_default()
-        };
         let wal = lock_or_recover(&self.wal);
         crate::observability::StorageWriteStats {
             wal_bytes: wal.cumulative_written_bytes(),
-            sidecar_bytes: file_len(".idx")
-                .saturating_add(file_len(".pidx"))
-                .saturating_add(file_len(".quiver"))
-                .saturating_add(file_len(".text"))
-                .saturating_add(file_len(".gidx")),
-            checkpoint_bytes: file_len("").saturating_add(file_len(".vec")),
+            sidecar_bytes: self.published_bytes.index.load(Ordering::Relaxed),
+            checkpoint_bytes: self.published_bytes.checkpoint.load(Ordering::Relaxed),
             temporary_spill_bytes: 0,
             logical_bytes: wal.cumulative_logical_bytes(),
         }
@@ -3051,9 +3143,15 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
     ) -> Result<Vec<SearchHit>> {
         let _operation = self.enter_operation()?;
         let mt = read_or_recover(&self.memtable);
+        let request = crate::request::current();
         self.resource_runtime
             .pool(self.resource_runtime.parallelism())?
             .install(|| {
+                let _scope = request
+                    .as_ref()
+                    .map(crate::request::RequestContext::enter)
+                    .transpose()?;
+                crate::request::check_current()?;
                 crate::graph::constrained::rank_within(
                     &mt,
                     query,
@@ -3097,7 +3195,8 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                     .collect(),
             )
         };
-        let plan = crate::query::planner::plan_filter(&filter, &mt);
+        let plan =
+            crate::query::planner::plan_filter_with_limit(&filter, Some(max_results + 1), &mt);
         if matches!(
             plan.access_path,
             crate::query::planner::AccessPath::FullNodeScan
@@ -3108,21 +3207,9 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                     .into(),
             ));
         }
-        let mut ids = plan
-            .candidates
-            .into_iter()
-            .filter(|id| {
-                mt.get_payload(*id)
-                    .is_some_and(|payload| filter.matches(&payload))
-            })
-            .collect::<Vec<_>>();
-        ids.sort_unstable();
-        if ids.len() > max_results {
-            return Err(TriviumError::QueryRowBudgetExceeded {
-                budget: max_results,
-            });
-        }
-        Ok(ids)
+        verified_property_matches(&mt, plan.candidates, max_results, |payload| {
+            filter.matches(payload)
+        })
     }
 
     pub fn create_ngram_index(&mut self, field: &str) -> Result<()> {
@@ -3174,32 +3261,20 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
             ).at_field("max_results"));
         }
         let mt = read_or_recover(&self.memtable);
-        let candidates = mt
-            .find_by_ngram_property_index(field, needle)?
+        let candidates = mt.property_indexes()
+            .ngram_candidates(field, needle)?
             .ok_or_else(|| {
                 TriviumError::InvalidInput(
                     "字段没有 N-gram 索引，已拒绝全扫描 (Field has no N-gram index; full scan rejected)"
                         .into(),
                 )
             })?;
-        let mut ids = candidates
-            .into_iter()
-            .filter(|id| {
-                mt.get_payload(*id).is_some_and(|payload| {
-                    payload
-                        .get(field)
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|text| text.contains(needle))
-                })
-            })
-            .collect::<Vec<_>>();
-        ids.sort_unstable();
-        if ids.len() > max_results {
-            return Err(TriviumError::QueryRowBudgetExceeded {
-                budget: max_results,
-            });
-        }
-        Ok(ids)
+        verified_property_matches(&mt, candidates, max_results, |payload| {
+            payload
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| text.contains(needle))
+        })
     }
 
     pub fn create_unique_index(&mut self, field: &str) -> Result<()> {
@@ -3582,17 +3657,25 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
             false,
         )?;
         let _scope = context.enter()?;
-        self.prepare_quiver_rerank_with_source(&query, prepared.source().as_ref())?;
-        let mt = read_or_recover(&self.memtable);
         let mut limits = self.tql_limits.clone();
         limits.query_control = Some(control);
         if let Some(budget) = row_budget {
-            limits.max_query_rows = Some(match limits.max_query_rows {
+            let ceiling = match limits.max_query_rows {
                 Some(current) if current > 0 => current.min(budget),
                 _ => budget,
-            });
+            };
+            if let Some(limit) = query.limit
+                && limit
+                    .checked_add(query.offset.unwrap_or(0))
+                    .is_none_or(|rows| rows > ceiling)
+            {
+                return Err(TriviumError::QueryRowBudgetExceeded { budget: ceiling });
+            }
+            limits.max_query_rows = Some(ceiling);
             limits.row_overflow = RowOverflowPolicy::Throw;
         }
+        self.prepare_quiver_rerank_with_source(&query, prepared.source().as_ref())?;
+        let mt = read_or_recover(&self.memtable);
         crate::query::tql_executor::execute_tql_values_with_source(
             &query,
             &mt,

@@ -1,6 +1,6 @@
 # TQL (Trivium Query Language) 完整参考
 
-> 本文介绍 `0.9.3-beta.1` 的 TQL 语法与执行语义，涵盖文档来源、命名图、属性过滤、向量检索和统一查询管线。TQL 使用 Rust 实现，版本记录见[变更说明](changes/0.9.3-beta.1.md)。
+> 本文介绍 `0.9.3` 的 TQL 语法与执行语义，涵盖文档来源、命名图、属性过滤、向量检索和统一查询管线。TQL 使用 Rust 实现，版本记录见[变更说明](changes/0.9.3.md)。
 
 ---
 
@@ -325,6 +325,8 @@ ORDER BY _.heat DESC
 LIMIT 10 OFFSET 20
 ```
 
+省略 `ORDER BY` 时，`FIND` 按节点 ID 升序应用 `OFFSET` 和 `LIMIT`。显式按单字段排序时，若索引能精确表示该顺序，执行器按索引逐条检查过滤条件，收集足够的合格行后结束。
+
 > **提醒**：`FIND` 场景下节点绑定到隐式变量 `_`，在 `ORDER BY` 中通过 `_.field` 引用字段。
 
 ### 支持的全部操作符
@@ -561,9 +563,9 @@ WHERE _.score > 0.8
 RETURN *
 ```
 
-> **提醒**　当查询省略 `EXPAND` 且 `WHERE` 是已索引的等值或 AND 等值文档过滤时，Planner 先取得属性索引候选，核对候选的实际 JSON 值和类型，再在合格集合内精确向量排序并返回 Top-K。
->
-> 无可用属性索引、范围/OR/通用表达式或带 `EXPAND` 的查询保留候选后过滤路径；可能少于 TOP 指定数量，但始终执行最终精确谓词校验。
+省略 `EXPAND` 时，`WHERE {…}` 文档过滤先确定合格节点，再在其中精确排名并取 Top-K。有可用属性索引时先查候选，随后核对实际 Payload；其余情况扫描同一读视图。带 `EXPAND` 或通用表达式的查询继续对召回候选执行最终谓词，返回数量可能少于 K。
+
+`EXPLAIN SEARCH` 用 `filter_before_top_k` 标明过滤顺序。先过滤的简写查询中，`access_path` 描述属性候选的来源，`vector_access_path` 为 `exact_fallback`。
 
 简写 `SEARCH` 在 `WHERE` 和 `RETURN` 中通过 `similarity(_)` 访问当前节点的检索分数。组合管线保留各节点变量绑定时的相似度与路径值。使用 `WITH` 重命名节点时同步传递这些值。
 
@@ -728,7 +730,7 @@ ORDER BY sim DESC LIMIT 10
 
 WITH 在执行位置对每行求值并保存带类型的投影快照。同一 WITH 的所有右值读取进入该阶段时的作用域，再同时安装别名；后续 WITH 仅保留显式投影的列。表达式递归检查全部变量，标量重命名保留标量类型。
 
-普通投影和过滤保留匹配行的重数。例如两个节点之间有两条不同标签的边，`MATCH (a)-[]->(b) WITH a,b RETURN COUNT(*)` 计为两行。`RETURN DISTINCT` 按返回值去重，集合运算按节点与绑定身份合并。
+普通投影和过滤保留匹配行的重数。例如两个节点之间有两条不同标签的边，`MATCH (a)-[]->(b) WITH a,b RETURN COUNT(*)` 计为两行。非聚合的 `RETURN DISTINCT a.id, b.id` 按完整的有序数对去重，同一来源指向不同目标时各保留一行。集合运算按节点与绑定身份合并。
 
 EXPAND 将起点快照传给扩展结果；多个起点汇合到同一节点时，不同的投影环境保持独立逻辑行。节点别名保留原节点身份和属性，数组、对象及标量保留投影值，分组与过滤读取相同快照。保存的投影内容计入实例查询工作区及共享运行时配额。
 
@@ -833,6 +835,8 @@ RETURN clustered, topic(clustered) AS topic_id, topic_score(clustered) AS confid
 
 ## 表达式、聚合与空值
 
+`WHERE` 比较的两侧均可使用标量表达式。例如 `WHERE n.x<-1` 与 `WHERE 0 > (n.x + 1)` 对整数属性给出相同结果。`WHERE n.z IS NULL` 和 `WHERE n.z IS NOT NULL` 可直接作为谓词，也可与其他条件用 `AND` 或 `OR` 组合。
+
 表达式支持 `+ - * /`、括号优先级、参数、属性、一等分数、`COALESCE`、`IS NULL/IS NOT NULL`、`path()` 与 `path_length()`。认知管线新增 `text_score()`、`diversity_score()`、`residual_score()`、`topic()` 与 `topic_score()`；未携带对应分数的行返回 Null。除零、非数值算术和非有限结果返回 Null。
 
 整数的字面量、属性、节点 ID 与 Prepared 参数覆盖 `i64::MIN..=u64::MAX`；Rust 一等值使用 `Int(i64)`、`UInt(u64)`、`Float(f64)`。`WHERE`、排序与 `MIN/MAX` 共用精确数值比较，整数和浮点混合比较保持整数精度。浮点相等比较使用实际数值相等；`+0.0` 与 `-0.0` 相等。
@@ -864,7 +868,9 @@ MATCH (n {id: 42})
 SET VECTOR(n) == [1e-5, 0.2, -0.3]
 ```
 
-目标匹配集不受查询返回行上限静默截断。向量维度必须与数据库一致，且所有分量必须为有限值；任一目标或向量校验失败时，事务整体不提交。该语法当前使用数字字面量；需要参数化或批量向量写入时使用事务 API。
+`SET VECTOR` 按匹配到的唯一节点更新和统计 `affected`。同一节点经多条边匹配时只替换一次。向量维度须与数据库一致，所有分量都须为有限值。超出匹配预算、目标无效或向量校验失败会拒绝整个事务。该语法使用数字字面量，参数化或批量向量写入可使用事务 API。
+
+`MATCH … CREATE` 中已绑定的节点变量可直接作为新边的端点。在该节点上指定非空属性会在写入前报错，修改已有属性使用 `SET`。对象成员与数组元素之间使用逗号分隔。
 
 SET VECTOR 从字面量保留数值类型，并按目标 dtype 转换。`u64` 保留 `0..=18446744073709551615` 的整数位模式，负数、小数与超范围值在写 WAL 前拒绝；f32/f16 在转换后检查有限范围。Rust mutation AST 的 `SetVector.vector` 使用 `Vec<serde_json::Number>`，自定义 `VectorType` 可覆盖 `from_json_number()` 定义数值转换。
 

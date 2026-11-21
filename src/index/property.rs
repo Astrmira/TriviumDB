@@ -49,7 +49,10 @@ pub(crate) fn validate_index_fields(fields: &[String], composite: bool) -> Resul
 }
 
 fn text_ngrams(text: &str) -> Result<Vec<String>> {
-    let chars = text.chars().collect::<Vec<_>>();
+    let chars = text
+        .chars()
+        .take(MAX_NGRAMS_PER_VALUE + NGRAM_WIDTH)
+        .collect::<Vec<_>>();
     if chars.len() < NGRAM_WIDTH {
         return Ok(Vec::new());
     }
@@ -67,25 +70,23 @@ fn text_ngrams(text: &str) -> Result<Vec<String>> {
     Ok(grams)
 }
 
-fn intersect_postings<'a, I>(mut postings: I) -> Vec<NodeId>
-where
-    I: Iterator<Item = &'a [NodeId]>,
-{
-    let Some(first) = postings.next() else {
-        return Vec::new();
-    };
-    let mut output = first.to_vec();
-    for posting in postings {
-        output.retain(|id| posting.binary_search(id).is_ok());
-        if output.is_empty() {
-            break;
-        }
-    }
-    output
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PropertyKey(Vec<u8>);
+
+pub(crate) enum PropertyPosting<'a> {
+    Heap(&'a [NodeId]),
+    Mapped(&'a [[u8; 8]]),
+}
+impl PropertyPosting<'_> {
+    pub(crate) fn contains(&self, id: NodeId) -> bool {
+        match self {
+            Self::Heap(ids) => ids.binary_search(&id).is_ok(),
+            Self::Mapped(ids) => ids
+                .binary_search_by_key(&id, |bytes| u64::from_le_bytes(*bytes))
+                .is_ok(),
+        }
+    }
+}
 
 impl PropertyKey {
     pub(crate) fn encoded_len(&self) -> usize {
@@ -227,7 +228,7 @@ impl HashPropertyIndex {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum PropertyIndexKind {
     Hash,
@@ -1263,6 +1264,14 @@ impl PropertyIndexRegistry {
     }
 
     pub fn ngram_lookup(&self, field: &str, needle: &str) -> Result<Option<Vec<NodeId>>> {
+        Ok(self.ngram_candidates(field, needle)?.map(Iterator::collect))
+    }
+
+    pub(crate) fn ngram_candidates(
+        &self,
+        field: &str,
+        needle: &str,
+    ) -> Result<Option<impl Iterator<Item = NodeId> + '_>> {
         let index = match self.ngram_indexes.get(field) {
             Some(index) => index,
             None => return Ok(None),
@@ -1284,10 +1293,14 @@ impl PropertyIndexRegistry {
             })
             .collect::<Vec<_>>();
         postings.sort_by_key(|posting| posting.len());
-        if postings.first().is_some_and(|posting| posting.is_empty()) {
-            return Ok(Some(Vec::new()));
-        }
-        Ok(Some(intersect_postings(postings.into_iter())))
+        let mut postings = postings.into_iter();
+        let first = postings.next().unwrap_or_default();
+        Ok(Some(first.iter().copied().filter(move |id| {
+            postings
+                .as_slice()
+                .iter()
+                .all(|posting| posting.binary_search(id).is_ok())
+        })))
     }
 
     pub fn drop_ngram_index(&mut self, field: &str) {
@@ -1411,6 +1424,61 @@ impl PropertyIndexRegistry {
         })
     }
 
+    pub(crate) fn ordered_cursor(
+        &self,
+        field: &str,
+        descending: bool,
+        bound: Option<(Ordering, bool, Value)>,
+    ) -> Option<impl Iterator<Item = NodeId> + '_> {
+        let index = self
+            .ordered_indexes
+            .get(field)
+            .filter(|index| index.has_exact_order())?;
+        let range = bound
+            .filter(|(_, _, value)| exact_range_bound(value))
+            .and_then(|(order, inclusive, value)| {
+                ordered_key(&value).map(|key| (key.0, order, inclusive))
+            });
+        Some(
+            index
+                .entries
+                .iter_values(descending, range)
+                .flat_map(|posting| posting.iter().copied()),
+        )
+    }
+
+    /// 无显式排序的分页取最小实体 ID；范围按键访问，堆只保留当前页所需候选。
+    pub(crate) fn range_ids_by_identity(
+        &self,
+        field: &str,
+        op: Ordering,
+        inclusive: bool,
+        value: &Value,
+        limit: usize,
+    ) -> Option<Vec<NodeId>> {
+        if !exact_range_bound(value) {
+            return None;
+        }
+        let index = self.ordered_indexes.get(field)?;
+        let key = ordered_key(value)?;
+        let ids = index
+            .entries
+            .iter_values(false, Some((key.0, op, inclusive)))
+            .flatten()
+            .copied();
+        let mut heap = std::collections::BinaryHeap::new();
+        for id in ids {
+            if heap.len() < limit {
+                heap.push(id);
+            } else if let Some(mut worst) = heap.peek_mut()
+                && id < *worst
+            {
+                *worst = id;
+            }
+        }
+        Some(heap.into_sorted_vec())
+    }
+
     pub(crate) fn has_exact_ordered_index(&self, field: &str) -> bool {
         self.ordered_indexes
             .get(field)
@@ -1426,47 +1494,45 @@ impl PropertyIndexRegistry {
         self.unique_indexes.remove(field);
     }
 
+    pub(crate) fn posting(&self, field: &str, value: &Value) -> Option<PropertyPosting<'_>> {
+        let key = PropertyKey::from_json(value)?;
+        if let Some(index) = self.indexes.get(field) {
+            return Some(PropertyPosting::Heap(
+                index
+                    .entries
+                    .get(&key)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            ));
+        }
+        let mapped = self.mapped.as_ref()?;
+        let Some(range) = mapped.blocks.get(&(field.to_owned(), key)) else {
+            return mapped
+                .blocks
+                .range((field.to_owned(), PropertyKey(Vec::new()))..)
+                .next()
+                .filter(|((name, _), _)| name == field)
+                .map(|_| PropertyPosting::Heap(&[]));
+        };
+        let (ids, tail) = mapped.mmap.get(range.clone())?.as_chunks::<8>();
+        tail.is_empty().then_some(PropertyPosting::Mapped(ids))
+    }
+
     pub fn lookup_limit(
         &self,
         field: &str,
         value: &Value,
         limit: Option<usize>,
     ) -> Option<Vec<NodeId>> {
-        let key = PropertyKey::from_json(value)?;
-        if let Some(index) = self.indexes.get(field) {
-            let ids = index
-                .entries
-                .get(&key)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            return Some(
-                ids.iter()
-                    .copied()
-                    .take(limit.unwrap_or(usize::MAX))
-                    .collect(),
-            );
-        }
-        let mapped = self.mapped.as_ref()?;
-        let Some(range) = mapped.blocks.get(&(field.to_owned(), key)) else {
-            return mapped
-                .blocks
-                .keys()
-                .any(|(name, _)| name == field)
-                .then(Vec::new);
-        };
-        let bytes = mapped.mmap.get(range.clone())?;
-        if !bytes.len().is_multiple_of(std::mem::size_of::<NodeId>()) {
-            return None;
-        }
-        Some(
-            bytes
-                .as_chunks::<8>()
-                .0
+        let limit = limit.unwrap_or(usize::MAX);
+        Some(match self.posting(field, value)? {
+            PropertyPosting::Heap(ids) => ids[..ids.len().min(limit)].to_vec(),
+            PropertyPosting::Mapped(ids) => ids
                 .iter()
-                .take(limit.unwrap_or(usize::MAX))
-                .map(|raw| u64::from_le_bytes(*raw))
+                .take(limit)
+                .map(|id| u64::from_le_bytes(*id))
                 .collect(),
-        )
+        })
     }
 
     pub fn lookup(&self, field: &str, value: &Value) -> Option<Vec<NodeId>> {
@@ -2163,6 +2229,8 @@ fn load_part(
         key_encoding_version: key_version,
         ..Default::default()
     };
+    // 映射 posting 单独保存，字段身份须独立于堆索引目录校验。
+    let mut hash_fields = std::collections::HashSet::new();
     let mut all_mapped_blocks = BTreeMap::new();
     let mut all_mapped_posting_entries = 0usize;
     for _ in 0..field_count {
@@ -2231,7 +2299,7 @@ fn load_part(
             Vec::new()
         };
         let duplicate = match kind {
-            0 => registry.indexes.contains_key(&field),
+            0 => !hash_fields.insert(field.clone()),
             1 => registry.ordered_indexes.contains_key(&field),
             2 => registry
                 .composite_indexes
@@ -2335,13 +2403,17 @@ fn load_part(
                     ids.push(id);
                 }
             }
-            if prefer_mmap_postings && kind == 0 {
-                mapped_blocks.insert(
+            let duplicate = if prefer_mmap_postings && kind == 0 {
+                let previous = mapped_blocks.insert(
                     (field.clone(), key.clone()),
                     posting_range.expect("v3 posting 必须有范围"),
                 );
                 mapped_posting_entries = mapped_posting_entries.saturating_add(id_count);
-            } else if entries.insert(key, ids).is_some() {
+                previous.is_some()
+            } else {
+                entries.insert(key, ids).is_some()
+            };
+            if duplicate {
                 return Err(TriviumError::CorruptedFile(
                     "属性索引包含重复键 (Property index contains duplicate keys)".into(),
                 ));

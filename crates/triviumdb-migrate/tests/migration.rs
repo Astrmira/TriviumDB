@@ -261,6 +261,70 @@ fn before_and_after_publication_failures_retry_with_complete_facts() {
     }
 }
 
+#[cfg(feature = "test-hooks")]
+#[test]
+fn 父目录同步失败后重新确认并发布报告() {
+    let root = tempfile::tempdir().unwrap();
+    let source = fixture("f32", "mmap", "wal", &root.path().join("source"));
+    let opts = options(source, root.path().join("target"));
+    let failure =
+        triviumdb::test_hooks::fail_io_at(triviumdb::test_hooks::IoPoint::MigrationDirectorySync);
+    let error = triviumdb_migrate::run(&opts).unwrap_err();
+    assert_eq!((error.phase, error.outcome), ("publish", "unknown"));
+    assert!(opts.destination.join("database.tdb.migration").is_file());
+    assert!(!opts.destination.join("migration-report.json").exists());
+    drop(failure);
+    let report = triviumdb_migrate::run(&opts).unwrap();
+    assert!(report.committed && report.reused);
+    assert!(opts.destination.join("migration-report.json").is_file());
+    verify(&report.database, [vec![1.0f32, -0.0], vec![0.25, 1.0]]);
+}
+
+#[test]
+fn 当前双曲来源迁移后保留曲率和原始向量() {
+    use triviumdb::index::pelorus::PelorusConfig;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.tdb");
+    let mut db = Database::<f32>::open(source.to_str().unwrap(), 2).unwrap();
+    db.insert_with_id(17, &[0.25, 0.0], json!({"kind":"point"}))
+        .unwrap();
+    db.build_pelorus_index(PelorusConfig {
+        curvature: 2.0,
+        ..Default::default()
+    })
+    .unwrap();
+    db.close().unwrap();
+    for mmap in [false, true] {
+        let mut opts = options(
+            source.clone(),
+            root.path().join(if mmap { "mmap" } else { "rom" }),
+        );
+        opts.mmap = mmap;
+        opts.check = true;
+        let checked = triviumdb_migrate::run(&opts).unwrap();
+        assert!(checked.facts.components.contains_key("pelorus_curvature"));
+        opts.check = false;
+        let report = triviumdb_migrate::run(&opts).unwrap();
+        assert_eq!(report.facts, checked.facts);
+        let mut target = Database::<f32>::open(report.database.to_str().unwrap(), 2).unwrap();
+        let hits = target
+            .search_pelorus(&[0.25, 0.0], &Default::default())
+            .unwrap();
+        assert_eq!(
+            (hits[0].id, hits[0].distance, &hits[0].payload),
+            (17, 0.0, &json!({"kind":"point"}))
+        );
+        assert_eq!(
+            target
+                .search_pelorus(&[0.75, 0.0], &Default::default())
+                .unwrap_err()
+                .code(),
+            "TDB_INVALID_VECTOR"
+        );
+        target.close().unwrap();
+    }
+}
+
 #[test]
 fn corruption_and_unowned_staging_are_preserved() {
     let root = tempfile::tempdir().unwrap();
@@ -579,4 +643,81 @@ fn uncommitted_source_transaction_and_torn_tail_do_not_enter_target() {
         triviumdb_migrate::run(&options(source.clone(), root.path().join("target"))).unwrap();
     verify(&report.database, [vec![1.0f32, -0.0], vec![0.25, 1.0]]);
     assert_eq!(bytes(source.parent().unwrap()), before);
+}
+
+#[test]
+fn 源库制品名对预检和执行均保留() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("a.tdb");
+    let mut db = Database::<f32>::open(source.to_str().unwrap(), 2).unwrap();
+    db.insert_with_id(3, &[0., 1.], json!({"x":7})).unwrap();
+    db.close().unwrap();
+    for check in [true, false] {
+        let mut opts = options(source.clone(), source.with_extension("tdb.migration"));
+        opts.check = check;
+        assert_eq!(
+            triviumdb_migrate::run(&opts).unwrap_err().code,
+            "TDB_INVALID_INPUT"
+        );
+        assert!(!opts.destination.exists());
+    }
+    let reopened = Database::<f32>::open_read_only(source.to_str().unwrap(), 2).unwrap();
+    assert_eq!(reopened.get_payload(3).unwrap(), Some(json!({"x":7})));
+}
+
+#[test]
+fn 失败预检回收临时目录且与执行共同拒绝目标布局冲突() {
+    let root = tempfile::tempdir().unwrap();
+    let source = fixture("f32", "rom", "checkpoint", &root.path().join("source"));
+    let mut opts = options(source, root.path().join("target"));
+    opts.check = true;
+    for _ in 0..2 {
+        let error = triviumdb_migrate::run_controlled(&opts, |phase| {
+            if phase == Phase::Converted {
+                return Err(std::io::Error::other("受控检查中断").into());
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "TDB_IO");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+    opts.check = false;
+    triviumdb_migrate::run(&opts).unwrap();
+    opts.mmap = false;
+    for check in [true, false] {
+        opts.check = check;
+        assert_eq!(
+            triviumdb_migrate::run(&opts).unwrap_err().code,
+            "TDB_MIGRATION_CONFLICT"
+        );
+    }
+}
+
+#[test]
+fn 复用须核验报告且发布后故障保留提交状态() {
+    let root = tempfile::tempdir().unwrap();
+    let source = fixture("f32", "rom", "checkpoint", &root.path().join("source"));
+    let opts = options(source, root.path().join("target"));
+    let error = triviumdb_migrate::run_controlled(&opts, |phase| {
+        if phase == Phase::AfterPublish {
+            return Err(std::io::Error::other("受控发布中断").into());
+        }
+        Ok(())
+    })
+    .unwrap_err();
+    assert_eq!((error.phase, error.outcome), ("publish", "committed"));
+    let report = opts.destination.join("migration-report.json");
+    std::fs::write(&report, b"{}").unwrap();
+    let conflict = triviumdb_migrate::run(&opts).unwrap_err();
+    assert_eq!((conflict.phase, conflict.outcome), ("publish", "committed"));
+    std::fs::remove_file(&report).unwrap();
+    assert!(triviumdb_migrate::run(&opts).unwrap().reused);
+    std::fs::rename(&report, root.path().join("saved-report.json")).unwrap();
+    let missing = triviumdb_migrate::run(&opts).unwrap_err();
+    assert_eq!((missing.phase, missing.outcome), ("publish", "committed"));
+    std::fs::rename(root.path().join("saved-report.json"), &report).unwrap();
+    let reused = triviumdb_migrate::run(&opts).unwrap();
+    assert!(reused.reused && reused.committed);
+    verify(&reused.database, [vec![1.0f32, -0.0], vec![0.25, 1.]]);
 }
