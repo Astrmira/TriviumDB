@@ -2497,3 +2497,24 @@ async fn 大整数在整节点和单列投影中保留精度和嵌套结构() {
     assert_eq!(rows[0]["wide"]["value"], expected["wide"]);
     assert_eq!(rows[0]["items"]["value"], expected["values"]);
 }
+
+#[tokio::test]
+async fn 超时超出时钟范围时在打开数据库前拒绝启动() {
+    use axum::response::IntoResponse;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unopened.tdb");
+    let response = build_app(ServerConfig {
+        database_path: path.clone(),
+        request_timeout: Duration::MAX,
+        ..Default::default()
+    })
+    .await
+    .unwrap_err()
+    .into_response();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["code"], "TDB_INVALID_INPUT");
+    assert_eq!(body["target"]["field"], "request_timeout");
+    assert_eq!(dir.path().read_dir().unwrap().count(), 0);
+}

@@ -362,7 +362,7 @@ fn insert_rows<
     vectors: &Bound<'_, PyAny>,
     payloads: &Bound<'_, PyAny>,
 ) -> PyResult<Vec<u64>> {
-    let mut vectors = super::vectors::WriteRows::<T>::new(vectors)?;
+    let mut vectors = super::vectors::WriteRows::<T>::new(vectors, db.dim())?;
     let payloads = write_list(payloads, "payloads")?;
     let count = vectors.len();
     if count != payloads.len() {

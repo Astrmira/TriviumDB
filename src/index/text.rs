@@ -20,6 +20,22 @@ use analyzer::tokenize;
 const TEXT_INDEX_MAGIC: &[u8; 4] = b"TIDX";
 pub const TEXT_INDEX_VERSION: u32 = 2;
 
+pub(crate) fn validate_bm25(k1: f32, b: f32) -> crate::Result<()> {
+    if !k1.is_finite() || k1 <= 0.0 {
+        return Err(crate::TriviumError::InvalidInput(
+            "BM25 k1 必须为有限正数 (BM25 k1 must be finite and positive)".into(),
+        )
+        .at_field("bm25_k1"));
+    }
+    if !(0.0..=1.0).contains(&b) {
+        return Err(crate::TriviumError::InvalidInput(
+            "BM25 b 必须在 [0,1] 内 (BM25 b must be in [0,1])".into(),
+        )
+        .at_field("bm25_b"));
+    }
+    Ok(())
+}
+
 /// 完整重建时显式提供的节点正文与关键词。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

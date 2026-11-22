@@ -1282,3 +1282,48 @@ fn 隐藏元素和大指数标量按文档语法提取() {
         );
     }
 }
+
+#[test]
+fn 行内HTML保留跨事件的正文块与行证据() {
+    let raw = "intro <section>in**ne**r</section> tail";
+    let parsed = parsing::parse(&serde_json::from_value(json!({
+        "source_id":"inline.md","source_revision":"1","content":raw,"config":{"include_lines":true}
+    })).unwrap()).unwrap();
+    parsed.validate().unwrap();
+    let section = parsed
+        .blocks
+        .iter()
+        .find(|block| block.kind == "section")
+        .unwrap();
+    let lines: Vec<_> = parsed
+        .blocks
+        .iter()
+        .filter(|block| block.kind == "line" && block.parent.as_ref() == Some(&section.key))
+        .collect();
+    assert_eq!((section.start_byte, section.end_byte), (7, 12));
+    assert_eq!(&parsed.text[7..12], "inner");
+    assert_eq!(
+        lines
+            .iter()
+            .map(|block| (block.start_byte, block.end_byte))
+            .collect::<Vec<_>>(),
+        [(7, 12)]
+    );
+}
+
+#[test]
+fn 缺失来源身份时指向对应输入字段() {
+    for (id, rev, field) in [("", "1", "source_id"), ("ok", "", "source_revision")] {
+        let error = parsing::parse(
+            &serde_json::from_value(json!({
+                "source_id":id, "source_revision":rev, "content":"text"
+            }))
+            .unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            serde_json::to_value(error.info().target).unwrap(),
+            json!({"field": field})
+        );
+    }
+}

@@ -26,6 +26,21 @@ def run_vector_buffers(root):
                 assert exc.code == "TDB_INVALID_INPUT" and exc.target["field"] == "vectors"
             else:
                 raise AssertionError("应拒绝不兼容的矩阵")
+        released = memoryview(backing)
+        released.release()
+        for field, call in (
+            ("query_vectors", lambda: db.search_batch(released)),
+            ("vectors", lambda: db.batch_insert(released, [])),
+            ("vectors", lambda: db.batch_insert_with_ids([], released, [])),
+        ):
+            try:
+                call()
+            except ValueError as exc:
+                assert exc.code == "TDB_INVALID_INPUT" and exc.target == {"field": field}
+                if field == "vectors":
+                    assert exc.write["outcome"] == "not_committed"
+            else:
+                raise AssertionError("必须拒绝已释放的视图")
         invalid_row = memoryview(array("f", [1, 0, float("nan"), 1])).cast("B").cast("f", (2, 2))
         try:
             db.batch_insert_with_ids([80, 81], invalid_row, [{}, {}])
@@ -54,6 +69,24 @@ def run_numpy_buffers(root):
         assert db.get(7).vector == [0.25, 0]
         hits = db.search_batch(memoryview(matrix), top_k=1, exact=True)
         assert [[h.id for h in row] for row in hits] == [[7], [3]]
+        for columns in (2, 3):
+            empty = memoryview(np.empty((0, columns), dtype=np.float16))
+            for field, call, expected in (
+                ("query_vectors", lambda: db.search_batch(empty), []),
+                ("vectors", lambda: db.batch_insert(empty, []), []),
+                ("vectors", lambda: db.batch_insert_with_ids([], empty, []), None),
+            ):
+                if columns == 2:
+                    assert call() == expected
+                else:
+                    try:
+                        call()
+                    except TriviumDBError as exc:
+                        assert exc.code == "TDB_DIMENSION_MISMATCH" and exc.target == {"field": field}
+                        if field == "vectors":
+                            assert exc.write["outcome"] == "not_committed"
+                    else:
+                        raise AssertionError("零行矩阵也必须匹配数据库维度")
         opposite_endian = matrix.astype(matrix.dtype.newbyteorder("S"))
         try:
             db.batch_insert(memoryview(opposite_endian), [{}, {}])

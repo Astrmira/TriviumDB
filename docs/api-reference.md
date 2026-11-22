@@ -903,7 +903,9 @@ results = db.search_batch(
 
 普通 CPython 3.9–3.15 可使用同一平台的 abi3 wheel。批量检索、批量写入的事务提交与 TQL 执行在 Rust 阶段释放 GIL。返回值和 Python 回调在解释器内构造或执行。
 
-`search_batch`、`batch_insert` 和 `batch_insert_with_ids` 接受二维 C 连续的 `memoryview`。缓冲使用本机字节序，元素格式与数据库的 f32、f16 或 u64 一致。NumPy 数组可直接传入 `memoryview(matrix)`。绑定在调用期间取得输入快照。
+`search_batch`、`batch_insert` 和 `batch_insert_with_ids` 接受二维 C 连续的 `memoryview`。缓冲使用本机字节序，元素格式与数据库的 f32、f16 或 u64 一致。矩阵列数须等于数据库维度，包括形状为 `(0, dim)` 的空批次。NumPy 数组可直接传入 `memoryview(matrix)`。绑定在调用期间取得输入快照。已释放的视图返回 `TDB_INVALID_INPUT`，列数不匹配返回 `TDB_DIMENSION_MISMATCH`。
+
+批量检索按整批累计命中及其 Payload 占用实例和共享运行时配额。预算不足时整批返回错误。宿主可拆分查询批次，分别消费结果。
 
 ```python
 from array import array
@@ -1896,7 +1898,7 @@ new_db.flush()?;
 
 > **提醒**：迁移不修改原数据库，原库仍可正常使用。新库创建完毕后，需要手动更新所有向量后才能进行有效的向量检索。
 
-> **提醒**：如果希望同时切换 dtype（例如从 f32 换 f16），需在创建新库时指定 `dtype` 参数：`TriviumDB("new.tdb", dim=1536, dtype="f16")`。
+维度迁移保留源库的 dtype。源库为 `f32` 时，使用 `TriviumDB("new.tdb", dim=1536, dtype="f32")` 打开目标库。
 
 ---
 

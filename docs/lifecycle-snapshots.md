@@ -83,7 +83,7 @@ Rust 的同步 `close()` 保留重复关闭返回 `DatabaseClosed` 的行为；P
 
 当前格式的数据库在最近一次检查点之后没有持久化变更时，关闭直接同步并释放 WAL，保留数据文件内容和已发布 manifest 的校验值。节点、边、属性索引、文本索引与 QuIVer 索引的持久化变更会要求新检查点。显式 `flush()` 会发布检查点，只读关闭保持物理零写。打开历史格式时，如果收到 `TDB_MIGRATION_REQUIRED`，请按[外部迁移指南](migration.md)将数据库迁至新目录，再打开迁移后的数据库。
 
-`publish_generation_manifest()` 在内部完成 `flush()` 后生成 manifest，应在全部写入完成后调用。发布后直接关闭可保留 manifest；发布后的持久化变更或再次显式 `flush()` 需要重新发布 manifest。
+`publish_generation_manifest()` 在内部完成 `flush()` 后生成 manifest，应在全部写入完成后调用。发布后直接关闭可保留 manifest。发布后的持久化变更或再次显式 `flush()` 需要重新发布 manifest。清单的原子重命名失败时，回执为 `publish/not_committed`。重命名成功后同步父目录失败时，回执为 `publish/unknown`。
 
 ### 分组提交的异常处理
 

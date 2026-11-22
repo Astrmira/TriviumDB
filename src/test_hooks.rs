@@ -90,6 +90,7 @@ pub enum IoPoint {
     SnapshotSync,
     SnapshotPublish,
     SnapshotDirectorySync,
+    ManifestDirectorySync,
     MarkerCreate,
     MarkerWrite,
     MarkerSync,

@@ -75,6 +75,7 @@ pub(super) fn vector<T: Component>(
 
 fn snapshot<T: Component>(
     view: &Bound<'_, PyMemoryView>,
+    dim: usize,
     field: &str,
     write: Option<WriteErrorInfo>,
 ) -> PyResult<Vec<Vec<T>>> {
@@ -87,29 +88,56 @@ fn snapshot<T: Component>(
             write,
         )
     };
-    let format: String = view.getattr("format")?.extract()?;
+    let attribute_error = |error| argument_input_error(error, field, write);
+    let format: String = view
+        .getattr("format")
+        .and_then(|value| value.extract())
+        .map_err(attribute_error)?;
     let native = if cfg!(target_endian = "little") {
         '<'
     } else {
         '>'
     };
     let format = format.strip_prefix(['@', '=', native]).unwrap_or(&format);
-    let itemsize: usize = view.getattr("itemsize")?.extract()?;
+    let itemsize: usize = view
+        .getattr("itemsize")
+        .and_then(|value| value.extract())
+        .map_err(attribute_error)?;
     if !(format == T::FORMAT || (T::FORMAT == "Q" && format == "L"))
         || itemsize != size_of::<T>()
-        || !view.getattr("c_contiguous")?.is_truthy()?
+        || !view
+            .getattr("c_contiguous")
+            .and_then(|value| value.is_truthy())
+            .map_err(attribute_error)?
     {
         return Err(invalid());
     }
-    let (rows, columns): (usize, usize) =
-        view.getattr("shape")?.extract().map_err(|_| invalid())?;
+    let (rows, columns): (usize, usize) = view
+        .getattr("shape")
+        .and_then(|value| value.extract())
+        .map_err(attribute_error)?;
+    if columns != dim {
+        let error = crate::TriviumError::DimensionMismatch {
+            expected: dim,
+            got: columns,
+        }
+        .at_field(field);
+        return Err(super::errors::to_py_error(match write {
+            Some(write) => error.with_write_info(write),
+            None => error,
+        }));
+    }
     let row_bytes = columns.checked_mul(itemsize).ok_or_else(invalid)?;
     let total = rows.checked_mul(row_bytes).ok_or_else(invalid)?;
     if rows != 0 && columns == 0 {
         return Err(invalid());
     }
     // abi3-py39 通过只读 bytes 快照访问缓冲；释放 GIL 或转换 Payload 时宿主可重新使用原数组。
-    let bytes = view.call_method0("tobytes")?.cast_into::<PyBytes>()?;
+    let bytes = view
+        .call_method0("tobytes")
+        .map_err(attribute_error)?
+        .cast_into::<PyBytes>()
+        .map_err(|_| invalid())?;
     if bytes.as_bytes().len() != total {
         return Err(invalid());
     }
@@ -120,9 +148,9 @@ fn snapshot<T: Component>(
         .collect())
 }
 
-pub(super) fn queries<T: Component>(value: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<T>>> {
+pub(super) fn queries<T: Component>(value: &Bound<'_, PyAny>, dim: usize) -> PyResult<Vec<Vec<T>>> {
     if let Ok(view) = value.cast::<PyMemoryView>() {
-        return snapshot(view, "query_vectors", None);
+        return snapshot(view, dim, "query_vectors", None);
     }
     read_sequence(value, "query_vectors", |row, path| vector(row, path, None))
 }
@@ -132,11 +160,12 @@ pub(super) enum WriteRows<'py, T> {
     Matrix(std::vec::IntoIter<Vec<T>>),
 }
 impl<'py, T: Component> WriteRows<'py, T> {
-    pub(super) fn new(value: &Bound<'py, PyAny>) -> PyResult<Self> {
+    pub(super) fn new(value: &Bound<'py, PyAny>, dim: usize) -> PyResult<Self> {
         if let Ok(view) = value.cast::<PyMemoryView>() {
             return Ok(Self::Matrix(
                 snapshot(
                     view,
+                    dim,
                     "vectors",
                     Some(WriteErrorInfo::MAINTENANCE_VALIDATION),
                 )?

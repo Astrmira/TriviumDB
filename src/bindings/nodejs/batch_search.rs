@@ -20,6 +20,7 @@ pub struct BatchSearchTask {
     context: Option<crate::sdk::RequestContext>,
     backend: SearchBackendHandle,
     queries: Batch,
+    response_workspace: Option<crate::resources::RequestWorkspace>,
     search_config: crate::database::SearchConfig,
     batch_config: crate::database::BatchSearchConfig,
 }
@@ -42,20 +43,25 @@ impl napi::Task for BatchSearchTask {
             return Ok(Err(error));
         }
         let queries = std::mem::replace(&mut self.queries, Batch::Numbers(Vec::new()));
-        Ok(match &self.backend {
-            SearchBackendHandle::F32(db) => queries
-                .into_f32()
-                .and_then(|rows| db.search_batch(&rows, &self.search_config, &self.batch_config)),
-            SearchBackendHandle::F16(db) => queries
-                .into_half()
-                .and_then(|rows| db.search_batch(&rows, &self.search_config, &self.batch_config)),
-            SearchBackendHandle::U64(db) => queries
-                .into_u64("queryVectors")
-                .and_then(|rows| db.search_batch(&rows, &self.search_config, &self.batch_config)),
-        })
+        let output = match &self.backend {
+            SearchBackendHandle::F32(db) => queries.into_f32().and_then(|rows| {
+                db.search_batch_with_workspace(&rows, &self.search_config, &self.batch_config)
+            }),
+            SearchBackendHandle::F16(db) => queries.into_half().and_then(|rows| {
+                db.search_batch_with_workspace(&rows, &self.search_config, &self.batch_config)
+            }),
+            SearchBackendHandle::U64(db) => queries.into_u64("queryVectors").and_then(|rows| {
+                db.search_batch_with_workspace(&rows, &self.search_config, &self.batch_config)
+            }),
+        };
+        Ok(output.map(|(hits, workspace)| {
+            self.response_workspace = Some(workspace);
+            hits
+        }))
     }
 
     fn resolve(&mut self, env: napi::Env, output: Self::Output) -> napi::Result<Self::JsValue> {
+        let _response_workspace = self.response_workspace.take();
         output
             .map_err(|error| to_napi_error(env, error))?
             .into_iter()
@@ -93,6 +99,7 @@ impl TriviumDB {
             context: crate::request::current(),
             backend,
             queries: query_vectors,
+            response_workspace: None,
             search_config: crate::database::SearchConfig {
                 top_k,
                 expand_depth: 0,
