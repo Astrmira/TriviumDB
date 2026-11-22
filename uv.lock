@@ -4,5 +4,5 @@ requires-python = ">=3.9, <3.16"
 
 [[package]]
 name = "triviumdb"
-version = "0.9.3"
+version = "0.9.4b1"
 source = { editable = "." }

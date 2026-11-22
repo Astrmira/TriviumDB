@@ -30,7 +30,7 @@
 
 **中文** | [**English**](README_EN.md)
 
-当前正式版本为 **0.9.3**，提供可选的 Pelorus 双曲检索和 QuIVer SSD 请求级 I/O 计量，并改进 WAL 恢复、TQL 查询与图预算。完整变更、Rust 接口调整及升级步骤见[双语发布说明](docs/changes/0.9.3.md)。
+当前预发布版本 **0.9.4-beta.1** 扩展了 Python 和 Node.js 的批量向量接口，并修复检索预算、存储约束和迁移重试。安装命令和升级步骤见[双语发布说明](docs/changes/0.9.4-beta.1.md)。
 
 SDK 的支持范围见 [SDK 正式接口清单](docs/sdk-contract.md)，历史磁盘格式通过[外部迁移工具](docs/migration.md)升级。
 
@@ -161,13 +161,13 @@ flowchart TD
 推荐使用超快的 [uv](https://github.com/astral-sh/uv) （只需毫秒级）：
 
 ```bash
-uv pip install "triviumdb==0.9.3"
+uv pip install "triviumdb==0.9.4b1"
 ```
 
 或者使用传统 pip：
 
 ```bash
-pip install "triviumdb==0.9.3"
+pip install "triviumdb==0.9.4b1"
 ```
 
 ### 🌐 Node.js / 前端用户
@@ -175,9 +175,9 @@ pip install "triviumdb==0.9.3"
 跨平台包已自带 `*.node` 预编译拓展，并含有完整的 TypeScript 补全：
 
 ```bash
-npm install triviumdb@0.9.3
+npm install triviumdb@0.9.4-beta.1
 # 或者
-pnpm add triviumdb@0.9.3
+pnpm add triviumdb@0.9.4-beta.1
 ```
 
 ### 🦀 Rust 原生用户
@@ -185,10 +185,10 @@ pnpm add triviumdb@0.9.3
 直接把我们当成 Library 依赖：
 
 ```bash
-cargo add triviumdb@0.9.3
+cargo add triviumdb@0.9.4-beta.1
 ```
 
-本页示例使用 `0.9.3`。采用当前格式的 0.9.2 和 0.9.3-beta.1 数据库可直接打开。打开时若返回 `TDB_MIGRATION_REQUIRED`，按[外部迁移指南](docs/migration.md)创建并核验目标库。
+本页示例使用 `0.9.4-beta.1`（PyPI 为 `0.9.4b1`，npm 通道为 `beta`）。0.9.3 当前格式数据库可直接打开。若返回 `TDB_MIGRATION_REQUIRED`，请按[外部迁移指南](docs/migration.md)创建并核验目标库。
 
 需要为嵌入式应用提供管理前端时，按[Console 宿主接入](docs/embedded-console.md)复用同一实例和文件锁；现有 HTML 仍需前端传输适配，资源包会标明这一条件及 CDN 依赖。
 
@@ -223,7 +223,7 @@ batch_results = db.search_batch(
 const batchResults = await db.searchBatch(queryVectors, 10, 0, 0.0)
 ```
 
-开发版绑定支持普通 CPython 3.9–3.15 和 Node.js 22、24、26。批量插入与检索可直接读取二维 Python `memoryview`，以及 Node.js 的 `Float32Array` 或 `BigUint64Array`。PyPI 上的 0.9.3 wheel 适用于 CPython 3.9–3.12。
+本预发布版支持启用 GIL 的 CPython 3.9–3.15 和 Node.js 22、24、26。批量插入与检索接受二维 Python `memoryview`，以及 Node.js 的 `Float32Array` 或 `BigUint64Array`。
 
 `parallelism=0` 表示自动选择并发度，最大允许值为 64；结果外层顺序严格对应输入查询。批量 API 仅支持无状态查询，不允许 fatigue 语义。
 

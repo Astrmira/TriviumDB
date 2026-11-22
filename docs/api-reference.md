@@ -1,6 +1,6 @@
 # TriviumDB API 完整参考
 
-> 本文记录 `0.9.3` 的 Rust、Python（PyO3）和 Node.js（napi-rs）公共 API。版本说明见 [0.9.3 变更](changes/0.9.3.md)，后续开发见[未发布变更](changes/unreleased.md)。许可为 Apache-2.0。
+> 本文记录 `0.9.4-beta.1` 的 Rust、Python（PyO3）和 Node.js（napi-rs）公共 API。版本说明见 [0.9.4-beta.1 变更](changes/0.9.4-beta.1.md)，后续开发见[未发布变更](changes/unreleased.md)。许可为 Apache-2.0。
 
 应用支持范围见 [SDK 正式接口清单](sdk-contract.md)。历史数据库由[外部迁移入口](migration.md)转换到当前文件组。普通打开通过 `TDB_MIGRATION_REQUIRED` 提供结构化指引。
 

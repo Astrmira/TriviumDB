@@ -30,7 +30,7 @@
 
 [**中文文档**](README.md) | **English**
 
-The current stable release is **0.9.3**. It adds opt-in Pelorus hyperbolic search and per-request QuIVer SSD I/O counters, and improves WAL recovery, TQL queries and graph budgets. See the [bilingual release notes](docs/changes/0.9.3.md) for changes, Rust API updates and upgrade steps.
+The **0.9.4-beta.1** prerelease expands batch vector inputs for Python and Node.js and fixes search budgeting, storage constraints, and migration retries. Installation and upgrade instructions are in the [bilingual release notes](docs/changes/0.9.4-beta.1.md).
 
 The [SDK contract inventory](docs/sdk-contract.md) describes supported interfaces. The [external migration tool](docs/migration.md) upgrades historical disk formats.
 
@@ -232,13 +232,13 @@ maturin develop --features python
 Recommended: use the blazing-fast [uv](https://github.com/astral-sh/uv) (millisecond install):
 
 ```bash
-uv pip install "triviumdb==0.9.3"
+uv pip install "triviumdb==0.9.4b1"
 ```
 
 Or traditional pip:
 
 ```bash
-pip install "triviumdb==0.9.3"
+pip install "triviumdb==0.9.4b1"
 ```
 
 ### 🌐 Node.js / Frontend Users
@@ -246,9 +246,9 @@ pip install "triviumdb==0.9.3"
 Cross-platform package includes pre-compiled `*.node` native extensions with full TypeScript completions:
 
 ```bash
-npm install triviumdb@0.9.3
+npm install triviumdb@0.9.4-beta.1
 # or
-pnpm add triviumdb@0.9.3
+pnpm add triviumdb@0.9.4-beta.1
 ```
 
 ### 🦀 Rust Native Users
@@ -256,10 +256,10 @@ pnpm add triviumdb@0.9.3
 Use as a library dependency:
 
 ```bash
-cargo add triviumdb@0.9.3
+cargo add triviumdb@0.9.4-beta.1
 ```
 
-The examples on this page use `0.9.3`. Current-format 0.9.2 and 0.9.3-beta.1 databases open directly. If opening returns `TDB_MIGRATION_REQUIRED`, follow the [external migration guide](docs/migration.md) to create and verify a destination database.
+The examples use `0.9.4-beta.1` (PyPI version `0.9.4b1`, npm channel `beta`). Current-format 0.9.3 databases open directly. If opening returns `TDB_MIGRATION_REQUIRED`, follow the [external migration guide](docs/migration.md) to create and verify a destination database.
 
 To add a management frontend to an embedded application, follow [Console host integration](docs/embedded-console.md) to reuse the same instance and file lock. The existing HTML still needs frontend-owned transport adaptation; the resource bundle declares that requirement and its CDN dependencies.
 
@@ -294,7 +294,7 @@ batch_results = db.search_batch(
 const batchResults = await db.searchBatch(queryVectors, 10, 0, 0.0)
 ```
 
-The development bindings support GIL-enabled CPython 3.9–3.15 and Node.js 22, 24 and 26. Batch inserts and searches accept two-dimensional Python memoryviews and packed Node.js Float32Array or BigUint64Array inputs. The 0.9.3 wheels on PyPI target CPython 3.9–3.12.
+This prerelease supports GIL-enabled CPython 3.9–3.15 and Node.js 22, 24, and 26. Batch inserts and searches accept two-dimensional Python `memoryview` inputs and Node.js `Float32Array` or `BigUint64Array` inputs.
 
 `parallelism=0` selects concurrency automatically, with a maximum accepted value of 64. Outer result order always matches input query order. The batch API supports stateless queries only and rejects fatigue semantics.
 
