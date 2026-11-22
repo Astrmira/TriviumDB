@@ -479,3 +479,42 @@ fn 同名空目录在发布瞬间出现时保持原样() {
     });
     assert_eq!(std::fs::read_dir(destination).unwrap().count(), 0);
 }
+
+#[test]
+fn 清单目标重命名失败后可按未提交回执重试() {
+    use triviumdb::error::{WriteOutcome, WritePhase};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.tdb");
+    let path = path.to_str().unwrap();
+    let mut db = triviumdb::Database::<f32>::open(path, 2).unwrap();
+    db.insert_with_id(7, &[1., 0.], serde_json::json!("persisted"))
+        .unwrap();
+    let manifest = triviumdb::storage::snapshot::manifest_path(path);
+    std::fs::create_dir(&manifest).unwrap();
+    let error = db.publish_generation_manifest("first").unwrap_err();
+    let write = error.info().write.unwrap();
+    assert_eq!(
+        (write.phase, write.outcome),
+        (WritePhase::Publish, WriteOutcome::NotCommitted)
+    );
+    assert!(manifest.is_dir());
+    std::fs::remove_dir(&manifest).unwrap();
+    let fault = fail_io_at(IoPoint::ManifestDirectorySync);
+    let write = db
+        .publish_generation_manifest("second")
+        .unwrap_err()
+        .info()
+        .write
+        .unwrap();
+    assert_eq!(
+        (write.phase, write.outcome),
+        (WritePhase::Publish, WriteOutcome::Unknown)
+    );
+    drop(fault);
+    db.close().unwrap();
+    let reader = triviumdb::Database::<f32>::open_immutable(path, 2).unwrap();
+    assert_eq!(
+        reader.get_payload(7).unwrap(),
+        Some(serde_json::json!("persisted"))
+    );
+}

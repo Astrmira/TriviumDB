@@ -122,7 +122,12 @@ fn 既有构建句柄在配额变更后使用当前预算并支持重试() {
     let handle = db.quiver_build_handle();
     db.set_memory_limit(1).unwrap();
     let error = handle.prepare_auto_build().err().unwrap();
-    assert_eq!(error.code(), "TDB_INVALID_INPUT");
+    assert_eq!(error.code(), "TDB_CAPACITY_RESERVATION_REJECTED");
+    assert!(
+        matches!(error.underlying(), triviumdb::TriviumError::CapacityReservationRejected {
+        memory_limit: 1, estimated_bytes, ..
+    } if *estimated_bytes > 1)
+    );
     assert_eq!(
         serde_json::to_value(error.info()).unwrap()["write"],
         json!({"phase":"validation","outcome":"not_committed"})

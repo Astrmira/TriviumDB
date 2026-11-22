@@ -357,3 +357,46 @@ fn inc溢出和类型错误原子拒绝包括同补丁其他字段() {
     assert_eq!(db.get_payload(1).unwrap().unwrap()["new"], json!(2));
     db.close().unwrap();
 }
+
+#[test]
+fn MemTable拒绝冲突写入且失败不消耗槽位和节点ID() {
+    use triviumdb::storage::memtable::MemTable;
+    let mut mt = MemTable::<f32>::new(2);
+    mt.register_unique_property_index("code").unwrap();
+    let code = json!({"code":"abc"});
+    let first = mt.insert(&[1., 0.], code.clone()).unwrap();
+    assert_eq!(first, 1);
+    for error in [
+        mt.insert(&[0., 1.], code.clone()).unwrap_err(),
+        mt.insert_with_id(17, &[0., 1.], code.clone()).unwrap_err(),
+        mt.raw_insert(17, &[0., 1.], code.clone()).unwrap_err(),
+    ] {
+        assert_eq!(error.code(), "TDB_UNIQUE_CONSTRAINT");
+    }
+    let second = mt.insert(&[0., 1.], json!({"code":"def"})).unwrap();
+    assert_eq!(second, 2);
+    assert_eq!(
+        mt.patch_payload(second, &json!({"$set":code}))
+            .unwrap_err()
+            .code(),
+        "TDB_UNIQUE_CONSTRAINT"
+    );
+    assert_eq!(
+        mt.find_by_property_index("code", &json!("abc")).unwrap(),
+        [1]
+    );
+    assert_eq!(
+        mt.get_payload(second).unwrap().as_ref(),
+        &json!({"code":"def"})
+    );
+    mt.delete(second).unwrap();
+    let deep = (0..128).fold(Value::Null, |v, _| Value::Array(vec![v]));
+    assert_eq!(
+        mt.raw_insert(9, &[0., 2.], deep).unwrap_err().code(),
+        "TDB_INVALID_INPUT"
+    );
+    assert!(!mt.contains(9));
+    assert_eq!(mt.insert(&[0., 3.], json!({"code":"ghi"})).unwrap(), 3);
+    assert_eq!(mt.internal_slot_count(), 2);
+    assert_eq!(mt.get_vector(3).unwrap(), &[0., 3.]);
+}

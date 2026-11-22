@@ -42,7 +42,7 @@ fn collect_prepared_parameters(
         values.insert(name, value);
         Ok(())
     };
-    if let Ok(dictionary) = parameters.downcast::<PyDict>() {
+    if let Ok(dictionary) = parameters.cast::<PyDict>() {
         for (key, value) in dictionary.iter() {
             insert(key, value)?;
         }
@@ -208,15 +208,15 @@ impl PyTriviumDB {
 
         match &this.inner {
             DbBackend::F32(db) => {
-                let rows = db.tql_values(&query).map_err(to_py_error)?;
+                let rows = py.detach(|| db.tql_values(&query)).map_err(to_py_error)?;
                 convert_rows(py, rows)
             }
             DbBackend::F16(db) => {
-                let rows = db.tql_values(&query).map_err(to_py_error)?;
+                let rows = py.detach(|| db.tql_values(&query)).map_err(to_py_error)?;
                 convert_rows(py, rows)
             }
             DbBackend::U64(db) => {
-                let rows = db.tql_values(&query).map_err(to_py_error)?;
+                let rows = py.detach(|| db.tql_values(&query)).map_err(to_py_error)?;
                 convert_rows(py, rows)
             }
         }
@@ -230,7 +230,7 @@ impl PyTriviumDB {
         let (_request, borrowed) = database_read(slf)?;
         let this = &*borrowed;
         let query: String = extract_argument(py, &query, "query", None)?;
-        dispatch!(this, db => db.prepare_tql(&query))
+        dispatch!(this, db => py.detach(|| db.prepare_tql(&query)))
             .map(|inner| PyPreparedTql { inner })
             .map_err(to_py_error)
     }
@@ -245,19 +245,11 @@ impl PyTriviumDB {
         let this = &*borrowed;
         let prepared = prepared
             .extract::<PyRef<'_, PyPreparedTql>>()
-            .map_err(|error| argument_input_error(error, "prepared", None))?;
+            .map_err(|error| argument_input_error(error.into(), "prepared", None))?;
         let values = collect_prepared_parameters(parameters, &prepared.inner)?;
-        let rows = match &this.inner {
-            DbBackend::F32(db) => db
-                .execute_prepared_tql(&prepared.inner, &values)
-                .map(|rows| rows.into_iter().map(tql_row_to_json).collect::<Vec<_>>()),
-            DbBackend::F16(db) => db
-                .execute_prepared_tql(&prepared.inner, &values)
-                .map(|rows| rows.into_iter().map(tql_row_to_json).collect::<Vec<_>>()),
-            DbBackend::U64(db) => db
-                .execute_prepared_tql(&prepared.inner, &values)
-                .map(|rows| rows.into_iter().map(tql_row_to_json).collect::<Vec<_>>()),
-        }
+        let plan = &prepared.inner;
+        let rows = dispatch!(this, db => py.detach(|| db.execute_prepared_tql(plan, &values)
+            .map(|rows| rows.into_iter().map(tql_row_to_json).collect::<Vec<_>>())))
         .map_err(to_py_error)?;
         rows.into_iter()
             .map(|row| {
@@ -284,11 +276,12 @@ impl PyTriviumDB {
         slf: &Bound<'_, Self>,
         py: Python<'_>,
         query: Bound<'_, PyAny>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let (_request, mut borrowed) = database_write(slf).map_err(write_admission_error)?;
         let this = &mut *borrowed;
         let query: String = extract_management_argument(py, &query, "query")?;
-        let result = dispatch!(this, mut db => db.tql_mut(&query)).map_err(to_py_error)?;
+        let result =
+            dispatch!(this, mut db => py.detach(|| db.tql_mut(&query))).map_err(to_py_error)?;
         let dict = PyDict::new(py);
         let _ = dict.set_item("affected", result.affected);
         let created: Vec<u64> = result.created_ids;

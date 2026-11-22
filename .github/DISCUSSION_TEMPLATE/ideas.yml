@@ -1,0 +1,8 @@
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like to explore? / 想一起聊什么？
+      description: English or Chinese is welcome. A use case or an open question is a great start. / 用英文或中文分享一个场景或待解的问题就好。
+    validations:
+      required: true

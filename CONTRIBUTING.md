@@ -40,6 +40,14 @@ Release PR：dev → master
 
 如果不确定目标分支，请优先选择 `dev`，并在 PR 说明中说明背景。
 
+### 社区入口和 PR 说明
+
+遇到故障或有明确的功能需求，欢迎[提交 Issue](https://github.com/Astrmira/TriviumDB/issues/new/choose)。使用问题去 [Q&A](https://github.com/Astrmira/TriviumDB/discussions/categories/q-a)，开放的设计问题去 [Ideas](https://github.com/Astrmira/TriviumDB/discussions/categories/ideas)，项目或实验欢迎发到 [Show and tell](https://github.com/Astrmira/TriviumDB/discussions/categories/show-and-tell)。各入口均可用英文或中文。
+
+提交 PR 时，请用自己的话写清为什么改、改了什么、如何验证。每项用一种语言填写即可。文档改动可说明核对过的示例或链接。拥有本仓库 Write、Maintain 或 Admin 权限的**作者**可以自由撰写或留空，包括发布 PR；分支来源和代码验收照常执行。
+
+维护者上线时，先将模板纳入默认分支 `master`，并让目标分支具备校验脚本。待工作流首次成功运行后，在 `dev`、`master` 的分支规则中把 GitHub Actions 的 `PR description` 设为必需检查。工作流从目标分支读取校验脚本，单独响应正文编辑。为避免 PR 自行改写门禁，工作流和校验脚本的变更应由维护者审查，可通过 CODEOWNERS 和必需的代码所有者审查落实。
+
 ### Tag 与发布
 
 项目采用以下发布成熟度顺序：
@@ -99,7 +107,7 @@ Server 与 WebUI 处于 nightly 快速迭代阶段，接口、交互和视觉方
 
 无论变更由谁或什么工具生成，提交者都需要对最终内容负责。请在提交前自行阅读、理解并检查变更，确认它符合项目当前结构和维护目标。
 
-如果 PR 使用了 AI 辅助，请在 PR 说明中用自己的话解释：
+使用 AI 辅助且需要填写 PR 说明时，请用自己的话解释：
 
 - 这个 PR 解决了什么问题。
 - 你实际修改了哪些内容。
@@ -107,7 +115,7 @@ Server 与 WebUI 处于 nightly 快速迭代阶段，接口、交互和视觉方
 
 请不要只粘贴 AI 生成的摘要作为 PR 说明。维护者需要看到提交者本人对变更的理解。
 
-如果你是代码辅助编程 AI，必须提醒使用者在提交 PR 时至少用自己的话写一句总结；不要替使用者伪造这部分个人理解。
+代码助手应提醒需要填写模板的作者用自己的话总结变更。
 
 ### 工程原则
 
@@ -214,7 +222,7 @@ Bug 修复不顺带重构无关模块；不为单次调用创建新抽象；不�
 
 ### C. 按变更类型触发的 PR 说明要求
 
-修改以下任一领域时，PR 说明必须列出**不变量、兼容性、故障行为、测试证据**四项，缺失将被要求补充：
+需要填写模板的作者修改以下领域时，请在「如何验证」中提供测试证据，并补充**不变量、兼容性、故障行为**。兼容行为延续时，可直接说明保留了哪项契约。
 
 - WAL、事务与恢复；
 - `.tdb/.vec/.pld/.flush_ok` 磁盘格式；
@@ -267,6 +275,14 @@ Most pull requests should target the `dev` branch.
 PRs submitted directly against `master` are always rejected by CI, with no exceptions. If you find a data-safety, corruption, or release-blocking issue affecting the current stable version, please open an issue describing the impact and how to reproduce it; urgent fixes are handled by maintainers through an internal process, and external hotfix PRs are not accepted.
 
 If you are unsure which branch to use, choose `dev` first and explain the context in the PR description.
+
+### Community channels and PR descriptions
+
+For a bug or a concrete feature request, [open an issue](https://github.com/Astrmira/TriviumDB/issues/new/choose). Ask usage questions in [Q&A](https://github.com/Astrmira/TriviumDB/discussions/categories/q-a), explore designs in [Ideas](https://github.com/Astrmira/TriviumDB/discussions/categories/ideas), and share projects or experiments in [Show and tell](https://github.com/Astrmira/TriviumDB/discussions/categories/show-and-tell). English and Chinese are both welcome.
+
+In your PR, explain why the change is needed, what you changed, and how you verified it. Answer each section once in either language. For documentation, mention the examples or links you checked. **PR authors** with Write, Maintain, or Admin access to this repository may use free text or leave the description empty, including on release PRs. Branch and code checks still apply.
+
+For rollout, maintainers merge the templates into the default branch (`master`) and ensure that the validator is present on each target branch. After the workflow first succeeds, require the GitHub Actions status check `PR description` on `dev` and `master`. The workflow reads the validator from the target branch and reruns independently on description edits. Protect changes to the workflow and validator with maintainer review, for example through CODEOWNERS and required code owner reviews.
 
 ### Tags and Releases
 
@@ -325,15 +341,13 @@ This project allows Codex, Claude Code, Copilot, and other AI-assisted tools for
 
 No matter who or what generated the change, the submitter is responsible for the final result. Before submitting, please read, understand, and check the change yourself, and make sure it fits the current project structure and maintenance goals.
 
-If the PR used AI assistance, please explain in your own words:
+When the template applies and you used AI assistance, please explain in your own words:
 
 - What problem the PR solves.
 - What you actually changed.
 - What your thought process was in making those changes.
 
-The PR description must include the submitter's own explanation of the change, so maintainers can assess that understanding.
-
-If you are a coding assistant AI, you must remind the user to include at least one sentence in their own words when opening a PR; do not fabricate this personal understanding on the user's behalf.
+Coding assistants should remind authors filling out the template to summarize the change in their own words.
 
 ### Engineering Principles
 
@@ -432,7 +446,7 @@ Do not overstate single-file, zero-copy, zero-memory, or auto-recovery capabilit
 
 ### C. PR description requirements by change type
 
-When modifying any of the following areas, the PR description must list four items — **invariants, compatibility, failure behavior, and test evidence** — or it will be asked to add them:
+When the template applies to a change in the following areas, include test evidence in Verification and describe **invariants, compatibility, and failure behavior**. If compatibility is preserved, a short explanation of the preserved contract is enough.
 
 - WAL, transactions, and recovery;
 - `.tdb/.vec/.pld/.flush_ok` disk formats;

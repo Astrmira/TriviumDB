@@ -302,10 +302,22 @@ fn 当前双曲来源迁移后保留曲率和原始向量() {
         opts.mmap = mmap;
         opts.check = true;
         let checked = triviumdb_migrate::run(&opts).unwrap();
-        assert!(checked.facts.components.contains_key("pelorus_curvature"));
+        assert!(checked.facts.components.contains_key("pelorus_config"));
         opts.check = false;
         let report = triviumdb_migrate::run(&opts).unwrap();
         assert_eq!(report.facts, checked.facts);
+        if mmap {
+            // 按旧工具的回执格式保存，随后对相同配置和已改变配置分别重试。
+            use sha2::{Digest, Sha256};
+            let path = opts.destination.join("migration-report.json");
+            let mut old: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let components = old["facts"]["components"].as_object_mut().unwrap();
+            components.remove("pelorus_config").unwrap();
+            let digest = Sha256::digest(format!("{}\n", json!(components)));
+            old["facts"]["sha256"] = json!(format!("{digest:x}"));
+            std::fs::write(path, serde_json::to_vec(&old).unwrap()).unwrap();
+        }
+        assert!(triviumdb_migrate::run(&opts).unwrap().reused);
         let mut target = Database::<f32>::open(report.database.to_str().unwrap(), 2).unwrap();
         let hits = target
             .search_pelorus(&[0.25, 0.0], &Default::default())
@@ -321,7 +333,18 @@ fn 当前双曲来源迁移后保留曲率和原始向量() {
                 .code(),
             "TDB_INVALID_VECTOR"
         );
+        target
+            .build_pelorus_index(PelorusConfig {
+                curvature: 2.0,
+                m: 17,
+                ..Default::default()
+            })
+            .unwrap();
         target.close().unwrap();
+        assert_eq!(
+            triviumdb_migrate::run(&opts).unwrap_err().code,
+            "TDB_MIGRATION_CONFLICT"
+        );
     }
 }
 

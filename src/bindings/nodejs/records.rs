@@ -56,67 +56,8 @@ impl TriviumDB {
         vectors: JsUnknown,
         payloads: JsUnknown,
     ) -> napi::Result<Vec<f64>> {
-        let vectors = write_array(env, vectors, "vectors", |env, value, path| {
-            write_vector(env, value, path, &self.dtype)
-        })?;
-        let payloads = write_array(env, payloads, "payloads", write_json)?;
-        if vectors.len() != payloads.len() {
-            return Err(write_input_error(
-                env,
-                "payloads",
-                "向量列表与 Payload 列表长度不一致 (Vector and payload list lengths differ)",
-            ));
-        }
-        self.check_generated_ids(env, vectors.len())?;
-        match &mut self.inner {
-            DbBackend::F32(db) => {
-                let converted: Vec<Vec<f32>> = vectors
-                    .into_iter()
-                    .map(|vector| vector.into_iter().map(|value| value as f32).collect())
-                    .collect();
-                let mut tx = crate::database::TxBuilder::new();
-                for (vector, payload) in converted.iter().zip(payloads) {
-                    tx.insert(vector, payload);
-                }
-                db.commit_tx(tx)
-                    .map_err(crate::sdk::direct_write_error)
-                    .map_err(|error| to_napi_error(env, error))
-                    .and_then(|value| node_ids_to_js(env, value))
-            }
-            DbBackend::F16(db) => {
-                let converted: Vec<Vec<half::f16>> = vectors
-                    .into_iter()
-                    .map(|vector| {
-                        vector
-                            .into_iter()
-                            .map(half::f16::from_f64_component)
-                            .collect()
-                    })
-                    .collect();
-                let mut tx = crate::database::TxBuilder::new();
-                for (vector, payload) in converted.iter().zip(payloads) {
-                    tx.insert(vector, payload);
-                }
-                db.commit_tx(tx)
-                    .map_err(crate::sdk::direct_write_error)
-                    .map_err(|error| to_napi_error(env, error))
-                    .and_then(|value| node_ids_to_js(env, value))
-            }
-            DbBackend::U64(db) => {
-                let converted: Vec<Vec<u64>> = vectors
-                    .iter()
-                    .map(|vector| parse_u64_vector(env, vector))
-                    .collect::<napi::Result<_>>()?;
-                let mut tx = crate::database::TxBuilder::new();
-                for (vector, payload) in converted.iter().zip(payloads) {
-                    tx.insert(vector, payload);
-                }
-                db.commit_tx(tx)
-                    .map_err(crate::sdk::direct_write_error)
-                    .map_err(|error| to_napi_error(env, error))
-                    .and_then(|value| node_ids_to_js(env, value))
-            }
-        }
+        self.insert_batch(env, None, vectors, payloads)
+            .and_then(|ids| node_ids_to_js(env, ids))
     }
 
     /// 批量插入指定 ID 的节点
@@ -129,76 +70,8 @@ impl TriviumDB {
         payloads: JsUnknown,
     ) -> napi::Result<()> {
         let parsed_ids = write_array(env, ids, "ids", write_id)?;
-        let vectors = write_array(env, vectors, "vectors", |env, value, path| {
-            write_vector(env, value, path, &self.dtype)
-        })?;
-        let payloads = write_array(env, payloads, "payloads", write_json)?;
-        if vectors.len() != payloads.len() {
-            return Err(write_input_error(
-                env,
-                "payloads",
-                "向量列表与 Payload 列表长度不一致 (Vector and payload list lengths differ)",
-            ));
-        }
-        if parsed_ids.len() != vectors.len() {
-            return Err(write_input_error(
-                env,
-                "ids",
-                "ID 列表与向量列表长度不一致 (ID and vector list lengths differ)",
-            ));
-        }
-        match &mut self.inner {
-            DbBackend::F32(db) => {
-                let converted: Vec<Vec<f32>> = vectors
-                    .into_iter()
-                    .map(|vector| vector.into_iter().map(|value| value as f32).collect())
-                    .collect();
-                let mut tx = crate::database::TxBuilder::new();
-                for ((id, vector), payload) in parsed_ids.iter().zip(converted.iter()).zip(payloads)
-                {
-                    tx.insert_with_id(*id, vector, payload);
-                }
-                db.commit_tx(tx)
-                    .map_err(crate::sdk::direct_write_error)
-                    .map(|_| ())
-                    .map_err(|error| to_napi_error(env, error))
-            }
-            DbBackend::F16(db) => {
-                let converted: Vec<Vec<half::f16>> = vectors
-                    .into_iter()
-                    .map(|vector| {
-                        vector
-                            .into_iter()
-                            .map(half::f16::from_f64_component)
-                            .collect()
-                    })
-                    .collect();
-                let mut tx = crate::database::TxBuilder::new();
-                for ((id, vector), payload) in parsed_ids.iter().zip(converted.iter()).zip(payloads)
-                {
-                    tx.insert_with_id(*id, vector, payload);
-                }
-                db.commit_tx(tx)
-                    .map_err(crate::sdk::direct_write_error)
-                    .map(|_| ())
-                    .map_err(|error| to_napi_error(env, error))
-            }
-            DbBackend::U64(db) => {
-                let converted: Vec<Vec<u64>> = vectors
-                    .iter()
-                    .map(|vector| parse_u64_vector(env, vector))
-                    .collect::<napi::Result<_>>()?;
-                let mut tx = crate::database::TxBuilder::new();
-                for ((id, vector), payload) in parsed_ids.iter().zip(converted.iter()).zip(payloads)
-                {
-                    tx.insert_with_id(*id, vector, payload);
-                }
-                db.commit_tx(tx)
-                    .map_err(crate::sdk::direct_write_error)
-                    .map(|_| ())
-                    .map_err(|error| to_napi_error(env, error))
-            }
-        }
+        self.insert_batch(env, Some(&parsed_ids), vectors, payloads)
+            .map(|_| ())
     }
 
     /// 带指定 ID 插入节点
@@ -478,4 +351,62 @@ impl TriviumDB {
                 .map(NodeJson),
         )
     }
+}
+
+impl TriviumDB {
+    fn insert_batch(
+        &mut self,
+        env: Env,
+        ids: Option<&[u64]>,
+        vectors: JsUnknown,
+        payloads: JsUnknown,
+    ) -> napi::Result<Vec<u64>> {
+        let vectors =
+            super::vectors::Batch::read(env, vectors, self.dim() as usize, &self.dtype, true)?;
+        let payloads = write_array(env, payloads, "payloads", write_json)?;
+        if vectors.len() != payloads.len() {
+            return Err(write_input_error(
+                env,
+                "payloads",
+                "向量列表与 Payload 列表长度不一致 (Vector and payload list lengths differ)",
+            ));
+        }
+        if let Some(ids) = ids {
+            if ids.len() != vectors.len() {
+                return Err(write_input_error(
+                    env,
+                    "ids",
+                    "ID 列表与向量列表长度不一致 (ID and vector list lengths differ)",
+                ));
+            }
+        } else {
+            self.check_generated_ids(env, vectors.len())?;
+        }
+        match &mut self.inner {
+            DbBackend::F32(db) => vectors
+                .into_f32()
+                .and_then(|rows| commit_rows(db, rows, payloads, ids)),
+            DbBackend::F16(db) => vectors
+                .into_half()
+                .and_then(|rows| commit_rows(db, rows, payloads, ids)),
+            DbBackend::U64(db) => vectors
+                .into_u64("vectors")
+                .and_then(|rows| commit_rows(db, rows, payloads, ids)),
+        }
+        .map_err(crate::sdk::direct_write_error)
+        .map_err(|e| to_napi_error(env, e))
+    }
+}
+
+fn commit_rows<T: VectorType + serde::Serialize + serde::de::DeserializeOwned>(
+    db: &mut crate::database::Database<T>,
+    rows: Vec<Vec<T>>,
+    payloads: Vec<serde_json::Value>,
+    ids: Option<&[u64]>,
+) -> crate::Result<Vec<u64>> {
+    let mut tx = crate::database::TxBuilder::new();
+    for (i, (row, payload)) in rows.into_iter().zip(payloads).enumerate() {
+        tx.insert_owned(ids.map(|ids| ids[i]), row, payload);
+    }
+    db.commit_tx(tx)
 }

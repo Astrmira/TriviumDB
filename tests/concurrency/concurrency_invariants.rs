@@ -527,6 +527,19 @@ fn Flush不得隐式构建QuIVer索引() {
     cleanup(&path);
 }
 
+fn assert_build_budget(error: &triviumdb::TriviumError) {
+    let triviumdb::TriviumError::CapacityReservationRejected {
+        estimated_bytes,
+        current_bytes,
+        memory_limit,
+        ..
+    } = error.underlying()
+    else {
+        panic!("建图应返回实例容量错误 {error:?}")
+    };
+    assert!(*estimated_bytes > 0 && current_bytes.saturating_add(*estimated_bytes) > *memory_limit);
+}
+
 #[test]
 fn QuIVer构建峰值预算_显式构建应在分配前拒绝() {
     let path = tmp_db("quiver_memory_gate");
@@ -538,9 +551,8 @@ fn QuIVer构建峰值预算_显式构建应在分配前拒绝() {
     }
     db.set_memory_limit(1).unwrap();
 
-    let error = db.build_quiver_index(None).unwrap_err().to_string();
-    assert!(error.contains("预计峰值"));
-    assert!(error.contains("内存上限"));
+    let error = db.build_quiver_index(None).unwrap_err();
+    assert_build_budget(&error);
     assert!(
         !std::path::Path::new(&format!("{path}.quiver")).exists(),
         "预算拒绝后不得发布半成品索引"
@@ -562,9 +574,8 @@ fn QuIVer导航树及遍历工作区必须提前计入构图预算() {
     // a363bc8 对 128 个四维节点、默认参数的旧峰值估算为 85,120 字节。
     // 旧估算恰好能通过的上限，必须因新增父节点和遍历工作区而提前拒绝。
     db.set_memory_limit(db.estimated_memory() + 85_120).unwrap();
-    let error = db.build_quiver_index(None).unwrap_err().to_string();
-    assert!(error.contains("预计峰值"));
-    assert!(error.contains("内存上限"));
+    let error = db.build_quiver_index(None).unwrap_err();
+    assert_build_budget(&error);
     assert_eq!(db.node_count().unwrap(), 128, "预算拒绝不得修改已有节点");
     drop(db);
     cleanup(&path);
@@ -581,12 +592,8 @@ fn QuIVer构建峰值预算_自动构建应返回明确错误() {
     }
     db.set_memory_limit(1).unwrap();
 
-    let error = db
-        .search(&[1.0, 1.0, -1.0, 0.5], 10, 0, -1.0)
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("自动构建预计峰值"));
-    assert!(error.contains("内存上限"));
+    let error = db.search(&[1.0, 1.0, -1.0, 0.5], 10, 0, -1.0).unwrap_err();
+    assert_build_budget(&error);
 
     drop(db);
     cleanup(&path);

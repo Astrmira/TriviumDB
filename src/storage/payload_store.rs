@@ -384,32 +384,48 @@ impl PayloadStore {
         self.entries.keys().copied()
     }
 
-    pub fn insert_value(&mut self, id: NodeId, value: serde_json::Value) -> Result<()> {
-        let raw = serde_json::to_vec(&value)
-            .map_err(|error| TriviumError::InvalidInput(format!("Payload 序列化失败: {error}")))?;
-        self.insert_raw(id, &raw)?;
-        self.cache_insert(id, Arc::new(value));
+    #[cfg(test)]
+    fn insert_value(&mut self, id: NodeId, value: serde_json::Value) -> Result<()> {
+        let raw = Self::encode_value(&value)?;
+        self.install_value(id, value, raw);
         Ok(())
+    }
+
+    pub(crate) fn encode_value(value: &serde_json::Value) -> Result<Box<[u8]>> {
+        validate_depth(value, 0)?;
+        serde_json::to_vec(value)
+            .map(Vec::into_boxed_slice)
+            .map_err(|error| {
+                TriviumError::InvalidInput(format!(
+                    "Payload 序列化失败 (Payload serialization failed): {error}"
+                ))
+            })
+    }
+
+    pub(crate) fn install_value(&mut self, id: NodeId, value: serde_json::Value, raw: Box<[u8]>) {
+        self.install_raw(id, raw);
+        self.cache_insert(id, Arc::new(value));
     }
 
     pub fn insert_raw(&mut self, id: NodeId, raw: &[u8]) -> Result<()> {
         validate_json(raw)?;
+        self.install_raw(id, raw.into());
+        Ok(())
+    }
+
+    fn install_raw(&mut self, id: NodeId, raw: Box<[u8]>) {
         self.invalidate(id);
-        self.heap_raw_bytes = self
-            .heap_raw_bytes
-            .saturating_sub(
-                self.entries
-                    .get(&id)
-                    .map_or(0, |entry| entry.raw.heap_bytes()),
-            )
-            .saturating_add(raw.len());
-        self.entries.insert(
+        self.heap_raw_bytes = self.heap_raw_bytes.saturating_add(raw.len());
+        if let Some(previous) = self.entries.insert(
             id,
             PayloadEntry {
-                raw: RawPayload::Heap(raw.to_vec().into_boxed_slice()),
+                raw: RawPayload::Heap(raw),
             },
-        );
-        Ok(())
+        ) {
+            self.heap_raw_bytes = self
+                .heap_raw_bytes
+                .saturating_sub(previous.raw.heap_bytes());
+        }
     }
 
     pub fn remove(&mut self, id: NodeId) -> bool {
@@ -620,36 +636,35 @@ fn validate_json(raw: &[u8]) -> Result<()> {
         })
 }
 
+fn validate_depth(value: &serde_json::Value, depth: usize) -> Result<()> {
+    match value {
+        serde_json::Value::Array(values) => {
+            if depth >= 127 {
+                return Err(TriviumError::InvalidInput(
+                    "JSON 容器嵌套超过 127 层 (JSON container nesting exceeds 127 levels)".into(),
+                ));
+            }
+            for value in values {
+                validate_depth(value, depth + 1)?;
+            }
+        }
+        serde_json::Value::Object(values) => {
+            if depth >= 127 {
+                return Err(TriviumError::InvalidInput(
+                    "JSON 容器嵌套超过 127 层 (JSON container nesting exceeds 127 levels)".into(),
+                ));
+            }
+            for value in values.values() {
+                validate_depth(value, depth + 1)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// 与默认 JSON 解码器保持相同的容器深度边界，计数过程不分配编码缓冲区。
 pub(crate) fn json_encoded_len(value: &serde_json::Value) -> Result<usize> {
-    fn validate_depth(value: &serde_json::Value, depth: usize) -> Result<()> {
-        match value {
-            serde_json::Value::Array(values) => {
-                if depth >= 127 {
-                    return Err(TriviumError::InvalidInput(
-                        "JSON 容器嵌套超过 127 层 (JSON container nesting exceeds 127 levels)"
-                            .into(),
-                    ));
-                }
-                for value in values {
-                    validate_depth(value, depth + 1)?;
-                }
-            }
-            serde_json::Value::Object(values) => {
-                if depth >= 127 {
-                    return Err(TriviumError::InvalidInput(
-                        "JSON 容器嵌套超过 127 层 (JSON container nesting exceeds 127 levels)"
-                            .into(),
-                    ));
-                }
-                for value in values.values() {
-                    validate_depth(value, depth + 1)?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
     validate_depth(value, 0)?;
     serialized_json_len(value)
 }

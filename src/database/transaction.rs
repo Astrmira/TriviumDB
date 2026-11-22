@@ -580,17 +580,27 @@ impl<T: VectorType> TxBuilder<T> {
     }
 
     pub fn insert(&mut self, vector: &[T], payload: serde_json::Value) {
-        self.ops.push(TxOp::Insert {
-            vector: vector.to_vec(),
-            payload,
-        });
+        self.insert_owned(None, vector.to_vec(), payload);
     }
 
     pub fn insert_with_id(&mut self, id: NodeId, vector: &[T], payload: serde_json::Value) {
-        self.ops.push(TxOp::InsertWithId {
-            id,
-            vector: vector.to_vec(),
-            payload,
+        self.insert_owned(Some(id), vector.to_vec(), payload);
+    }
+
+    /// 绑定已取得输入快照，直接移交缓冲区给原有事务。
+    pub(crate) fn insert_owned(
+        &mut self,
+        id: Option<NodeId>,
+        vector: Vec<T>,
+        payload: serde_json::Value,
+    ) {
+        self.ops.push(match id {
+            Some(id) => TxOp::InsertWithId {
+                id,
+                vector,
+                payload,
+            },
+            None => TxOp::Insert { vector, payload },
         });
     }
 

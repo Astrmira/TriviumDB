@@ -42,6 +42,7 @@ mod tests;
 mod text;
 mod transaction;
 mod types;
+mod vectors;
 
 pub use database::PyTriviumDB;
 pub use errors::{

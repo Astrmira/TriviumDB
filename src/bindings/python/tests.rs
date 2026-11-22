@@ -4,8 +4,8 @@ use super::errors::to_py_error;
 
 #[test]
 fn 核心错误完整映射到_python异常() {
-    pyo3::prepare_freethreaded_python();
-    pyo3::Python::with_gil(|py| {
+    pyo3::Python::initialize();
+    pyo3::Python::attach(|py| {
         use pyo3::prelude::*;
         let json = py.import("json").unwrap();
         for (error, code, expected) in crate::error::tests::cases() {

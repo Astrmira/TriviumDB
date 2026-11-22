@@ -517,12 +517,19 @@ pub(crate) fn verify_publication(
     let final_path = database.with_file_name("migration-report.json");
     let verify_report = |path: &Path| -> Result<()> {
         let report: crate::Report = read_json(path)?;
-        if report
-            != (crate::Report {
-                committed: true,
-                ..expected.clone()
-            })
+        let mut receipt = crate::Report {
+            committed: true,
+            ..expected.clone()
+        };
+        if !report.facts.components.contains_key("pelorus_config")
+            && receipt.facts.components.remove("pelorus_config").is_some()
         {
+            // 旧回执仅记录曲率。此处核验原回执，目标复用仍按本次完整配置摘要判定。
+            let mut encoded = serde_json::to_vec(&receipt.facts.components)?;
+            encoded.push(b'\n');
+            receipt.facts.sha256 = format!("{:x}", Sha256::digest(&encoded));
+        }
+        if report != receipt {
             return Err(Failure::new(
                 "TDB_CORRUPTED_FILE",
                 "迁移报告与已验证事实不符 (Migration report differs from verified facts)",

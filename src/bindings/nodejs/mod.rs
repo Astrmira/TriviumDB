@@ -46,6 +46,7 @@ mod tests;
 mod text;
 mod transaction;
 mod types;
+mod vectors;
 
 pub use batch_search::BatchSearchTask;
 pub use database::TriviumDB;

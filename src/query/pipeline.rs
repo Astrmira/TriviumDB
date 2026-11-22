@@ -1050,13 +1050,8 @@ impl<T: VectorType> PipelineOperator<T> for TextSearchSource {
                 "文本查询或召回规模超过预算 (Text query or recall size exceeds budget)".into(),
             ));
         }
-        if !self.k1.is_finite()
-            || self.k1 <= 0.0
-            || !self.b.is_finite()
-            || !(0.0..=1.0).contains(&self.b)
-            || !self.ac_weight.is_finite()
-            || self.ac_weight < 0.0
-        {
+        crate::index::text::validate_bm25(self.k1, self.b)?;
+        if !self.ac_weight.is_finite() || self.ac_weight < 0.0 {
             return Err(TriviumError::InvalidInput(
                 "文本召回参数无效 (Invalid text retrieval parameters)".into(),
             ));

@@ -13,13 +13,11 @@ pub(super) fn verify_snapshot(
     py: Python<'_>,
     directory: Bound<'_, PyAny>,
     runtime: Option<Bound<'_, PyAny>>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let directory = read_string(&directory, "directory")?;
     let runtime = parse_python_runtime(runtime, None)?;
     let manifest = py
-        .allow_threads(|| {
-            crate::storage::snapshot::verify_snapshot_with_runtime(&directory, &runtime)
-        })
+        .detach(|| crate::storage::snapshot::verify_snapshot_with_runtime(&directory, &runtime))
         .map_err(to_py_error)?;
     let value = serde_json::to_value(manifest)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
@@ -33,7 +31,7 @@ pub(super) fn restore_snapshot(
     source: Bound<'_, PyAny>,
     destination: Bound<'_, PyAny>,
     runtime: Option<Bound<'_, PyAny>>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let source = write_string(&source, "source")?;
     let destination = write_string(&destination, "destination")?;
     let runtime = parse_python_runtime(
@@ -41,7 +39,7 @@ pub(super) fn restore_snapshot(
         Some(crate::error::WriteErrorInfo::MAINTENANCE_VALIDATION),
     )?;
     let manifest = py
-        .allow_threads(|| {
+        .detach(|| {
             crate::storage::snapshot::restore_snapshot_with_runtime(&source, &destination, &runtime)
         })
         .map_err(to_py_error)?;
@@ -57,15 +55,13 @@ impl PyTriviumDB {
         py: Python<'_>,
         destination: Bound<'_, PyAny>,
         generation_id: Bound<'_, PyAny>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let (_request, mut borrowed) = database_write(slf).map_err(write_admission_error)?;
         let this = &mut *borrowed;
         let destination = write_string(&destination, "destination")?;
         let generation_id = write_string(&generation_id, "generation_id")?;
         let manifest = py
-            .allow_threads(
-                || dispatch!(this, mut db => db.create_snapshot(&destination, &generation_id)),
-            )
+            .detach(|| dispatch!(this, mut db => db.create_snapshot(&destination, &generation_id)))
             .map_err(to_py_error)?;
         let value = serde_json::to_value(manifest)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;

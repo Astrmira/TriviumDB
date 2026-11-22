@@ -24,7 +24,7 @@ impl PyTriviumDB {
         Ok(false)
     }
 
-    fn request_shutdown(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<PyObject> {
+    fn request_shutdown(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let (_request, mut borrowed) = database_write(slf)?;
         let this = &mut *borrowed;
         let status = dispatch!(this, mut db => db.request_shutdown()).map_err(to_py_error)?;
@@ -33,7 +33,7 @@ impl PyTriviumDB {
         json_to_pyobject(py, &value)
     }
 
-    fn shutdown_status(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<PyObject> {
+    fn shutdown_status(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let (_request, borrowed) = database_read(slf)?;
         let this = &*borrowed;
         let value = serde_json::to_value(dispatch!(this, db => db.shutdown_status()))
@@ -49,7 +49,7 @@ impl PyTriviumDB {
         let (_request, mut borrowed) = database_write(slf)?;
         let this = &mut *borrowed;
         let timeout_ms: u64 = integer_value(&timeout_ms, "timeout_ms", None)?;
-        py.allow_threads(|| dispatch!(this, mut db => db.close_timeout(std::time::Duration::from_millis(timeout_ms))))
+        py.detach(|| dispatch!(this, mut db => db.close_timeout(std::time::Duration::from_millis(timeout_ms))))
                 .map_err(to_py_error)
     }
 
@@ -57,7 +57,7 @@ impl PyTriviumDB {
     fn close(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<()> {
         let (_request, mut borrowed) = database_write(slf)?;
         let this = &mut *borrowed;
-        match py.allow_threads(|| dispatch!(this, mut db => db.close())) {
+        match py.detach(|| dispatch!(this, mut db => db.close())) {
             Ok(()) | Err(crate::error::TriviumError::DatabaseClosed) => Ok(()),
             Err(error) => Err(to_py_error(error)),
         }

@@ -98,7 +98,7 @@ pub(super) fn _invoke_request(
     callback: &Bound<'_, PyAny>,
     args: &Bound<'_, PyTuple>,
     kwargs: &Bound<'_, PyDict>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let admission = |error| to_py_error(crate::sdk::request_admission(error, owner, operation));
     let _scope = context.inner.enter().map_err(admission)?;
     if operation != "console_request" {

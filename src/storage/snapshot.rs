@@ -5,7 +5,7 @@
 //! 校验路径只读，确保 Immutable Reader 不修复、不补建、也不改变制品字节。
 
 use crate::error::{Result, TriviumError};
-use crate::storage::fs::robust_rename_and_sync;
+use crate::storage::fs::{rename_publication_entry, sync_parent_directory};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 mod transfer;
@@ -173,8 +173,11 @@ pub(crate) fn write_manifest_with_write_info(
         file.sync_all()?;
     }
     write.phase = crate::error::WritePhase::Publish;
+    rename_publication_entry(&tmp, &path)?;
     write.outcome = crate::error::WriteOutcome::Unknown;
-    robust_rename_and_sync(&tmp, &path)?;
+    #[cfg(feature = "test-hooks")]
+    crate::test_hooks::io_result(crate::test_hooks::IoPoint::ManifestDirectorySync)?;
+    sync_parent_directory(&path)?;
     write.outcome = crate::error::WriteOutcome::Committed;
     Ok(manifest)
 }
