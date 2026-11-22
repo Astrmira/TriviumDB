@@ -1,8 +1,6 @@
 //! 节点读取、批量写入与 CRUD 参数转换。
 
-use super::arguments::{
-    extract_argument, write_float, write_half, write_id, write_list, write_sequence, write_string,
-};
+use super::arguments::{extract_argument, write_id, write_list, write_sequence, write_string};
 use super::database::{DbBackend, PyTriviumDB, database_read, database_write};
 use super::errors::{to_py_error, write_admission_error, write_input_error};
 use super::json::{json_to_pyobject, write_json};
@@ -23,15 +21,27 @@ impl PyTriviumDB {
         let json = write_json(payload, "payload")?;
         match &mut this.inner {
             DbBackend::F32(db) => {
-                let vec: Vec<f32> = write_sequence(&vector, "vector", write_float)?;
+                let vec: Vec<f32> = super::vectors::vector(
+                    &vector,
+                    "vector",
+                    Some(crate::error::WriteErrorInfo::MAINTENANCE_VALIDATION),
+                )?;
                 db.insert(&vec, json).map_err(to_py_error)
             }
             DbBackend::F16(db) => {
-                let vec16: Vec<half::f16> = write_sequence(&vector, "vector", write_half)?;
+                let vec16: Vec<half::f16> = super::vectors::vector(
+                    &vector,
+                    "vector",
+                    Some(crate::error::WriteErrorInfo::MAINTENANCE_VALIDATION),
+                )?;
                 db.insert(&vec16, json).map_err(to_py_error)
             }
             DbBackend::U64(db) => {
-                let vec: Vec<u64> = write_sequence(&vector, "vector", write_id)?;
+                let vec: Vec<u64> = super::vectors::vector(
+                    &vector,
+                    "vector",
+                    Some(crate::error::WriteErrorInfo::MAINTENANCE_VALIDATION),
+                )?;
                 db.insert(&vec, json).map_err(to_py_error)
             }
         }
@@ -50,15 +60,27 @@ impl PyTriviumDB {
         let json = write_json(payload, "payload")?;
         match &mut this.inner {
             DbBackend::F32(db) => {
-                let vec: Vec<f32> = write_sequence(&vector, "vector", write_float)?;
+                let vec: Vec<f32> = super::vectors::vector(
+                    &vector,
+                    "vector",
+                    Some(crate::error::WriteErrorInfo::MAINTENANCE_VALIDATION),
+                )?;
                 db.insert_with_id(id, &vec, json)
             }
             DbBackend::F16(db) => {
-                let vec16: Vec<half::f16> = write_sequence(&vector, "vector", write_half)?;
+                let vec16: Vec<half::f16> = super::vectors::vector(
+                    &vector,
+                    "vector",
+                    Some(crate::error::WriteErrorInfo::MAINTENANCE_VALIDATION),
+                )?;
                 db.insert_with_id(id, &vec16, json)
             }
             DbBackend::U64(db) => {
-                let vec: Vec<u64> = write_sequence(&vector, "vector", write_id)?;
+                let vec: Vec<u64> = super::vectors::vector(
+                    &vector,
+                    "vector",
+                    Some(crate::error::WriteErrorInfo::MAINTENANCE_VALIDATION),
+                )?;
                 db.insert_with_id(id, &vec, json)
             }
         }
@@ -76,16 +98,32 @@ impl PyTriviumDB {
         let id = write_id(&id, "id")?;
         let json = write_json(payload, "payload")?;
         match &mut this.inner {
-            DbBackend::F32(db) => {
-                db.upsert_with_id(id, &write_sequence(&vector, "vector", write_float)?, json)
-            }
+            DbBackend::F32(db) => db.upsert_with_id(
+                id,
+                &super::vectors::vector(
+                    &vector,
+                    "vector",
+                    Some(crate::error::WriteErrorInfo::MAINTENANCE_VALIDATION),
+                )?,
+                json,
+            ),
             DbBackend::F16(db) => {
-                let vector = write_sequence(&vector, "vector", write_half)?;
+                let vector = super::vectors::vector(
+                    &vector,
+                    "vector",
+                    Some(crate::error::WriteErrorInfo::MAINTENANCE_VALIDATION),
+                )?;
                 db.upsert_with_id(id, &vector, json)
             }
-            DbBackend::U64(db) => {
-                db.upsert_with_id(id, &write_sequence(&vector, "vector", write_id)?, json)
-            }
+            DbBackend::U64(db) => db.upsert_with_id(
+                id,
+                &super::vectors::vector(
+                    &vector,
+                    "vector",
+                    Some(crate::error::WriteErrorInfo::MAINTENANCE_VALIDATION),
+                )?,
+                json,
+            ),
         }
         .map_err(to_py_error)
     }
@@ -167,15 +205,27 @@ impl PyTriviumDB {
         let id = write_id(&id, "id")?;
         match &mut this.inner {
             DbBackend::F32(db) => {
-                let vec: Vec<f32> = write_sequence(&vector, "vector", write_float)?;
+                let vec: Vec<f32> = super::vectors::vector(
+                    &vector,
+                    "vector",
+                    Some(crate::error::WriteErrorInfo::MAINTENANCE_VALIDATION),
+                )?;
                 db.update_vector(id, &vec).map_err(to_py_error)
             }
             DbBackend::F16(db) => {
-                let vec16: Vec<half::f16> = write_sequence(&vector, "vector", write_half)?;
+                let vec16: Vec<half::f16> = super::vectors::vector(
+                    &vector,
+                    "vector",
+                    Some(crate::error::WriteErrorInfo::MAINTENANCE_VALIDATION),
+                )?;
                 db.update_vector(id, &vec16).map_err(to_py_error)
             }
             DbBackend::U64(db) => {
-                let vec: Vec<u64> = write_sequence(&vector, "vector", write_id)?;
+                let vec: Vec<u64> = super::vectors::vector(
+                    &vector,
+                    "vector",
+                    Some(crate::error::WriteErrorInfo::MAINTENANCE_VALIDATION),
+                )?;
                 db.update_vector(id, &vec).map_err(to_py_error)
             }
         }
@@ -188,7 +238,7 @@ impl PyTriviumDB {
         slf: &Bound<'_, Self>,
         py: Python<'_>,
         id: Bound<'_, PyAny>,
-    ) -> PyResult<Option<PyObject>> {
+    ) -> PyResult<Option<Py<PyAny>>> {
         let (_request, borrowed) = database_read(slf)?;
         let this = &*borrowed;
         let id = extract_argument(py, &id, "id", None)?;
@@ -281,242 +331,68 @@ impl PyTriviumDB {
 
     fn batch_insert(
         slf: &Bound<'_, Self>,
-        _py: Python<'_>,
+        py: Python<'_>,
         vectors: Bound<'_, PyAny>,
         payloads: &Bound<'_, PyAny>,
     ) -> PyResult<Vec<u64>> {
         let (_request, mut borrowed) = database_write(slf).map_err(write_admission_error)?;
-        let this = &mut *borrowed;
-        let vectors = write_list(&vectors, "vectors")?;
-        let payloads = write_list(payloads, "payloads")?;
-        if vectors.len() != payloads.len() {
-            return Err(write_input_error(
-                pyo3::exceptions::PyValueError::new_err(
-                    "vectors 与 payloads 长度必须相同 (vectors and payloads must have the same length)",
-                ),
-                "payloads",
-            ));
-        }
-        match &mut this.inner {
-            DbBackend::F32(db) => {
-                let mut tx = crate::database::TxBuilder::new();
-                for i in 0..payloads.len() {
-                    let payload_obj = payloads.get_item(i).map_err(|error| {
-                        write_input_error(
-                            error,
-                            &crate::sdk::field_member("payloads", &i.to_string()),
-                        )
-                    })?;
-                    let path = crate::sdk::field_member("vectors", &i.to_string());
-                    let vec_obj = vectors
-                        .get_item(i)
-                        .map_err(|error| write_input_error(error, &path))?;
-                    let vec: Vec<f32> = write_sequence(&vec_obj, &path, write_float)?;
-                    tx.insert(
-                        &vec,
-                        write_json(
-                            &payload_obj,
-                            &crate::sdk::field_member("payloads", &i.to_string()),
-                        )?,
-                    );
-                }
-                db.commit_tx(tx)
-                    .map_err(crate::sdk::direct_write_error)
-                    .map_err(to_py_error)
-            }
-            DbBackend::F16(db) => {
-                let mut tx = crate::database::TxBuilder::new();
-                for i in 0..payloads.len() {
-                    let payload_obj = payloads.get_item(i).map_err(|error| {
-                        write_input_error(
-                            error,
-                            &crate::sdk::field_member("payloads", &i.to_string()),
-                        )
-                    })?;
-                    let path = crate::sdk::field_member("vectors", &i.to_string());
-                    let vec_obj = vectors
-                        .get_item(i)
-                        .map_err(|error| write_input_error(error, &path))?;
-                    let vec16: Vec<half::f16> = write_sequence(&vec_obj, &path, write_half)?;
-                    tx.insert(
-                        &vec16,
-                        write_json(
-                            &payload_obj,
-                            &crate::sdk::field_member("payloads", &i.to_string()),
-                        )?,
-                    );
-                }
-                db.commit_tx(tx)
-                    .map_err(crate::sdk::direct_write_error)
-                    .map_err(to_py_error)
-            }
-            DbBackend::U64(db) => {
-                let mut tx = crate::database::TxBuilder::new();
-                for i in 0..payloads.len() {
-                    let payload_obj = payloads.get_item(i).map_err(|error| {
-                        write_input_error(
-                            error,
-                            &crate::sdk::field_member("payloads", &i.to_string()),
-                        )
-                    })?;
-                    let path = crate::sdk::field_member("vectors", &i.to_string());
-                    let vec_obj = vectors
-                        .get_item(i)
-                        .map_err(|error| write_input_error(error, &path))?;
-                    let vec: Vec<u64> = write_sequence(&vec_obj, &path, write_id)?;
-                    tx.insert(
-                        &vec,
-                        write_json(
-                            &payload_obj,
-                            &crate::sdk::field_member("payloads", &i.to_string()),
-                        )?,
-                    );
-                }
-                db.commit_tx(tx)
-                    .map_err(crate::sdk::direct_write_error)
-                    .map_err(to_py_error)
-            }
-        }
+        dispatch!(borrowed, mut db => insert_rows(py, db, None, &vectors, payloads))
     }
 
     fn batch_insert_with_ids(
         slf: &Bound<'_, Self>,
-        _py: Python<'_>,
+        py: Python<'_>,
         ids: Bound<'_, PyAny>,
         vectors: Bound<'_, PyAny>,
         payloads: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let (_request, mut borrowed) = database_write(slf).map_err(write_admission_error)?;
-        let this = &mut *borrowed;
         let ids = write_sequence(&ids, "ids", write_id)?;
-        let vectors = write_list(&vectors, "vectors")?;
-        let payloads = write_list(payloads, "payloads")?;
-        if vectors.len() != payloads.len() {
-            return Err(write_input_error(
-                pyo3::exceptions::PyValueError::new_err(
-                    "vectors 与 payloads 长度必须相同 (vectors and payloads must have the same length)",
-                ),
-                "payloads",
-            ));
-        }
-        if ids.len() != vectors.len() {
-            return Err(write_input_error(
-                pyo3::exceptions::PyValueError::new_err(
-                    "ids 与 vectors 长度必须相同 (ids and vectors must have the same length)",
-                ),
-                "ids",
-            ));
-        }
-
-        match &mut this.inner {
-            DbBackend::F32(db) => {
-                let mut tx = crate::database::TxBuilder::new();
-                for i in 0..payloads.len() {
-                    let payload_obj = payloads.get_item(i).map_err(|error| {
-                        write_input_error(
-                            error,
-                            &crate::sdk::field_member("payloads", &i.to_string()),
-                        )
-                    })?;
-                    let path = crate::sdk::field_member("vectors", &i.to_string());
-                    let value = vectors
-                        .get_item(i)
-                        .map_err(|error| write_input_error(error, &path))?;
-                    let vec: Vec<f32> = write_sequence(&value, &path, write_float)?;
-                    let id = ids.get(i).copied().ok_or_else(|| {
-                        write_input_error(
-                            PyValueError::new_err(
-                                "转换期间批次长度改变 (Batch length changed during conversion)",
-                            ),
-                            "ids",
-                        )
-                    })?;
-                    tx.insert_with_id(
-                        id,
-                        &vec,
-                        write_json(
-                            &payload_obj,
-                            &crate::sdk::field_member("payloads", &i.to_string()),
-                        )?,
-                    );
-                }
-                db.commit_tx(tx)
-                    .map_err(crate::sdk::direct_write_error)
-                    .map(|_| ())
-                    .map_err(to_py_error)
-            }
-            DbBackend::F16(db) => {
-                let mut tx = crate::database::TxBuilder::new();
-                for i in 0..payloads.len() {
-                    let payload_obj = payloads.get_item(i).map_err(|error| {
-                        write_input_error(
-                            error,
-                            &crate::sdk::field_member("payloads", &i.to_string()),
-                        )
-                    })?;
-                    let path = crate::sdk::field_member("vectors", &i.to_string());
-                    let value = vectors
-                        .get_item(i)
-                        .map_err(|error| write_input_error(error, &path))?;
-                    let vec16: Vec<half::f16> = write_sequence(&value, &path, write_half)?;
-                    let id = ids.get(i).copied().ok_or_else(|| {
-                        write_input_error(
-                            PyValueError::new_err(
-                                "转换期间批次长度改变 (Batch length changed during conversion)",
-                            ),
-                            "ids",
-                        )
-                    })?;
-                    tx.insert_with_id(
-                        id,
-                        &vec16,
-                        write_json(
-                            &payload_obj,
-                            &crate::sdk::field_member("payloads", &i.to_string()),
-                        )?,
-                    );
-                }
-                db.commit_tx(tx)
-                    .map_err(crate::sdk::direct_write_error)
-                    .map(|_| ())
-                    .map_err(to_py_error)
-            }
-            DbBackend::U64(db) => {
-                let mut tx = crate::database::TxBuilder::new();
-                for i in 0..payloads.len() {
-                    let payload_obj = payloads.get_item(i).map_err(|error| {
-                        write_input_error(
-                            error,
-                            &crate::sdk::field_member("payloads", &i.to_string()),
-                        )
-                    })?;
-                    let path = crate::sdk::field_member("vectors", &i.to_string());
-                    let value = vectors
-                        .get_item(i)
-                        .map_err(|error| write_input_error(error, &path))?;
-                    let vec: Vec<u64> = write_sequence(&value, &path, write_id)?;
-                    let id = ids.get(i).copied().ok_or_else(|| {
-                        write_input_error(
-                            PyValueError::new_err(
-                                "转换期间批次长度改变 (Batch length changed during conversion)",
-                            ),
-                            "ids",
-                        )
-                    })?;
-                    tx.insert_with_id(
-                        id,
-                        &vec,
-                        write_json(
-                            &payload_obj,
-                            &crate::sdk::field_member("payloads", &i.to_string()),
-                        )?,
-                    );
-                }
-                db.commit_tx(tx)
-                    .map_err(crate::sdk::direct_write_error)
-                    .map(|_| ())
-                    .map_err(to_py_error)
-            }
-        }
+        dispatch!(borrowed, mut db => insert_rows(py, db, Some(&ids), &vectors, payloads))
+            .map(|_| ())
     }
+}
+
+fn insert_rows<
+    T: crate::VectorType + super::vectors::Component + serde::Serialize + serde::de::DeserializeOwned,
+>(
+    py: Python<'_>,
+    db: &mut crate::database::Database<T>,
+    ids: Option<&[u64]>,
+    vectors: &Bound<'_, PyAny>,
+    payloads: &Bound<'_, PyAny>,
+) -> PyResult<Vec<u64>> {
+    let mut vectors = super::vectors::WriteRows::<T>::new(vectors)?;
+    let payloads = write_list(payloads, "payloads")?;
+    let count = vectors.len();
+    if count != payloads.len() {
+        return Err(write_input_error(
+            PyValueError::new_err(
+                "vectors 与 payloads 长度必须相同 (vectors and payloads must have the same length)",
+            ),
+            "payloads",
+        ));
+    }
+    if ids.is_some_and(|ids| ids.len() != count) {
+        return Err(write_input_error(
+            PyValueError::new_err(
+                "ids 与 vectors 长度必须相同 (ids and vectors must have the same length)",
+            ),
+            "ids",
+        ));
+    }
+    let mut tx = crate::database::TxBuilder::new();
+    for i in 0..count {
+        let index = i.to_string();
+        let payload_field = crate::sdk::field_member("payloads", &index);
+        let payload = payloads
+            .get_item(i)
+            .map_err(|e| write_input_error(e, &payload_field))?;
+        let row = vectors.next_row(i, &crate::sdk::field_member("vectors", &index))?;
+        let json = write_json(&payload, &payload_field)?;
+        tx.insert_owned(ids.map(|ids| ids[i]), row, json);
+    }
+    py.detach(|| db.commit_tx(tx))
+        .map_err(crate::sdk::direct_write_error)
+        .map_err(to_py_error)
 }

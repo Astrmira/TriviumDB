@@ -89,6 +89,7 @@ Python 与 Node 的原生绑定分别位于 [`src/bindings/python/`](../src/bind
 | 模块 | 职责 |
 | --- | --- |
 | `arguments.rs`、`json.rs`、`options.rs` | 实参、数值、字符串、容器、JSON 和配置的语言表示 |
+| `vectors.rs` | 校验宿主向量缓冲的 dtype、形状与布局，取得 Rust 持有的批量输入，保持查询返回和事务提交的原有语义 |
 | `errors.rs`、`requests.rs`、`runtime.rs` | 结构化错误、请求上下文、调用形状及共享资源句柄 |
 | `database.rs` | 数据库包装类型、dtype 后端、构造与基础信息 |
 | `records.rs`、`transaction.rs` | 节点读写、批量操作及事务构建、提交和对象生命周期 |

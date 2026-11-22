@@ -65,7 +65,7 @@ pub(super) fn attach_error_info(exception: PyErr, error: crate::TriviumError) ->
 }
 
 pub(super) fn attach_error_descriptor(exception: PyErr, info: crate::error::ErrorInfo) -> PyErr {
-    Python::with_gil(|py| -> PyResult<()> {
+    Python::attach(|py| -> PyResult<()> {
         let value = exception.value(py);
         value.setattr("schema_version", info.schema_version)?;
         value.setattr("code", info.code)?;
@@ -120,7 +120,7 @@ pub(super) fn write_admission_error(error: PyErr) -> PyErr {
 }
 
 fn python_write_error(error: PyErr, write: crate::error::WriteErrorInfo) -> PyErr {
-    Python::with_gil(|py| -> PyResult<()> {
+    Python::attach(|py| -> PyResult<()> {
         let write = serde_json::to_value(write)
             .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(error.to_string()))?;
         error

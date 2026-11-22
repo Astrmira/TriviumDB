@@ -198,6 +198,22 @@ fn array_value<T>(
     write: Option<crate::error::WriteErrorInfo>,
     mut parse: impl FnMut(Env, JsUnknown, &str) -> napi::Result<T>,
 ) -> napi::Result<Vec<T>> {
+    array_items(env, value, field, write, |item, index| {
+        parse(
+            env,
+            item,
+            &crate::sdk::field_member(field, &index.to_string()),
+        )
+    })
+}
+
+fn array_items<T>(
+    env: Env,
+    value: JsUnknown,
+    field: &str,
+    write: Option<crate::error::WriteErrorInfo>,
+    mut parse: impl FnMut(JsUnknown, u32) -> napi::Result<T>,
+) -> napi::Result<Vec<T>> {
     let invalid = || {
         argument_input_error(
             env,
@@ -215,13 +231,12 @@ fn array_value<T>(
     }
     let mut result = Vec::new();
     for index in 0..array.get_array_length()? {
-        let path = crate::sdk::field_member(field, &index.to_string());
-        let item = parse(env, array.get_element(index)?, &path)?;
+        let item = parse(array.get_element(index)?, index)?;
         result.try_reserve(1).map_err(|error| {
             let error = crate::TriviumError::CapacityAllocationFailed {
                 reason: format!("参数缓冲分配失败 (Argument buffer allocation failed): {error}"),
             }
-            .at_field(&path);
+            .at_field(&crate::sdk::field_member(field, &index.to_string()));
             to_napi_error(
                 env,
                 match write {
@@ -267,11 +282,40 @@ pub(super) fn read_vector(
     field: &str,
     dtype: &str,
 ) -> napi::Result<Vec<f64>> {
-    read_array(env, value, field, |env, value, path| {
-        let number = read_number(env, value, path)?;
-        if dtype == "u64" {
-            validate_u64_component(number)
-                .map_err(|error| to_napi_error(env, error.at_field(path)))?;
+    vector_numbers(env, value, field, dtype == "u64", None)
+}
+
+pub(super) fn vector_numbers(
+    env: Env,
+    value: JsUnknown,
+    field: &str,
+    check_u64: bool,
+    write: Option<crate::error::WriteErrorInfo>,
+) -> napi::Result<Vec<f64>> {
+    array_items(env, value, field, write, |item, index| {
+        let path = || crate::sdk::field_member(field, &index.to_string());
+        // JsNumber 的转换检查实际类型，逐元素读取 getter 一次，仅失败时生成成员路径。
+        let number = napi::JsNumber::try_from(item)
+            .map_err(|_| {
+                argument_input_error(
+                    env,
+                    &path(),
+                    "参数必须是数值 (Argument must be a number)",
+                    write,
+                )
+            })?
+            .get_double()?;
+        if check_u64 {
+            validate_u64_component(number).map_err(|e| {
+                let e = e.at_field(&path());
+                to_napi_error(
+                    env,
+                    match write {
+                        Some(info) => e.with_write_info(info),
+                        None => e,
+                    },
+                )
+            })?;
         }
         Ok(number)
     })
@@ -341,20 +385,13 @@ pub(super) fn write_vector(
     field: &str,
     dtype: &str,
 ) -> napi::Result<Vec<f64>> {
-    write_array(env, value, field, |env, value, path| {
-        let number = write_number(env, value, path)?;
-        if dtype == "u64" {
-            validate_u64_component(number).map_err(|error| {
-                to_napi_error(
-                    env,
-                    error
-                        .at_field(path)
-                        .with_write_info(crate::error::WriteErrorInfo::MAINTENANCE_VALIDATION),
-                )
-            })?;
-        }
-        Ok(number)
-    })
+    vector_numbers(
+        env,
+        value,
+        field,
+        dtype == "u64",
+        Some(crate::error::WriteErrorInfo::MAINTENANCE_VALIDATION),
+    )
 }
 
 pub(super) fn constructor_options(env: Env, options: Option<JsUnknown>) -> napi::Result<JsObject> {

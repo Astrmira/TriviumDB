@@ -253,6 +253,35 @@ jobs:
           python -m mypy --strict tests/python/typing_smoke.py
           npx --yes pyright tests/python/typing_smoke.py --pythonpath "$(command -v python)"
 
+      - name: 核对 NumPy 半精度矩阵与字节序
+        if: runner.os == 'Linux'
+        run: |
+          python -m pip install numpy
+          python tests/python/vector_buffers.py --numpy
+
+      - name: 安装其余普通 CPython 解释器
+        if: runner.os == 'Linux'
+        uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.9
+            3.11
+            3.12
+            3.13
+            3.14
+            3.15
+
+      - name: 用同一份 abi3 wheel 核对跨版本核心契约
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          for minor in 9 11 12 13 14 15; do
+            python3."$minor" -m venv "$RUNNER_TEMP/tdb-py$minor"
+            interpreter="$RUNNER_TEMP/tdb-py$minor/bin/python"
+            "$interpreter" -m pip install --no-index --no-deps python-dist/*.whl
+            "$interpreter" tests/python/vector_buffers.py
+          done
+
   node-binding:
     name: Node.js Binding Lifecycle
     runs-on: ${{ matrix.runner }}
@@ -303,6 +332,24 @@ jobs:
 
       - name: 验证 npm 产物的 TypeScript 消费与原生运行契约
         run: npm run test:package
+
+      - uses: actions/setup-node@v4
+        if: runner.os == 'Linux'
+        with:
+          node-version: 24
+
+      - name: Node 24 复用原生包验证公共契约
+        if: runner.os == 'Linux'
+        run: npm run test:public-api
+
+      - uses: actions/setup-node@v4
+        if: runner.os == 'Linux'
+        with:
+          node-version: 26
+
+      - name: Node 26 复用原生包验证公共契约
+        if: runner.os == 'Linux'
+        run: npm run test:public-api
 
   # ═══════════════════════════════════════════
   #  Job 2b: ARM64 Linux 原生测试

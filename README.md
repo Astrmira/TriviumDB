@@ -22,7 +22,7 @@
 > TriviumDB 为 Agent、RAG 和知识图谱应用提供进程内的向量、图与文档存储。宿主应用通过 Rust、Python 或 Node.js API 管理数据库实例、查询和持久化。
 
 [![Rust](https://img.shields.io/badge/Rust-stable-orange?logo=rust)](https://www.rust-lang.org/)
-[![Python 3.9–3.12](https://img.shields.io/badge/Python-3.9%E2%80%933.12-blue?logo=python)](https://pypi.org/)
+[![Python 3.9–3.15](https://img.shields.io/badge/Python-3.9%E2%80%933.15-blue?logo=python)](docs/api-reference.md)
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![QuIVer arXiv](https://img.shields.io/badge/QuIVer%20arXiv-2605.02171-b31b1b.svg)](https://arxiv.org/abs/2605.02171)
 [![Pelorus arXiv](https://img.shields.io/badge/Pelorus%20arXiv-2611.22159-b31b1b.svg)](https://arxiv.org/abs/2611.22159)
@@ -222,6 +222,8 @@ batch_results = db.search_batch(
 ```javascript
 const batchResults = await db.searchBatch(queryVectors, 10, 0, 0.0)
 ```
+
+开发版绑定支持普通 CPython 3.9–3.15 和 Node.js 22、24、26。批量插入与检索可直接读取二维 Python `memoryview`，以及 Node.js 的 `Float32Array` 或 `BigUint64Array`。PyPI 上的 0.9.3 wheel 适用于 CPython 3.9–3.12。
 
 `parallelism=0` 表示自动选择并发度，最大允许值为 64；结果外层顺序严格对应输入查询。批量 API 仅支持无状态查询，不允许 fatigue 语义。
 

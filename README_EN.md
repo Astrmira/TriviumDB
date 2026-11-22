@@ -22,7 +22,7 @@
 > TriviumDB provides in-process vector, graph, and document storage for Agent, RAG, and knowledge-graph applications. The host application manages database instances, queries, and persistence through Rust, Python, or Node.js APIs.
 
 [![Rust](https://img.shields.io/badge/Rust-stable-orange?logo=rust)](https://www.rust-lang.org/)
-[![Python 3.9–3.12](https://img.shields.io/badge/Python-3.9%E2%80%933.12-blue?logo=python)](https://pypi.org/)
+[![Python 3.9–3.15](https://img.shields.io/badge/Python-3.9%E2%80%933.15-blue?logo=python)](docs/api-reference.md)
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![QuIVer arXiv](https://img.shields.io/badge/QuIVer%20arXiv-2605.02171-b31b1b.svg)](https://arxiv.org/abs/2605.02171)
 [![Pelorus arXiv](https://img.shields.io/badge/Pelorus%20arXiv-2611.22159-b31b1b.svg)](https://arxiv.org/abs/2611.22159)
@@ -293,6 +293,8 @@ batch_results = db.search_batch(
 ```javascript
 const batchResults = await db.searchBatch(queryVectors, 10, 0, 0.0)
 ```
+
+The development bindings support GIL-enabled CPython 3.9–3.15 and Node.js 22, 24 and 26. Batch inserts and searches accept two-dimensional Python memoryviews and packed Node.js Float32Array or BigUint64Array inputs. The 0.9.3 wheels on PyPI target CPython 3.9–3.12.
 
 `parallelism=0` selects concurrency automatically, with a maximum accepted value of 64. Outer result order always matches input query order. The batch API supports stateless queries only and rejects fatigue semantics.
 

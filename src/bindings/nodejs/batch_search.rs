@@ -1,13 +1,10 @@
 //! 批量检索的异步任务与请求上下文传播。
 
-use super::arguments::{
-    optional_bool, optional_number, parse_search_usize, read_array, read_number,
-    validate_u64_component,
-};
+use super::arguments::{optional_bool, optional_number, parse_search_usize};
 use super::database::{DbBackend, TriviumDB};
 use super::errors::to_napi_error;
 use super::types::{JsSearchHit, search_hit_to_js};
-use crate::VectorType;
+use super::vectors::Batch;
 use napi::bindgen_prelude::Either;
 use napi::{Env, JsUnknown};
 use napi_derive::napi;
@@ -22,7 +19,7 @@ enum SearchBackendHandle {
 pub struct BatchSearchTask {
     context: Option<crate::sdk::RequestContext>,
     backend: SearchBackendHandle,
-    queries: Vec<Vec<f64>>,
+    queries: Batch,
     search_config: crate::database::SearchConfig,
     batch_config: crate::database::BatchSearchConfig,
 }
@@ -44,52 +41,17 @@ impl napi::Task for BatchSearchTask {
         if let Err(error) = crate::request::check_current() {
             return Ok(Err(error));
         }
+        let queries = std::mem::replace(&mut self.queries, Batch::Numbers(Vec::new()));
         Ok(match &self.backend {
-            SearchBackendHandle::F32(db) => {
-                let queries = self
-                    .queries
-                    .iter()
-                    .map(|query| query.iter().map(|value| *value as f32).collect())
-                    .collect::<Vec<Vec<f32>>>();
-                db.search_batch(&queries, &self.search_config, &self.batch_config)
-            }
-            SearchBackendHandle::F16(db) => {
-                let queries = self
-                    .queries
-                    .iter()
-                    .map(|query| {
-                        query
-                            .iter()
-                            .map(|value| half::f16::from_f64_component(*value))
-                            .collect()
-                    })
-                    .collect::<Vec<Vec<half::f16>>>();
-                db.search_batch(&queries, &self.search_config, &self.batch_config)
-            }
-            SearchBackendHandle::U64(db) => {
-                let queries = self
-                    .queries
-                    .iter()
-                    .enumerate()
-                    .map(|(row, query)| {
-                        query
-                            .iter()
-                            .copied()
-                            .enumerate()
-                            .map(|(column, value)| {
-                                validate_u64_component(value).map_err(|error| {
-                                    error.at_field(&format!("/queryVectors/{row}/{column}"))
-                                })
-                            })
-                            .collect::<crate::Result<Vec<_>>>()
-                    })
-                    .collect::<crate::Result<Vec<_>>>();
-                let queries = match queries {
-                    Ok(queries) => queries,
-                    Err(error) => return Ok(Err(error)),
-                };
-                db.search_batch(&queries, &self.search_config, &self.batch_config)
-            }
+            SearchBackendHandle::F32(db) => queries
+                .into_f32()
+                .and_then(|rows| db.search_batch(&rows, &self.search_config, &self.batch_config)),
+            SearchBackendHandle::F16(db) => queries
+                .into_half()
+                .and_then(|rows| db.search_batch(&rows, &self.search_config, &self.batch_config)),
+            SearchBackendHandle::U64(db) => queries
+                .into_u64("queryVectors")
+                .and_then(|rows| db.search_batch(&rows, &self.search_config, &self.batch_config)),
         })
     }
 
@@ -118,10 +80,8 @@ impl TriviumDB {
         min_score: Option<JsUnknown>,
         exact: Option<JsUnknown>,
     ) -> napi::Result<napi::bindgen_prelude::AsyncTask<BatchSearchTask>> {
-        let query_vectors = read_array(env, query_vectors, "queryVectors", |env, value, path| {
-            // 保留 u64 数值范围在任务阶段拒绝的 Promise 完成语义。
-            read_array(env, value, path, read_number)
-        })?;
+        let query_vectors =
+            Batch::read(env, query_vectors, self.dim() as usize, &self.dtype, false)?;
         let top_k = parse_search_usize(env, top_k, 5.0, "topK", true)?;
         let parallelism = parse_search_usize(env, parallelism, 0.0, "parallelism", false)?;
         let backend = match &self.inner {

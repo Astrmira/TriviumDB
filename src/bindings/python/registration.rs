@@ -28,7 +28,7 @@ pub fn init_logger() {
         .try_init();
 }
 
-#[pymodule]
+#[pymodule(gil_used = true)]
 pub fn triviumdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("TriviumDBError", m.py().get_type::<TriviumDBError>())?;
     m.add("InvalidInputError", m.py().get_type::<InvalidInputError>())?;

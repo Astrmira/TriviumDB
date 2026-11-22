@@ -36,15 +36,15 @@ pub struct PySearchHit {
     #[pyo3(get)]
     pub score: f32,
     #[pyo3(get)]
-    pub payload: PyObject,
+    pub payload: Py<PyAny>,
 }
 
 #[pyclass(name = "GroupedSearchResult")]
 pub struct PyGroupedSearchResult {
     #[pyo3(get)]
-    pub semantic_hits: PyObject,
+    pub semantic_hits: Py<PyAny>,
     #[pyo3(get)]
-    pub graph_hits: PyObject,
+    pub graph_hits: Py<PyAny>,
 }
 
 #[pyclass(name = "ReachabilityStep")]
@@ -58,12 +58,12 @@ pub struct PyReachabilityStep {
     #[pyo3(get)]
     pub weight: f64,
     #[pyo3(get)]
-    pub metadata: PyObject,
+    pub metadata: Py<PyAny>,
 }
 
 impl Clone for PyReachabilityStep {
     fn clone(&self) -> Self {
-        Python::with_gil(|py| Self {
+        Python::attach(|py| Self {
             from_id: self.from_id,
             to_id: self.to_id,
             label: self.label.clone(),
@@ -96,12 +96,12 @@ pub struct PyEdge {
     #[pyo3(get)]
     pub weight: f64,
     #[pyo3(get)]
-    pub metadata: PyObject,
+    pub metadata: Py<PyAny>,
 }
 
 impl Clone for PyEdge {
     fn clone(&self) -> Self {
-        Python::with_gil(|py| Self {
+        Python::attach(|py| Self {
             target_id: self.target_id,
             label: self.label.clone(),
             weight: self.weight,
@@ -121,7 +121,7 @@ pub struct PyIncomingEdge {
     #[pyo3(get)]
     pub weight: f64,
     #[pyo3(get)]
-    pub metadata: PyObject,
+    pub metadata: Py<PyAny>,
 }
 
 pub(super) fn search_hit_to_python(
@@ -141,9 +141,9 @@ pub struct PyNodeView {
     #[pyo3(get)]
     pub id: u64,
     #[pyo3(get)]
-    pub vector: PyObject, // 可能是 f32/f16(透传给py仍是float)/u64
+    pub vector: Py<PyAny>, // 可能是 f32/f16(透传给py仍是float)/u64
     #[pyo3(get)]
-    pub payload: PyObject,
+    pub payload: Py<PyAny>,
     #[pyo3(get)]
     pub edges: Vec<PyEdge>,
     #[pyo3(get)]
@@ -158,7 +158,7 @@ pub struct PyNodeView {
 pub struct PyQueryRow {
     /// 变量名 -> (id, payload_dict)
     #[pyo3(get)]
-    pub row: PyObject,
+    pub row: Py<PyAny>,
 }
 
 /// Hook 管线执行上下文（包含各阶段计时统计和自定义数据）
@@ -166,15 +166,15 @@ pub struct PyQueryRow {
 pub struct PyHookContext {
     /// 各管线阶段的耗时统计（阶段名 → 耗时微秒数）
     #[pyo3(get)]
-    pub timings: PyObject,
+    pub timings: Py<PyAny>,
     /// 每阶段候选数量
     #[pyo3(get)]
-    pub counts: PyObject,
+    pub counts: Py<PyAny>,
     /// Hook 注入的自定义数据
     #[pyo3(get)]
-    pub custom_data: PyObject,
+    pub custom_data: Py<PyAny>,
     #[pyo3(get)]
-    pub observations: PyObject,
+    pub observations: Py<PyAny>,
     /// 管线是否被 Hook 提前终止
     #[pyo3(get)]
     pub aborted: bool,

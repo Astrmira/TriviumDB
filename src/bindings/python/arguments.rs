@@ -9,22 +9,22 @@ use pyo3::types::{PyDict, PyList, PyString, PyTuple};
 
 /// 默认值构造为真实 Python 整数，使显式提取保留原有数值默认值。
 pub(super) fn integer_argument(value: u64) -> Py<PyAny> {
-    Python::with_gil(|py| match value.into_pyobject(py) {
+    Python::attach(|py| match value.into_pyobject(py) {
         Ok(value) => value.into_any().unbind(),
         Err(never) => match never {},
     })
 }
 
 pub(super) fn string_argument(value: &str) -> Py<PyAny> {
-    Python::with_gil(|py| pyo3::types::PyString::new(py, value).into_any().unbind())
+    Python::attach(|py| pyo3::types::PyString::new(py, value).into_any().unbind())
 }
 
 pub(super) fn float_argument(value: f64) -> Py<PyAny> {
-    Python::with_gil(|py| pyo3::types::PyFloat::new(py, value).into_any().unbind())
+    Python::attach(|py| pyo3::types::PyFloat::new(py, value).into_any().unbind())
 }
 
 pub(super) fn boolean_argument(value: bool) -> Py<PyAny> {
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         value
             .into_pyobject(py)
             .unwrap()
@@ -43,7 +43,7 @@ pub(super) fn constructor_arguments<'py>(
     py.import("triviumdb.triviumdb")?
         .getattr("_bind_constructor")?
         .call1((owner, args, kwargs))?
-        .downcast_into::<PyDict>()
+        .cast_into::<PyDict>()
         .map_err(Into::into)
 }
 
@@ -69,7 +69,7 @@ pub(super) fn constructor_mib(value: usize, field: &str) -> PyResult<usize> {
     })
 }
 
-pub(super) fn extract_management_argument<'py, T: FromPyObject<'py>>(
+pub(super) fn extract_management_argument<'py, T: for<'a> FromPyObject<'a, 'py>>(
     py: Python<'py>,
     value: &Bound<'py, PyAny>,
     field: &str,
@@ -82,13 +82,13 @@ pub(super) fn extract_management_argument<'py, T: FromPyObject<'py>>(
     )
 }
 
-pub(super) fn extract_argument<'py, T: FromPyObject<'py>>(
+pub(super) fn extract_argument<'py, T: for<'a> FromPyObject<'a, 'py>>(
     py: Python<'py>,
     value: &Bound<'py, PyAny>,
     field: &str,
     write: Option<crate::error::WriteErrorInfo>,
 ) -> PyResult<T> {
-    value.extract().map_err(|error| {
+    value.extract::<T>().map_err(|error| {
         use pyo3::types::{PyBool, PyBytes, PyComplex, PyFloat, PyInt, PyString, PyTuple};
         let value_type = value.get_type();
         let builtin = value.is_none()
@@ -114,10 +114,10 @@ pub(super) fn extract_argument<'py, T: FromPyObject<'py>>(
                 Some(write) => input.with_write_info(write),
                 None => input,
             };
-            attach_error_info(error, input)
+            attach_error_info(error.into(), input)
         } else {
             // 自定义转换协议中的宿主异常保留原对象、cause 与已有诊断。
-            error
+            error.into()
         }
     })
 }
@@ -137,7 +137,7 @@ fn numeric_protocol(value: &Bound<'_, PyAny>, slot: i32) -> bool {
     }
 }
 
-pub(super) fn integer_value<'py, T: FromPyObject<'py>>(
+pub(super) fn integer_value<'py, T: for<'a> FromPyObject<'a, 'py>>(
     value: &Bound<'py, PyAny>,
     field: &str,
     write: Option<crate::error::WriteErrorInfo>,
@@ -175,19 +175,7 @@ pub(super) fn half_value(
     number_value(value, field, write).map(half::f16::from_f64_component)
 }
 
-pub(super) fn read_half(value: &Bound<'_, PyAny>, field: &str) -> PyResult<half::f16> {
-    half_value(value, field, None)
-}
-
-pub(super) fn write_half(value: &Bound<'_, PyAny>, field: &str) -> PyResult<half::f16> {
-    half_value(
-        value,
-        field,
-        Some(crate::error::WriteErrorInfo::MAINTENANCE_VALIDATION),
-    )
-}
-
-fn number_value<'py, T: FromPyObject<'py>>(
+fn number_value<'py, T: for<'a> FromPyObject<'a, 'py>>(
     value: &Bound<'py, PyAny>,
     field: &str,
     write: Option<crate::error::WriteErrorInfo>,
@@ -265,7 +253,7 @@ pub(super) fn write_list<'py>(
 ) -> PyResult<Bound<'py, PyList>> {
     value
         .clone()
-        .downcast_into::<PyList>()
+        .cast_into::<PyList>()
         .map_err(|error| write_input_error(error.into(), field))
 }
 
@@ -296,6 +284,16 @@ pub(super) fn sequence_value<T>(
     write: Option<crate::error::WriteErrorInfo>,
     parse: impl Fn(&Bound<'_, PyAny>, &str) -> PyResult<T>,
 ) -> PyResult<Vec<T>> {
+    sequence_with_fast_path(value, field, write, |_| None, parse)
+}
+
+pub(super) fn sequence_with_fast_path<T>(
+    value: &Bound<'_, PyAny>,
+    field: &str,
+    write: Option<crate::error::WriteErrorInfo>,
+    fast: impl Fn(&Bound<'_, PyAny>) -> Option<T>,
+    parse: impl Fn(&Bound<'_, PyAny>, &str) -> PyResult<T>,
+) -> PyResult<Vec<T>> {
     // SAFETY: Bound 保持对象存活且 GIL 覆盖检测；只调用 CPython 协议检测，不解引用裸内存。
     let sequence = unsafe { pyo3::ffi::PySequence_Check(value.as_ptr()) != 0 };
     if !sequence || value.is_instance_of::<PyString>() {
@@ -312,13 +310,16 @@ pub(super) fn sequence_value<T>(
     let mut result = Vec::new();
     for (index, item) in value.try_iter()?.enumerate() {
         let item = item?;
-        let path = crate::sdk::field_member(field, &index.to_string());
-        let parsed = parse(&item, &path)?;
+        let path = || crate::sdk::field_member(field, &index.to_string());
+        let parsed = match fast(&item) {
+            Some(parsed) => parsed,
+            None => parse(&item, &path())?,
+        };
         result.try_reserve(1).map_err(|error| {
             let error = crate::TriviumError::CapacityAllocationFailed {
                 reason: format!("参数缓冲分配失败 (Argument buffer allocation failed): {error}"),
             }
-            .at_field(&path);
+            .at_field(&path());
             to_py_error(match write {
                 Some(write) => error.with_write_info(write),
                 None => error,

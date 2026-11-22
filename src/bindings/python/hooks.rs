@@ -20,17 +20,10 @@ use pyo3::types::{PyDict, PyList};
 /// - on_rerank(self, hits, ctx) -> Optional[list]
 /// - on_post_search(self, hits, ctx) -> None
 struct PySearchHookWrapper {
-    py_hook: PyObject,
+    py_hook: Py<PyAny>,
     // 身份只用于准入匹配；正在调用的方法持有 PyRef，保证原实例存活。
     database_identity: usize,
 }
-
-// SAFETY: PyObject 本身是 Send+Sync（它只是一个引用计数指针），
-// 实际的 Python 调用在 with_gil 中执行，由 GIL 保证线程安全。
-unsafe impl Send for PySearchHookWrapper {}
-
-// SAFETY: Python 回调共享访问均在 GIL 下执行，请求借用约束重入及数据库对象生命周期。
-unsafe impl Sync for PySearchHookWrapper {}
 
 impl PySearchHookWrapper {
     fn with_callback<R: Default>(
@@ -46,7 +39,7 @@ impl PySearchHookWrapper {
                     return R::default();
                 }
             };
-        Python::with_gil(|py| call(py, ctx))
+        Python::attach(|py| call(py, ctx))
     }
 
     fn record_python_error(ctx: &mut crate::hook::HookContext, stage: &str, error: PyErr) {
@@ -56,7 +49,7 @@ impl PySearchHookWrapper {
     }
 
     /// 将 Rust Vec<SearchHit> 转换为 Python list[dict]
-    fn hits_to_py(py: Python<'_>, hits: &[crate::node::SearchHit]) -> PyResult<PyObject> {
+    fn hits_to_py(py: Python<'_>, hits: &[crate::node::SearchHit]) -> PyResult<Py<PyAny>> {
         let values = hits
             .iter()
             .map(|h| -> PyResult<_> {
@@ -70,11 +63,11 @@ impl PySearchHookWrapper {
         Ok(PyList::new(py, values)?.into_any().unbind())
     }
 
-    fn py_to_hits(py: Python<'_>, obj: &PyObject) -> PyResult<Vec<crate::node::SearchHit>> {
-        let list = obj.bind(py).downcast::<PyList>()?;
+    fn py_to_hits(py: Python<'_>, obj: &Py<PyAny>) -> PyResult<Vec<crate::node::SearchHit>> {
+        let list = obj.bind(py).cast::<PyList>()?;
         list.iter()
             .map(|item| {
-                let dict = item.downcast::<PyDict>()?;
+                let dict = item.cast::<PyDict>()?;
                 let required = |name: &str| {
                     dict.get_item(name)?.ok_or_else(|| {
                         PyValueError::new_err(format!(
@@ -103,8 +96,8 @@ impl PySearchHookWrapper {
         &self,
         stage: &str,
         ctx: &mut crate::hook::HookContext,
-        argument: impl FnOnce(Python<'_>) -> PyResult<PyObject>,
-        decode: impl FnOnce(Python<'_>, PyObject) -> PyResult<R>,
+        argument: impl FnOnce(Python<'_>) -> PyResult<Py<PyAny>>,
+        decode: impl FnOnce(Python<'_>, Py<PyAny>) -> PyResult<R>,
     ) -> Option<R> {
         self.with_callback(ctx, |py, ctx| {
             let call = || -> PyResult<Option<R>> {
@@ -143,7 +136,7 @@ impl PySearchHookWrapper {
                     })
                 };
                 let custom = required("custom_data")?;
-                let custom = pyobject_to_json(custom.downcast::<PyDict>()?.as_any())?;
+                let custom = pyobject_to_json(custom.cast::<PyDict>()?.as_any())?;
                 let abort = required("abort")?.extract::<bool>()?;
                 ctx.custom_data = custom;
                 ctx.abort = abort;
@@ -285,7 +278,7 @@ impl PyTriviumDB {
     ///
     /// db.set_hook(MyHook())
     /// ```
-    fn set_hook(slf: &Bound<'_, Self>, hook: PyObject) -> PyResult<()> {
+    fn set_hook(slf: &Bound<'_, Self>, hook: Py<PyAny>) -> PyResult<()> {
         let (_request, mut borrowed) = database_write(slf)?;
         let this = &mut *borrowed;
         let wrapper = PySearchHookWrapper {

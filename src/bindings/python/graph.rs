@@ -15,9 +15,10 @@ use pyo3::types::{PyDict, PyList};
 #[derive(Default)]
 struct EdgeMetadata<'py>(Option<Bound<'py, PyAny>>);
 
-impl<'py> FromPyObject<'py> for EdgeMetadata<'py> {
-    fn extract_bound(value: &Bound<'py, PyAny>) -> PyResult<Self> {
-        Ok(Self(Some(value.clone())))
+impl<'py> FromPyObject<'_, 'py> for EdgeMetadata<'py> {
+    type Error = PyErr;
+    fn extract(value: Borrowed<'_, 'py, PyAny>) -> PyResult<Self> {
+        Ok(Self(Some(value.to_owned())))
     }
 }
 
@@ -285,7 +286,7 @@ impl PyTriviumDB {
         max_results: Py<PyAny>,
         max_edges: Py<PyAny>,
         max_frontier_size: Py<PyAny>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let (_request, borrowed) = database_read(slf)?;
         let this = &*borrowed;
         let id = extract_argument(py, &id, "id", None)?;
@@ -344,7 +345,7 @@ impl PyTriviumDB {
         max_results: Py<PyAny>,
         max_edges: Py<PyAny>,
         max_frontier_size: Py<PyAny>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let (_request, borrowed) = database_read(slf)?;
         let this = &*borrowed;
         let id = extract_argument(py, &id, "id", None)?;
@@ -389,7 +390,7 @@ impl PyTriviumDB {
         json_to_pyobject(py, &value)
     }
 
-    fn graph_stats(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<PyObject> {
+    fn graph_stats(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let (_request, borrowed) = database_read(slf)?;
         let this = &*borrowed;
         let value =
@@ -398,7 +399,7 @@ impl PyTriviumDB {
         json_to_pyobject(py, &value)
     }
 
-    fn validate_graph(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<PyObject> {
+    fn validate_graph(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let (_request, borrowed) = database_read(slf)?;
         let this = &*borrowed;
         let value =
@@ -407,7 +408,7 @@ impl PyTriviumDB {
         json_to_pyobject(py, &value)
     }
 
-    fn repair_graph_indexes(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<PyObject> {
+    fn repair_graph_indexes(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let (_request, mut borrowed) = database_write(slf).map_err(write_admission_error)?;
         let this = &mut *borrowed;
         let report = dispatch!(this, mut db => db.repair_graph_indexes()).map_err(to_py_error)?;
@@ -439,7 +440,7 @@ impl PyTriviumDB {
         min_community_size: Py<PyAny>,
         max_iterations: Py<PyAny>,
         compute_centroids: Py<PyAny>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let (_request, borrowed) = database_read(slf)?;
         let this = &*borrowed;
         let min_community_size =

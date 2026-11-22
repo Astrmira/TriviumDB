@@ -27,7 +27,7 @@ impl PyTriviumDB {
         dispatch!(this, mut db => db.set_sync_mode(sm)).map_err(to_py_error)
     }
 
-    fn storage_info(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<PyObject> {
+    fn storage_info(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let (_request, borrowed) = database_read(slf)?;
         let this = &*borrowed;
         let value = dispatch!(this, db => serde_json::to_value(db.storage_info()))
@@ -45,7 +45,7 @@ impl PyTriviumDB {
         slf: &Bound<'_, Self>,
         py: Python<'_>,
         generation_id: Bound<'_, PyAny>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let (_request, mut borrowed) = database_write(slf).map_err(write_admission_error)?;
         let this = &mut *borrowed;
         let generation_id: String =
@@ -178,7 +178,7 @@ impl PyTriviumDB {
     }
 
     /// 读取多个数据库共享的配额、工作线程和任务统计。
-    fn resource_stats(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<PyObject> {
+    fn resource_stats(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let (_request, borrowed) = database_read(slf)?;
         let this = &*borrowed;
         let stats = dispatch!(this, db => db.resource_stats());
@@ -187,7 +187,7 @@ impl PyTriviumDB {
         json_to_pyobject(py, &value)
     }
 
-    fn instance_stats(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<PyObject> {
+    fn instance_stats(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let (_request, borrowed) = database_read(slf)?;
         let this = &*borrowed;
         let stats = dispatch!(this, db => db.instance_stats());

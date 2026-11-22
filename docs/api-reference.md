@@ -901,12 +901,32 @@ results = db.search_batch(
 )
 ```
 
-Python 在整个 Rust 查询阶段释放 GIL，避免逐条 FFI 调用造成的吞吐损失。
+普通 CPython 3.9–3.15 可使用同一平台的 abi3 wheel。批量检索、批量写入的事务提交与 TQL 执行在 Rust 阶段释放 GIL。返回值和 Python 回调在解释器内构造或执行。
+
+`search_batch`、`batch_insert` 和 `batch_insert_with_ids` 接受二维 C 连续的 `memoryview`。缓冲使用本机字节序，元素格式与数据库的 f32、f16 或 u64 一致。NumPy 数组可直接传入 `memoryview(matrix)`。绑定在调用期间取得输入快照。
+
+```python
+from array import array
+
+matrix = memoryview(array("f", [1, 0, 0, 1])).cast("B").cast("f", (2, 2))
+db.batch_insert(matrix, [{"name": "a"}, {"name": "b"}])
+hits = db.search_batch(matrix, top_k=1, exact=True)
+```
 
 **Node.js：**
 ```javascript
 const results = await db.searchBatch(queryVectors, 10, 0, 0.0, true)
 ```
+
+Node.js 22、24 和 26 共用同一平台的 Node-API 8 原生模块。`searchBatch`、`batchInsert` 和 `batchInsertWithIds` 接受按数据库维数逐行排列的连续数组。浮点库使用 `Float32Array`，u64 库使用 `BigUint64Array`。视图可以带有起始偏移，底层存储使用普通 ArrayBuffer。提交查询时绑定复制输入，因此调用返回后即可复用原数组。
+
+```javascript
+const matrix = new Float32Array([1, 0, 0, 1])
+db.batchInsert(matrix, [{ name: 'a' }, { name: 'b' }])
+const hits = await db.searchBatch(matrix, 1, 0, 0, true)
+```
+
+> **精度提醒**　`BigUint64Array` 输入保留全部 64 位。`get().vector` 沿用 JavaScript `number[]` 表示，超过安全整数范围的分量可能舍入。
 
 Node.js 接口返回 Promise，检索工作在后台线程执行。参数依次为 `queryVectors`、`topK`、`parallelism`、`minScore`、`exact`。
 

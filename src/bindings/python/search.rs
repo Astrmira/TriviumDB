@@ -2,7 +2,7 @@
 
 use super::arguments::{
     boolean_argument, extract_argument, float_argument, integer_argument, read_double, read_float,
-    read_half, read_id, read_sequence, read_string, string_argument,
+    read_id, read_sequence, read_string, string_argument,
 };
 use super::database::{DbBackend, PyTriviumDB, database_read};
 use super::errors::to_py_error;
@@ -63,17 +63,17 @@ impl PyTriviumDB {
 
         let (results, hook_ctx) = match &this.inner {
             DbBackend::F32(db) => {
-                let vec: Vec<f32> = read_sequence(&query_vector, "query_vector", read_float)?;
-                py.allow_threads(|| db.search_hybrid_with_context(None, Some(&vec), &config))
+                let vec: Vec<f32> = super::vectors::vector(&query_vector, "query_vector", None)?;
+                py.detach(|| db.search_hybrid_with_context(None, Some(&vec), &config))
             }
             DbBackend::F16(db) => {
                 let vec16: Vec<half::f16> =
-                    read_sequence(&query_vector, "query_vector", read_half)?;
-                py.allow_threads(|| db.search_hybrid_with_context(None, Some(&vec16), &config))
+                    super::vectors::vector(&query_vector, "query_vector", None)?;
+                py.detach(|| db.search_hybrid_with_context(None, Some(&vec16), &config))
             }
             DbBackend::U64(db) => {
-                let vec: Vec<u64> = read_sequence(&query_vector, "query_vector", read_id)?;
-                py.allow_threads(|| db.search_hybrid_with_context(None, Some(&vec), &config))
+                let vec: Vec<u64> = super::vectors::vector(&query_vector, "query_vector", None)?;
+                py.detach(|| db.search_hybrid_with_context(None, Some(&vec), &config))
             }
         }
         .map_err(to_py_error)?;
@@ -168,17 +168,17 @@ impl PyTriviumDB {
 
         let results = match &this.inner {
             DbBackend::F32(db) => {
-                let vec: Vec<f32> = read_sequence(&query_vector, "query_vector", read_float)?;
-                py.allow_threads(|| db.search_hybrid(None, Some(&vec), &config))
+                let vec: Vec<f32> = super::vectors::vector(&query_vector, "query_vector", None)?;
+                py.detach(|| db.search_hybrid(None, Some(&vec), &config))
             }
             DbBackend::F16(db) => {
                 let vec16: Vec<half::f16> =
-                    read_sequence(&query_vector, "query_vector", read_half)?;
-                py.allow_threads(|| db.search_hybrid(None, Some(&vec16), &config))
+                    super::vectors::vector(&query_vector, "query_vector", None)?;
+                py.detach(|| db.search_hybrid(None, Some(&vec16), &config))
             }
             DbBackend::U64(db) => {
-                let vec: Vec<u64> = read_sequence(&query_vector, "query_vector", read_id)?;
-                py.allow_threads(|| db.search_hybrid(None, Some(&vec), &config))
+                let vec: Vec<u64> = super::vectors::vector(&query_vector, "query_vector", None)?;
+                py.detach(|| db.search_hybrid(None, Some(&vec), &config))
             }
         }
         .map_err(to_py_error)?;
@@ -241,17 +241,17 @@ impl PyTriviumDB {
         .with_exact(exact);
         let result = match &this.inner {
             DbBackend::F32(db) => {
-                let vector: Vec<f32> = read_sequence(&query_vector, "query_vector", read_float)?;
-                py.allow_threads(|| db.search_hybrid_grouped(None, Some(&vector), &config))
+                let vector: Vec<f32> = super::vectors::vector(&query_vector, "query_vector", None)?;
+                py.detach(|| db.search_hybrid_grouped(None, Some(&vector), &config))
             }
             DbBackend::F16(db) => {
                 let vector: Vec<half::f16> =
-                    read_sequence(&query_vector, "query_vector", read_half)?;
-                py.allow_threads(|| db.search_hybrid_grouped(None, Some(&vector), &config))
+                    super::vectors::vector(&query_vector, "query_vector", None)?;
+                py.detach(|| db.search_hybrid_grouped(None, Some(&vector), &config))
             }
             DbBackend::U64(db) => {
-                let vector: Vec<u64> = read_sequence(&query_vector, "query_vector", read_id)?;
-                py.allow_threads(|| db.search_hybrid_grouped(None, Some(&vector), &config))
+                let vector: Vec<u64> = super::vectors::vector(&query_vector, "query_vector", None)?;
+                py.detach(|| db.search_hybrid_grouped(None, Some(&vector), &config))
             }
         }
         .map_err(to_py_error)?;
@@ -312,25 +312,16 @@ impl PyTriviumDB {
         let batch_config = crate::database::BatchSearchConfig { parallelism };
         let results = match &this.inner {
             DbBackend::F32(db) => {
-                let queries: Vec<Vec<f32>> =
-                    read_sequence(&query_vectors, "query_vectors", |value, field| {
-                        read_sequence(value, field, read_float)
-                    })?;
-                py.allow_threads(|| db.search_batch(&queries, &config, &batch_config))
+                let queries: Vec<Vec<f32>> = super::vectors::queries(&query_vectors)?;
+                py.detach(|| db.search_batch(&queries, &config, &batch_config))
             }
             DbBackend::F16(db) => {
-                let queries: Vec<Vec<half::f16>> =
-                    read_sequence(&query_vectors, "query_vectors", |value, field| {
-                        read_sequence(value, field, read_half)
-                    })?;
-                py.allow_threads(|| db.search_batch(&queries, &config, &batch_config))
+                let queries: Vec<Vec<half::f16>> = super::vectors::queries(&query_vectors)?;
+                py.detach(|| db.search_batch(&queries, &config, &batch_config))
             }
             DbBackend::U64(db) => {
-                let queries: Vec<Vec<u64>> =
-                    read_sequence(&query_vectors, "query_vectors", |value, field| {
-                        read_sequence(value, field, read_id)
-                    })?;
-                py.allow_threads(|| db.search_batch(&queries, &config, &batch_config))
+                let queries: Vec<Vec<u64>> = super::vectors::queries(&query_vectors)?;
+                py.detach(|| db.search_batch(&queries, &config, &batch_config))
             }
         }
         .map_err(to_py_error)?;
@@ -492,17 +483,17 @@ impl PyTriviumDB {
 
         let results = match &this.inner {
             DbBackend::F32(db) => {
-                let vec: Vec<f32> = read_sequence(&query_vector, "query_vector", read_float)?;
-                py.allow_threads(|| db.search_hybrid(q_text, Some(&vec), &config))
+                let vec: Vec<f32> = super::vectors::vector(&query_vector, "query_vector", None)?;
+                py.detach(|| db.search_hybrid(q_text, Some(&vec), &config))
             }
             DbBackend::F16(db) => {
                 let vec16: Vec<half::f16> =
-                    read_sequence(&query_vector, "query_vector", read_half)?;
-                py.allow_threads(|| db.search_hybrid(q_text, Some(&vec16), &config))
+                    super::vectors::vector(&query_vector, "query_vector", None)?;
+                py.detach(|| db.search_hybrid(q_text, Some(&vec16), &config))
             }
             DbBackend::U64(db) => {
-                let vec: Vec<u64> = read_sequence(&query_vector, "query_vector", read_id)?;
-                py.allow_threads(|| db.search_hybrid(q_text, Some(&vec), &config))
+                let vec: Vec<u64> = super::vectors::vector(&query_vector, "query_vector", None)?;
+                py.detach(|| db.search_hybrid(q_text, Some(&vec), &config))
             }
         }
         .map_err(to_py_error)?;
@@ -556,23 +547,17 @@ impl PyTriviumDB {
         let query_text = query_text.to_owned();
         let results = match &this.inner {
             DbBackend::F32(db) => {
-                let vec: Vec<f32> = read_sequence(&query_vector, "query_vector", read_float)?;
-                py.allow_threads(|| {
-                    db.search_hybrid_weighted(&query_text, &vec, &config, hybrid_alpha)
-                })
+                let vec: Vec<f32> = super::vectors::vector(&query_vector, "query_vector", None)?;
+                py.detach(|| db.search_hybrid_weighted(&query_text, &vec, &config, hybrid_alpha))
             }
             DbBackend::F16(db) => {
                 let vec16: Vec<half::f16> =
-                    read_sequence(&query_vector, "query_vector", read_half)?;
-                py.allow_threads(|| {
-                    db.search_hybrid_weighted(&query_text, &vec16, &config, hybrid_alpha)
-                })
+                    super::vectors::vector(&query_vector, "query_vector", None)?;
+                py.detach(|| db.search_hybrid_weighted(&query_text, &vec16, &config, hybrid_alpha))
             }
             DbBackend::U64(db) => {
-                let vec: Vec<u64> = read_sequence(&query_vector, "query_vector", read_id)?;
-                py.allow_threads(|| {
-                    db.search_hybrid_weighted(&query_text, &vec, &config, hybrid_alpha)
-                })
+                let vec: Vec<u64> = super::vectors::vector(&query_vector, "query_vector", None)?;
+                py.detach(|| db.search_hybrid_weighted(&query_text, &vec, &config, hybrid_alpha))
             }
         }
         .map_err(to_py_error)?;
@@ -606,16 +591,16 @@ impl PyTriviumDB {
             extract_argument(py, max_anchor_nodes.bind(py), "max_anchor_nodes", None)?;
         let hits = match &this.inner {
             DbBackend::F32(db) => {
-                let query: Vec<f32> = read_sequence(&query_vector, "query_vector", read_float)?;
+                let query: Vec<f32> = super::vectors::vector(&query_vector, "query_vector", None)?;
                 db.search_graph_first(&query, &anchor_ids, top_k, max_anchor_nodes)
             }
             DbBackend::F16(db) => {
                 let query: Vec<half::f16> =
-                    read_sequence(&query_vector, "query_vector", read_half)?;
+                    super::vectors::vector(&query_vector, "query_vector", None)?;
                 db.search_graph_first(&query, &anchor_ids, top_k, max_anchor_nodes)
             }
             DbBackend::U64(db) => {
-                let query: Vec<u64> = read_sequence(&query_vector, "query_vector", read_id)?;
+                let query: Vec<u64> = super::vectors::vector(&query_vector, "query_vector", None)?;
                 db.search_graph_first(&query, &anchor_ids, top_k, max_anchor_nodes)
             }
         }
@@ -644,16 +629,16 @@ impl PyTriviumDB {
         let top_k = extract_argument(py, &top_k, "top_k", None)?;
         let hits = match &this.inner {
             DbBackend::F32(db) => {
-                let query: Vec<f32> = read_sequence(&query_vector, "query_vector", read_float)?;
+                let query: Vec<f32> = super::vectors::vector(&query_vector, "query_vector", None)?;
                 db.search_exact(&query, top_k)
             }
             DbBackend::F16(db) => {
                 let query: Vec<half::f16> =
-                    read_sequence(&query_vector, "query_vector", read_half)?;
+                    super::vectors::vector(&query_vector, "query_vector", None)?;
                 db.search_exact(&query, top_k)
             }
             DbBackend::U64(db) => {
-                let query: Vec<u64> = read_sequence(&query_vector, "query_vector", read_id)?;
+                let query: Vec<u64> = super::vectors::vector(&query_vector, "query_vector", None)?;
                 db.search_exact(&query, top_k)
             }
         }
