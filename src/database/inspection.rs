@@ -104,6 +104,8 @@ pub fn fingerprint<T: VectorType + serde::Serialize + serde::de::DeserializeOwne
     if let Some(pelorus) = &mt.pelorus {
         record(&mut hash, &pelorus.config.curvature)?;
         seal("pelorus_curvature", &mut hash);
+        record(&mut hash, &pelorus.config)?;
+        seal("pelorus_config", &mut hash);
     }
     record(&mut hash, &components)?;
     Ok(FactFingerprint {

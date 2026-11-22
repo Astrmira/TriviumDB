@@ -73,13 +73,11 @@ pub struct ParsedDocument {
 }
 impl ParsedDocument {
     pub fn validate(&self) -> Result<()> {
-        if self.source_id.is_empty() || self.source_revision.is_empty() || self.parser_id.is_empty()
-        {
-            return Err(invalid(
-                "parsed",
-                "解析来源身份不能为空 (Parsed source identities must be nonempty)",
-            ));
-        }
+        validate_source_fields([
+            ("parsed.source_id", &self.source_id),
+            ("parsed.source_revision", &self.source_revision),
+            ("parsed.parser_id", &self.parser_id),
+        ])?;
         budget("document_content_bytes", self.text.len(), 64 * 1024 * 1024)?;
         budget("document_blocks", self.blocks.len(), 100_000)?;
         if content_hash(&self.text) != self.content_hash
@@ -95,14 +93,24 @@ impl ParsedDocument {
     }
 }
 
+fn validate_source_fields<const N: usize>(fields: [(&str, &str); N]) -> Result<()> {
+    for (field, value) in fields {
+        if value.is_empty() {
+            return Err(invalid(
+                field,
+                "来源身份字段不能为空 (Source identity field must be nonempty)",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn parse(input: &DocumentParseInput) -> Result<ParsedDocument> {
     crate::request::check_current()?;
-    if input.source_id.is_empty() || input.source_revision.is_empty() {
-        return Err(invalid(
-            "source_id",
-            "来源身份与修订不能为空 (Source identity and revision must be nonempty)",
-        ));
-    }
+    validate_source_fields([
+        ("source_id", &input.source_id),
+        ("source_revision", &input.source_revision),
+    ])?;
     let config = &input.config;
     if !(4..=1024 * 1024).contains(&config.max_block_bytes) {
         return Err(invalid(
@@ -520,6 +528,7 @@ fn markdown(writer: &mut Writer<'_>) -> Result<()> {
         .peekable();
     let mut open = Vec::<(TagEnd, usize)>::new();
     let mut sections = Vec::<(u8, usize)>::new();
+    let mut inline_html = Vec::<(String, usize)>::new();
     let mut scopes = Vec::<(TagEnd, Option<&'static str>, bool)>::new();
     let mut suppressed = 0usize;
     let mut hidden_until = 0;
@@ -599,6 +608,12 @@ fn markdown(writer: &mut Writer<'_>) -> Result<()> {
                 if open.last().is_some_and(|(kind, _)| *kind == tag)
                     && let Some((_, index)) = open.pop()
                 {
+                    // 未闭合的行内 HTML 随所属 Markdown 块结束，子范围始终包含在父范围内。
+                    while inline_html.last().is_some_and(|(_, child)| *child > index) {
+                        if let Some((_, child)) = inline_html.pop() {
+                            writer.close(child);
+                        }
+                    }
                     writer.close(index);
                     writer.newline(range.end)?;
                 }
@@ -669,13 +684,23 @@ fn markdown(writer: &mut Writer<'_>) -> Result<()> {
                     .map(|(_, index)| *index)
                     .or_else(|| sections.last().map(|(_, index)| *index))
                     .map(|index| writer.blocks[index].key.clone());
-                html(writer, range, parent)?;
+                let raw = &writer.raw[range.clone()];
+                html_fragment(
+                    writer,
+                    raw,
+                    &[(0..raw.len(), range)],
+                    parent,
+                    &mut inline_html,
+                )?;
             }
             Event::TaskListMarker(value) => {
                 writer.append(if value { "[x] " } else { "[ ] " }, range)?
             }
             Event::FootnoteReference(text) => writer.append(&text, range)?,
         }
+    }
+    for (_, index) in inline_html.into_iter().rev() {
+        writer.close(index);
     }
     for (_, index) in open.into_iter().rev() {
         writer.close(index);
@@ -753,11 +778,25 @@ fn html_mapped(
     origins: &[(Range<usize>, Range<usize>)],
     base_parent: Option<String>,
 ) -> Result<Option<usize>> {
+    let mut open = Vec::new();
+    let skipped = html_fragment(writer, raw, origins, base_parent, &mut open)?;
+    for (_, index) in open.into_iter().rev() {
+        writer.close(index);
+    }
+    Ok(skipped)
+}
+
+fn html_fragment(
+    writer: &mut Writer<'_>,
+    raw: &str,
+    origins: &[(Range<usize>, Range<usize>)],
+    base_parent: Option<String>,
+    open: &mut Vec<(String, usize)>,
+) -> Result<Option<usize>> {
     use html5gum::{DefaultEmitter, Token, Tokenizer};
     let mut emitter = DefaultEmitter::<usize>::new_with_span();
     emitter.naively_switch_states(true);
     let parser = Tokenizer::new_with_emitter(raw, emitter);
-    let mut open = Vec::<(String, usize)>::new();
     let mut skipped = Vec::<(String, usize)>::new();
     for token in parser {
         crate::request::check_current()?;
@@ -893,9 +932,6 @@ fn html_mapped(
             }
             _ => {}
         }
-    }
-    for (_, index) in open.into_iter().rev() {
-        writer.close(index);
     }
     Ok(skipped.first().map(|(_, start)| *start))
 }

@@ -1,0 +1,13 @@
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: How can we help? / 有什么想问的？
+      description: English or Chinese is welcome. Tell us what you want to do and where you got stuck. / 用英文或中文说说你想做什么、卡在哪一步。
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Useful context (optional) / 补充信息（选填）
+      description: A version, snippet, or TQL query can help others answer. / 版本号、一小段代码或 TQL 有助于大家解答。

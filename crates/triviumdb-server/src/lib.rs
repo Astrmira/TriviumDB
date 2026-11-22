@@ -167,6 +167,15 @@ struct AppState {
     request_metrics: Arc<RequestMetrics>,
 }
 
+fn request_deadline(start: Instant, timeout: Duration) -> Result<Instant, ApiError> {
+    start.checked_add(timeout).ok_or_else(|| {
+        ApiError::invalid_request(
+            "请求超时超出时钟可表示范围 (Request timeout exceeds the representable clock range)",
+        )
+        .at_field("request_timeout")
+    })
+}
+
 pub async fn build_app(config: ServerConfig) -> Result<Router, ApiError> {
     build_app_with_shutdown(config)
         .await
@@ -195,6 +204,7 @@ pub async fn build_app_with_shutdown(
             "请求体上限和超时必须大于 0 (Request body limit and timeout must be greater than zero)",
         ));
     }
+    request_deadline(Instant::now(), config.request_timeout)?;
     let engine = EngineHandle::start(EngineConfig {
         database_path: config.database_path,
         database: config.database,
@@ -483,7 +493,7 @@ async fn list_indexes(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     Ok(Json(
-        serde_json::json!({ "indexes": state.engine.index_info(Instant::now() + state.request_timeout).await? }),
+        serde_json::json!({ "indexes": state.engine.index_info(request_deadline(Instant::now(), state.request_timeout)?).await? }),
     ))
 }
 
@@ -509,7 +519,11 @@ async fn manage_index(
     let Json(request) = decode_json(request)?;
     let version = state
         .engine
-        .manage_index(request, create, Instant::now() + state.request_timeout)
+        .manage_index(
+            request,
+            create,
+            request_deadline(Instant::now(), state.request_timeout)?,
+        )
         .await?;
     Ok(Json(serde_json::json!({
         "status": if create { "created" } else { "deleted" },
@@ -527,7 +541,7 @@ async fn build_quiver(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let published = state
         .engine
-        .build_quiver(Instant::now() + state.request_timeout)
+        .build_quiver(request_deadline(Instant::now(), state.request_timeout)?)
         .await?;
     Ok(Json(serde_json::json!({ "published": published })))
 }
@@ -539,7 +553,10 @@ async fn build_pelorus(
     let Json(config) = decode_json(request)?;
     let version = state
         .engine
-        .build_pelorus(config, Instant::now() + state.request_timeout)
+        .build_pelorus(
+            config,
+            request_deadline(Instant::now(), state.request_timeout)?,
+        )
         .await?;
     Ok(Json(serde_json::json!({
         "status": "published",
@@ -669,7 +686,10 @@ async fn prepare(
     }
     let (id, parameters) = state
         .engine
-        .prepare(request.query, Instant::now() + state.request_timeout)
+        .prepare(
+            request.query,
+            request_deadline(Instant::now(), state.request_timeout)?,
+        )
         .await?;
     Ok(Json(serde_json::json!({
         "preparedId": id,
@@ -690,7 +710,7 @@ async fn execute_prepared(
         .execute_prepared(
             &id,
             request.parameters.into_iter().collect(),
-            started + state.request_timeout,
+            request_deadline(started, state.request_timeout)?,
         )
         .await?;
     query_response(result, &headers, request.profile, true, started, None)
@@ -755,7 +775,7 @@ async fn search_vector(
         .search_vector(
             vector,
             search_config,
-            std::time::Instant::now() + state.request_timeout,
+            request_deadline(Instant::now(), state.request_timeout)?,
         )
         .await?;
     let etag = version.global_etag();
@@ -784,7 +804,7 @@ async fn tql(
             "query 不得为空 (query must not be empty)",
         ));
     }
-    let deadline = std::time::Instant::now() + state.request_timeout;
+    let deadline = request_deadline(Instant::now(), state.request_timeout)?;
     // mutation 标志是「允许写入」，不是「强制走写路径」：读语句即使带了 mutation=true
     // 也必须走读查询。否则 tql_mut(read query) 会以 500「API 已移除」返回，
     // 而 UI 的写入模式复选框是粘性的，用户写过一次 CREATE 后所有查询都会 500。
@@ -1073,7 +1093,7 @@ async fn get_node(
 ) -> Result<impl IntoResponse, ApiError> {
     let result = state
         .engine
-        .get_node(id, std::time::Instant::now() + state.request_timeout)
+        .get_node(id, request_deadline(Instant::now(), state.request_timeout)?)
         .await?;
     let node_etag = result.version.node_etag(id, result.node_version);
     let edge_versions = result
@@ -1148,7 +1168,11 @@ async fn get_neighbors(
     let config = graph_config(query.depth, query.limit, query.labels, query.direction)?;
     let (mut result, version) = state
         .engine
-        .query_subgraph(id, config, Instant::now() + state.request_timeout)
+        .query_subgraph(
+            id,
+            config,
+            request_deadline(Instant::now(), state.request_timeout)?,
+        )
         .await?;
     if let Some(types) = query.types {
         let types = types
@@ -1204,7 +1228,7 @@ async fn get_edges(
             query.label,
             query.offset,
             query.limit,
-            Instant::now() + state.request_timeout,
+            request_deadline(Instant::now(), state.request_timeout)?,
         )
         .await?;
     let edges = edges.into_iter().map(encode_graph_edge).collect::<Vec<_>>();
@@ -1231,7 +1255,10 @@ async fn batch_get_nodes(
     let requested = request.ids.clone();
     let (nodes, version) = state
         .engine
-        .batch_get_nodes(request.ids, Instant::now() + state.request_timeout)
+        .batch_get_nodes(
+            request.ids,
+            request_deadline(Instant::now(), state.request_timeout)?,
+        )
         .await?;
     let found = nodes
         .iter()
@@ -1268,7 +1295,11 @@ async fn get_paths(
     };
     let (result, version) = state
         .engine
-        .reachable(from, config, Instant::now() + state.request_timeout)
+        .reachable(
+            from,
+            config,
+            request_deadline(Instant::now(), state.request_timeout)?,
+        )
         .await?;
     let paths = result
         .results
@@ -1313,7 +1344,10 @@ async fn indexed_lookup(
     let Json(request) = decode_json(request)?;
     let ids = state
         .engine
-        .indexed_lookup(request, Instant::now() + state.request_timeout)
+        .indexed_lookup(
+            request,
+            request_deadline(Instant::now(), state.request_timeout)?,
+        )
         .await?;
     Ok(Json(serde_json::json!({ "ids": ids, "count": ids.len() })))
 }
@@ -1325,7 +1359,10 @@ async fn substring_lookup(
     let Json(request) = decode_json(request)?;
     let ids = state
         .engine
-        .substring_lookup(request, Instant::now() + state.request_timeout)
+        .substring_lookup(
+            request,
+            request_deadline(Instant::now(), state.request_timeout)?,
+        )
         .await?;
     Ok(Json(serde_json::json!({ "ids": ids, "count": ids.len() })))
 }
@@ -1338,7 +1375,11 @@ async fn compare_and_set_payload_field(
     let Json(request) = decode_json(request)?;
     let result = state
         .engine
-        .conditional_mutation(id, request, Instant::now() + state.request_timeout)
+        .conditional_mutation(
+            id,
+            request,
+            request_deadline(Instant::now(), state.request_timeout)?,
+        )
         .await?;
     let etag = result.version.global_etag();
     let mut response = Json(serde_json::json!({
@@ -1357,7 +1398,10 @@ async fn delete_many(
     let Json(request) = decode_json(request)?;
     let result = state
         .engine
-        .delete_many(request, Instant::now() + state.request_timeout)
+        .delete_many(
+            request,
+            request_deadline(Instant::now(), state.request_timeout)?,
+        )
         .await?;
     let etag = result.version.global_etag();
     let mut response = Json(serde_json::json!({
@@ -1403,7 +1447,7 @@ async fn submit_transaction(
         .transaction(
             request,
             optional_header_name(headers, "idempotency-key")?,
-            std::time::Instant::now() + state.request_timeout,
+            request_deadline(Instant::now(), state.request_timeout)?,
         )
         .await?;
     let etag = result.version.global_etag();

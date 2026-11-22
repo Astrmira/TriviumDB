@@ -1,0 +1,22 @@
+name: Feature request / 功能请求
+description: Tell us what you want to achieve and what would help. / 告诉我们你的使用场景和期待的能力。
+body:
+  - type: markdown
+    attributes:
+      value: |
+        English or Chinese is welcome. Still exploring? Join [Ideas](https://github.com/Astrmira/TriviumDB/discussions/categories/ideas).
+        用英文或中文填写即可。想法还在酝酿中？欢迎去 [Ideas 讨论](https://github.com/Astrmira/TriviumDB/discussions/categories/ideas)。
+  - type: textarea
+    id: use-case
+    attributes:
+      label: What are you trying to do? / 你想完成什么？
+      description: A concrete use case helps us understand the need. / 说说你在哪一步遇到了限制。
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: What would success look like? / 希望得到什么结果？
+      description: An example input and expected output are welcome. / 可以用一组输入与预期输出来说明。
+    validations:
+      required: true

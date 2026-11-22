@@ -15,6 +15,7 @@ hits: list[SearchHit] = db.search_advanced(
 )
 exact_hits: list[SearchHit] = db.search([1.0, 0.0], exact=True)
 exact_batch: list[list[SearchHit]] = db.search_batch([[1.0, 0.0]], exact=True)
+packed_hits: list[list[SearchHit]] = db.search_batch(memoryview(bytes(8)).cast("f", (1, 2)))
 transaction: Transaction = db.transaction()
 transaction.rollback()
 state: dict[str, Any] = db.shutdown_status()

@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Ask a question / 使用答疑
+    url: https://github.com/Astrmira/TriviumDB/discussions/categories/q-a
+    about: Need a hand with installation, an SDK, or TQL? Ask here. / 安装、SDK 或 TQL 遇到疑问？欢迎来问。
+  - name: Explore an idea / 讨论想法
+    url: https://github.com/Astrmira/TriviumDB/discussions/categories/ideas
+    about: Talk through a use case or design with the community. / 一起来聊使用场景或设计取舍。
+  - name: Share a project / 分享作品
+    url: https://github.com/Astrmira/TriviumDB/discussions/categories/show-and-tell
+    about: Show us what you built or measured with TriviumDB. / 欢迎分享用 TriviumDB 做的项目或实验。

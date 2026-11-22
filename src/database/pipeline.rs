@@ -49,7 +49,7 @@ fn call_hook<T: VectorType, R>(
     Ok(call())
 }
 
-pub(super) fn validate_config(config: &SearchConfig, dim: usize) -> Result<()> {
+pub(super) fn validate_config<T: VectorType>(config: &SearchConfig, dim: usize) -> Result<()> {
     for (name, value) in [
         ("min_score", config.min_score),
         ("fista_lambda", config.fista_lambda),
@@ -57,8 +57,6 @@ pub(super) fn validate_config(config: &SearchConfig, dim: usize) -> Result<()> {
         ("dpp_quality_weight", config.dpp_quality_weight),
         ("fista_threshold", config.fista_threshold),
         ("text_boost", config.text_boost),
-        ("bm25_k1", config.bm25_k1),
-        ("bm25_b", config.bm25_b),
         ("min_edge_weight", config.min_edge_weight),
     ] {
         if !value.is_finite() {
@@ -69,6 +67,13 @@ pub(super) fn validate_config(config: &SearchConfig, dim: usize) -> Result<()> {
         }
     }
 
+    if crate::vector::is_binary_vector::<T>()
+        && config.enable_advanced_pipeline
+        && (config.enable_sparse_residual || config.enable_dpp)
+    {
+        return Err(crate::TriviumError::InvalidInput("u64 支持汉明检索与图扩散，浮点认知重排配置不适用于二进制指纹 (u64 supports Hamming retrieval and graph expansion; floating-point cognitive reranking is unavailable for binary fingerprints)".into()));
+    }
+    crate::index::text::validate_bm25(config.bm25_k1, config.bm25_b)?;
     if let Some(bias) = config.diffusion_bias.as_deref() {
         if bias.len() != dim {
             return Err(crate::error::TriviumError::DimensionMismatch {
@@ -96,8 +101,8 @@ pub(super) fn validate_config(config: &SearchConfig, dim: usize) -> Result<()> {
     Ok(())
 }
 
-fn sanitize_config(config: &mut SearchConfig, dim: usize) -> Result<()> {
-    validate_config(config, dim)?;
+fn sanitize_config<T: VectorType>(config: &mut SearchConfig, dim: usize) -> Result<()> {
+    validate_config::<T>(config, dim)?;
     config.top_k = config.top_k.max(1);
     config.recall_k = if config.recall_k == 0 {
         config.top_k.saturating_mul(8).max(64)
@@ -163,9 +168,11 @@ pub(crate) fn execute_pipeline_with_limit<T: VectorType>(
     crate::test_hooks::hit(crate::test_hooks::ConcurrencyPoint::BeforeSearchReadLock);
     let runtime = read_or_recover(memtable).resource_runtime().clone();
     let quiver_config = crate::index::quiver::QuIVerConfig::default();
+    let mut safe_cfg = config.clone();
     let (auto_build_snapshot, _build_workspace) = {
         let mt = read_or_recover(memtable);
         mt.ensure_readable()?;
+        sanitize_config::<T>(&mut safe_cfg, mt.dim())?;
         if let Some(query) = query_vector {
             crate::vector::validate_query_vector(query, mt.dim())?;
         }
@@ -175,18 +182,10 @@ pub(crate) fn execute_pipeline_with_limit<T: VectorType>(
             && !config.force_brute_force
             && mt.auto_quiver_build_needed()
         {
-            let projected = mt
-                .estimated_memory_bytes()
-                .saturating_add(mt.quiver_build_peak_bytes(&quiver_config));
-            if memory_limit > 0 && projected > memory_limit {
-                return Err(crate::error::TriviumError::InvalidInput(format!(
-                    "QuIVer 自动构建预计峰值 {}MB 超过内存上限 {}MB",
-                    projected / (1024 * 1024),
-                    memory_limit / (1024 * 1024)
-                )));
-            }
-            let workspace =
-                runtime.reserve_workspace(mt.quiver_build_peak_bytes(&quiver_config))?;
+            let workspace = mt.reserve_request_workspace(
+                memory_limit,
+                mt.quiver_build_peak_bytes(&quiver_config),
+            )?;
             (mt.quiver_build_snapshot(), Some(workspace))
         } else {
             (None, None)
@@ -215,10 +214,6 @@ pub(crate) fn execute_pipeline_with_limit<T: VectorType>(
     // ═══════════════════════════════════════════════════════
     let dim = mt.dim();
 
-    // 隔离作用域：强行钳平越界的玄学配置参数，防止底层矩阵求解 Panic 或死循环
-    let mut safe_cfg = config.clone();
-    sanitize_config(&mut safe_cfg, dim)?;
-
     // ═══════════════════════════════════════════════════════
     // 🔌 Hook #1: on_pre_search — 查询预处理
     // ═══════════════════════════════════════════════════════
@@ -242,7 +237,7 @@ pub(crate) fn execute_pipeline_with_limit<T: VectorType>(
         return Ok(PipelineOutput::empty());
     }
 
-    sanitize_config(&mut safe_cfg, dim)?;
+    sanitize_config::<T>(&mut safe_cfg, dim)?;
     let candidate_bytes = mt
         .internal_slot_count()
         .checked_mul(std::mem::size_of::<SearchHit>() + 32)
@@ -277,12 +272,6 @@ pub(crate) fn execute_pipeline_with_limit<T: VectorType>(
 
     let query_vector = query_vector.filter(|_| alpha != Some(0.0));
     let config = &safe_cfg;
-    if crate::vector::is_binary_vector::<T>()
-        && config.enable_advanced_pipeline
-        && (config.enable_sparse_residual || config.enable_dpp)
-    {
-        return Err(crate::TriviumError::InvalidInput("u64 支持汉明检索与图扩散，浮点认知重排配置不适用于二进制指纹 (u64 supports Hamming retrieval and graph expansion; floating-point cognitive reranking is unavailable for binary fingerprints)".into()));
-    }
     ctx.record_observation("estimated_heap_bytes", mt.estimated_memory_bytes() as u64);
     ctx.record_observation("mmap_vector_bytes", mt.mmap_vector_bytes() as u64);
     ctx.record_observation("node_count", mt.node_count() as u64);
@@ -1062,7 +1051,7 @@ mod tests {
             rerank_k: 0,
             ..Default::default()
         };
-        sanitize_config(&mut config, 128).unwrap();
+        sanitize_config::<f32>(&mut config, 128).unwrap();
         assert_eq!(config.recall_k, 80);
         assert_eq!(config.rerank_k, 40);
     }

@@ -23,6 +23,7 @@ from transaction_admission import run_transaction_admission_contract
 from console_contracts import run_console_contract
 from kernel_boundaries import run_kernel_boundaries
 from request_contexts import run_request_contexts
+from vector_buffers import run_vector_buffers
 
 
 def run_transaction_contract(root: str) -> None:
@@ -413,6 +414,7 @@ def main() -> None:
         run_transaction_admission_contract(root)
         run_console_contract(root)
         run_request_contexts(root)
+        run_vector_buffers(root)
         run_kernel_boundaries(root)
         run_transaction_contract(root)
         run_write_boundaries(root)

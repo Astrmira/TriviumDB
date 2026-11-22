@@ -183,13 +183,24 @@ fn 恢复插入拒绝重复ID且起始分配跳过零() {
 }
 
 #[test]
-fn raw_insert_跳过NaN检查() {
+fn 恢复插入拒绝非有限向量并保留槽位和ID() {
     let mut mt = make_mt();
-    // raw_insert 用于 WAL 恢复，不检查 NaN
-    let result = mt.raw_insert(1, &[f32::NAN, 0.0, 0.0], json!({"raw": true}));
-    assert!(result.is_ok(), "raw_insert 应允许 WAL 恢复路径写入 NaN");
-    assert_eq!(mt.node_count(), 1, "raw_insert 成功后必须产生一个节点");
-    assert_eq!(mt.get_payload(1).unwrap().get("raw"), Some(&json!(true)));
+    for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        assert!(matches!(
+            mt.raw_insert(1, &[0.0, value, 0.0], json!({"raw": true})),
+            Err(triviumdb::TriviumError::InvalidVector { .. })
+        ));
+        assert!(!mt.contains(1));
+        assert_eq!(mt.internal_slot_count(), 0);
+        assert_eq!(mt.next_id_value(), 1);
+    }
+    let id = mt.insert(&[0.0, 1.0, 0.0], json!({"valid": true})).unwrap();
+    assert_eq!(id, 1);
+    assert_eq!(mt.get_vector(id).unwrap(), [0.0, 1.0, 0.0]);
+    assert_eq!(
+        mt.get_payload(id).unwrap().as_ref(),
+        &json!({"valid": true})
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════

@@ -631,14 +631,7 @@ pub struct MemTable<T: VectorType> {
 }
 
 impl<T: VectorType> MemTable<T> {
-    /// 内部辅助：校验向量中是否包含 NaN 或 Infinity
-    ///
-    /// **为什么在写入时检查而不是查询时？**
-    /// NaN 进入 mmap 基础层后会永久残留。在 BruteForce 并行昦描时，
-    /// `score >= min_score`（NaN 比较永远为 false）会静默将该节点永久消失于检索结果，
-    /// 且权会无任何错误提示。一旦进入就难以排查。
-    ///
-    /// `raw_insert` 是内部恢复路径（WAL 回放 / 文件重建），剛意不加此检查。
+    /// 写入与恢复插入共用有限值检查，防止 NaN 或无穷大进入向量池并影响评分。
     #[inline]
     fn validate_vector(vector: &[T]) -> Result<()> {
         for elem in vector {
@@ -1008,25 +1001,32 @@ impl<T: VectorType> MemTable<T> {
         vector: &[T],
         payload: serde_json::Value,
     ) -> Result<()> {
-        if id == 0 || id == NodeId::MAX {
-            return Err(TriviumError::InvalidInput(
-                "节点 ID 0 与 u64::MAX 为保留值 (Node IDs 0 and u64::MAX are reserved)".into(),
-            ));
-        }
-        if self.ids_to_indices.contains_key(&id) {
-            return Err(TriviumError::NodeAlreadyExists(id));
-        }
-        if vector.len() != self.dim {
-            return Err(TriviumError::DimensionMismatch {
-                expected: self.dim,
-                got: vector.len(),
-            });
-        }
+        self.insert_node_facts(id, vector, payload)?;
+        self.mark_vector_changed(id);
+        Ok(())
+    }
 
+    fn prepare_node_payload(&self, id: NodeId, payload: &serde_json::Value) -> Result<Box<[u8]>> {
+        let raw = super::payload_store::PayloadStore::encode_value(payload)?;
+        if !self.unique_updates_paused() && !self.property_indexes.is_empty() {
+            self.validate_unique_changes([(id, Some(payload))])?;
+        }
+        Ok(raw)
+    }
+
+    fn insert_node_facts(
+        &mut self,
+        id: NodeId,
+        vector: &[T],
+        payload: serde_json::Value,
+    ) -> Result<usize> {
+        self.validate_insert_with_id(id, vector)?;
+        let raw = self.prepare_node_payload(id, &payload)?;
         // 优先从空闲槽复活
         let sig = calculate_json_signature(&payload);
-        let idx = if let Some(free_idx) = self.free_slots.pop() {
+        let idx = if let Some(&free_idx) = self.free_slots.last() {
             self.vec_pool.update(free_idx, vector)?;
+            self.free_slots.pop();
             self.indices_to_ids[free_idx] = id;
             self.fast_tags[free_idx] = sig;
             free_idx
@@ -1038,7 +1038,7 @@ impl<T: VectorType> MemTable<T> {
             i
         };
         self.add_to_property_index(id, &payload);
-        self.payloads.insert_value(id, payload)?;
+        self.payloads.install_value(id, payload, raw);
         self.active_ids.insert(id);
         self.ids_to_indices.insert(id, idx);
         self.mark_property_changed();
@@ -1047,8 +1047,7 @@ impl<T: VectorType> MemTable<T> {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .node_added(id);
         self.mark_graph_changed();
-        self.mark_vector_changed(id);
-        Ok(())
+        Ok(idx)
     }
 
     pub fn register_node(&mut self, id: NodeId, payload: serde_json::Value) -> Result<()> {
@@ -1116,63 +1115,8 @@ impl<T: VectorType> MemTable<T> {
 
     /// 插入具有原生三维度属性的节点，保证原子性。
     pub fn insert(&mut self, vector: &[T], payload: serde_json::Value) -> Result<NodeId> {
-        self.validate_insert(vector)?;
-        crate::storage::payload_store::json_encoded_len(&payload)?;
-
         let id = self.next_id;
-        let next_id = id
-            .checked_add(1)
-            .ok_or_else(|| TriviumError::InvalidInput("节点 ID 空间已耗尽".into()))?;
-
-        // 1. 记录向量（优先尝试从空闲槽复活，否则推入尾部增量层）
-        let sig = calculate_json_signature(&payload);
-        let idx = if let Some(free_idx) = self.free_slots.pop() {
-            self.vec_pool.update(free_idx, vector)?; // 原地重生
-            self.indices_to_ids[free_idx] = id;
-            self.fast_tags[free_idx] = sig;
-            free_idx
-        } else {
-            let i = self.indices_to_ids.len();
-            self.vec_pool.push(vector)?; // 追尾拓展
-            self.indices_to_ids.push(id);
-            self.fast_tags.push(sig);
-            i
-        };
-
-        // 2. 更新文档型负载
-        self.add_to_property_index(id, &payload);
-        self.payloads.insert_value(id, payload)?;
-        self.active_ids.insert(id);
-
-        // 3. 构建反向映射
-        self.ids_to_indices.insert(id, idx);
-        self.mark_property_changed();
-        self.graph_stats_state
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .node_added(id);
-        self.mark_graph_changed();
-
-        // 4. 属性索引已在 Payload 转入冷存储前维护
-
-        // 5. 增量更新 QuIVer 索引（如果已构建且未暂停同步）
-        if !self.quiver_sync_paused
-            && let Some(ref mut quiver) = self.quiver_index
-        {
-            let vec_f32: Vec<f32> = vector.iter().map(|v| v.to_f32()).collect();
-            let mut lcg = id.wrapping_mul(0x9E3779B97F4A7C15);
-            quiver.insert(&vec_f32, id, idx, &mut lcg);
-            quiver.dirty_count_inc(); // 追加也算增量变更
-            if quiver.needs_rebuild() {
-                self.quiver_index = None;
-                tracing::debug!(
-                    "QuIVer 索引增量变更超过 25%，已丢弃，下次搜索前将自动重建 (QuIVer index exceeded 25% dirty changes and was discarded; it will rebuild before the next search)"
-                );
-            }
-        }
-
-        self.mark_vector_changed(id);
-        self.next_id = next_id;
+        self.insert_with_id(id, vector, payload)?;
         Ok(id)
     }
 
@@ -1184,48 +1128,9 @@ impl<T: VectorType> MemTable<T> {
         vector: &[T],
         payload: serde_json::Value,
     ) -> Result<()> {
-        self.validate_insert_with_id(id, vector)?;
-        crate::storage::payload_store::json_encoded_len(&payload)?;
-        let advanced_next_id = if id >= self.next_id {
-            Some(
-                id.checked_add(1)
-                    .ok_or_else(|| TriviumError::InvalidInput("节点 ID 空间已耗尽".into()))?,
-            )
-        } else {
-            None
-        };
-
-        // 优先从空闲槽复活
-        let sig = calculate_json_signature(&payload);
-        let idx = if let Some(free_idx) = self.free_slots.pop() {
-            self.vec_pool.update(free_idx, vector)?;
-            self.indices_to_ids[free_idx] = id;
-            self.fast_tags[free_idx] = sig;
-            free_idx
-        } else {
-            let i = self.indices_to_ids.len();
-            self.vec_pool.push(vector)?;
-            self.indices_to_ids.push(id);
-            self.fast_tags.push(sig);
-            i
-        };
-        self.add_to_property_index(id, &payload);
-        self.payloads.insert_value(id, payload)?;
-        self.active_ids.insert(id);
-        self.ids_to_indices.insert(id, idx);
-        self.mark_property_changed();
-        self.graph_stats_state
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .node_added(id);
-        self.mark_graph_changed();
-
-        // 属性索引已在 Payload 转入冷存储前维护
-
-        // 防御性推进分配器指针，避免后续普通 insert 撞车
-        if let Some(next_id) = advanced_next_id {
-            self.next_id = next_id;
-        }
+        let idx = self.insert_node_facts(id, vector, payload)?;
+        // 准入已拒绝 u64::MAX，显式 ID 与自动分配共用同一高水位。
+        self.next_id = self.next_id.max(id + 1);
 
         // 增量更新 QuIVer 索引（如果已构建且未暂停同步）
         if !self.quiver_sync_paused
@@ -3346,9 +3251,9 @@ impl<T: VectorType> MemTable<T> {
 
     /// 更新节点的元数据（Payload），不影响向量和图谱
     pub fn update_payload(&mut self, id: NodeId, payload: serde_json::Value) -> Result<()> {
-        crate::storage::payload_store::json_encoded_len(&payload)?;
-        match self.get_payload(id).map(|payload| (*payload).clone()) {
+        match self.try_get_payload(id)? {
             Some(old_payload) => {
+                let raw = self.prepare_node_payload(id, &payload)?;
                 let sig = calculate_json_signature(&payload);
                 if let Some(&idx) = self.ids_to_indices.get(&id) {
                     self.fast_tags[idx] = sig;
@@ -3356,7 +3261,7 @@ impl<T: VectorType> MemTable<T> {
                 // 属性索引同步更新
                 self.property_indexes.update(id, &old_payload, &payload);
                 self.mark_property_changed();
-                self.payloads.insert_value(id, payload)?;
+                self.payloads.install_value(id, payload, raw);
                 self.mark_changed(false);
                 Ok(())
             }

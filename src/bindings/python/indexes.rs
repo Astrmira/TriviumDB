@@ -154,7 +154,7 @@ impl PyTriviumDB {
         dispatch!(this, mut db => db.drop_bitmap_index(&field)).map_err(to_py_error)
     }
 
-    fn index_info(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<PyObject> {
+    fn index_info(slf: &Bound<'_, Self>, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let (_request, borrowed) = database_read(slf)?;
         let this = &*borrowed;
         let value =

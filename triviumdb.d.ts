@@ -12,6 +12,8 @@
 
 /** u64 分量要求有限非负整数且小于 2**64；number 按 binary64 精度表示。 */
 export type Vector = number[];
+/** 连续缓冲按数据库维度分行。浮点库使用 Float32Array，u64 库使用 BigUint64Array。 */
+export type VectorBatch = Vector[] | Float32Array | BigUint64Array;
 
 export type SyncMode = 'full' | 'normal' | 'off';
 
@@ -715,7 +717,7 @@ export class TriviumDB {
    * @param payloads payload 列表
    * @returns 分配的新 ID 列表
    */
-  batchInsert(vectors: Vector[], payloads: any[]): number[];
+  batchInsert(vectors: VectorBatch, payloads: any[]): number[];
 
   /**
    * 批量插入指定 ID 的节点
@@ -723,7 +725,7 @@ export class TriviumDB {
    * @param vectors  向量数组列表
    * @param payloads payload 列表
    */
-  batchInsertWithIds(ids: number[], vectors: Vector[], payloads: any[]): void;
+  batchInsertWithIds(ids: number[], vectors: VectorBatch, payloads: any[]): void;
 
   /**
    * 获取任意节点信息
@@ -862,7 +864,7 @@ export class TriviumDB {
   search(queryVector: Vector, topK?: number | null, expandDepth?: number | null, minScore?: number | null, payloadFilter?: Record<string, unknown> | null, exact?: boolean | null): JsSearchHit[];
 
   searchGrouped(queryVector: Vector, topK?: number | null, expandDepth?: number | null, minScore?: number | null, payloadFilter?: Record<string, unknown> | null, exact?: boolean | null): JsGroupedSearchResult;
-  searchBatch(queryVectors: Vector[], topK?: number | null, parallelism?: number | null, minScore?: number | null, exact?: boolean | null): Promise<JsSearchHit[][]>;
+  searchBatch(queryVectors: VectorBatch, topK?: number | null, parallelism?: number | null, minScore?: number | null, exact?: boolean | null): Promise<JsSearchHit[][]>;
 
   /**
    * 认知管线检索：向量锚定 + FISTA残差 + SA-PPR有限深度扩散 + DPP多样性采样

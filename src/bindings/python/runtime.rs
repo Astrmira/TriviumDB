@@ -61,7 +61,7 @@ impl PyResourceRuntime {
         })
     }
 
-    fn stats(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let value = serde_json::to_value(self.inner.stats())
             .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(error.to_string()))?;
         json_to_pyobject(py, &value)
@@ -87,7 +87,7 @@ pub(super) fn parse_python_runtime(
                 Some(write) => input.with_write_info(write),
                 None => input,
             };
-            attach_error_info(error, input)
+            attach_error_info(error.into(), input)
         })?;
     Ok(runtime.inner.clone())
 }

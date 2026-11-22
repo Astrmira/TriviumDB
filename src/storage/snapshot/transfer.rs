@@ -208,7 +208,7 @@ fn write_copied_manifest(directory: &Path, manifest: &GenerationManifest) -> Res
     file.write_all(&bytes)?;
     file.sync_all()?;
     drop(file);
-    robust_rename_and_sync(
+    crate::storage::fs::robust_rename_and_sync(
         &temporary,
         &directory.join(format!("{DATABASE_FILE}.manifest.json")),
     )?;

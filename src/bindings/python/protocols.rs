@@ -61,10 +61,8 @@ impl PyTriviumDB {
         let (_request, mut borrowed) = database_write(slf)?;
         let this = &mut *borrowed;
         let request_json = read_string(&request_json, "request_json")?;
-        py.allow_threads(
-            || dispatch!(this, mut db => crate::sdk::documents::request(db, &request_json)),
-        )
-        .map_err(to_py_error)
+        py.detach(|| dispatch!(this, mut db => crate::sdk::documents::request(db, &request_json)))
+            .map_err(to_py_error)
     }
 
     /// SSD运行时JSON适配复用Core的事实绑定、驻留、缓存与I/O生命周期。
@@ -76,7 +74,7 @@ impl PyTriviumDB {
         let (_request, borrowed) = database_read(slf)?;
         let this = &*borrowed;
         let request_json = read_string(&request_json, "request_json")?;
-        py.allow_threads(|| dispatch!(this, db => crate::sdk::quiver::request(db, &request_json)))
+        py.detach(|| dispatch!(this, db => crate::sdk::quiver::request(db, &request_json)))
             .map_err(to_py_error)
     }
 
@@ -89,7 +87,7 @@ impl PyTriviumDB {
         let (_request, borrowed) = database_read(slf)?;
         let this = &*borrowed;
         let request_json = read_string(&request_json, "request_json")?;
-        py.allow_threads(|| dispatch!(this, db => crate::sdk::pelorus::request(db, &request_json)))
+        py.detach(|| dispatch!(this, db => crate::sdk::pelorus::request(db, &request_json)))
             .map_err(to_py_error)
     }
 
@@ -102,7 +100,7 @@ impl PyTriviumDB {
         let (_request, mut borrowed) = database_write(slf)?;
         let this = &mut *borrowed;
         let request_json = read_string(&request_json, "request_json")?;
-        py.allow_threads(
+        py.detach(
             || dispatch!(this, mut db => crate::sdk::named_graphs::request(db, &request_json)),
         )
         .map_err(to_py_error)
@@ -119,10 +117,10 @@ impl PyTriviumDB {
         let this = &mut *borrowed;
         let session = session
             .extract::<PyRef<'_, PyConsoleSession>>()
-            .map_err(|error| argument_input_error(error, "session", None))?;
+            .map_err(|error| argument_input_error(error.into(), "session", None))?;
         let session = session.inner.clone();
         let request_json = read_string(&request_json, "request_json")?;
-        py.allow_threads(|| dispatch!(this, mut db => db.console_request(&session, &request_json)))
+        py.detach(|| dispatch!(this, mut db => db.console_request(&session, &request_json)))
             .map_err(to_py_error)
     }
 }

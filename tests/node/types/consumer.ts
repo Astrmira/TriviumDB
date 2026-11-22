@@ -30,6 +30,9 @@ export function inspectRequestContext(database: TriviumDB): void {
   const identity: string = context.requestId;
   const node: JsNodeView | null = context.run(() => database.get(7));
   const asynchronous: Promise<JsSearchHit[][]> = context.run(async () => database.searchBatch([[1, 0]]));
+  const packed: Promise<JsSearchHit[][]> = database.searchBatch(new Float32Array([1, 0]));
+  database.batchInsertWithIds([1], new BigUint64Array([1n, 0n]), [{}]);
+  void packed;
   context.cancel();
   // @ts-expect-error 请求 ID 使用字符串。
   new RequestContext(1);

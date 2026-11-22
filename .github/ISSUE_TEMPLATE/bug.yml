@@ -1,0 +1,33 @@
+name: Bug report / 报告问题
+description: Something behaved unexpectedly? Help us reproduce it. / 遇到了异常？一起把问题定位清楚。
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! English or Chinese is welcome. / 感谢反馈，用英文或中文填写一次即可。
+  - type: input
+    id: environment
+    attributes:
+      label: Version and environment / 版本与环境
+      placeholder: "TriviumDB 0.9.3 · Python 3.12 · Windows 11"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How can we reproduce it? / 怎样复现？
+      description: A short snippet, TQL query, or sequence of steps is ideal. / 一小段代码、TQL 或操作步骤都可以。
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Expected and actual result / 预期和实际结果
+      description: Please include the error code if you have one. / 如有错误码，也请附上。
+    validations:
+      required: true
+  - type: textarea
+    id: measurements
+    attributes:
+      label: Performance or recall details (optional) / 性能或召回细节（选填）
+      description: Dataset or model, size, dimensions, search settings, and comparison. / 可附数据集或模型、规模、维度、检索参数和对照结果。

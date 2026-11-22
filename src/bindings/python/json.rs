@@ -7,7 +7,7 @@ use pyo3::types::{PyDict, PyList};
 
 // ════════ 辅助转换 ════════
 
-pub(super) fn json_to_pyobject(py: Python<'_>, val: &serde_json::Value) -> PyResult<PyObject> {
+pub(super) fn json_to_pyobject(py: Python<'_>, val: &serde_json::Value) -> PyResult<Py<PyAny>> {
     use pyo3::IntoPyObjectExt;
     match val {
         serde_json::Value::Null => Ok(py.None()),
@@ -105,7 +105,7 @@ pub(super) fn pyobject_to_json_at(
                     "JSON 容器嵌套超过 127 层 (JSON container nesting exceeds 127 levels)",
                 ));
             }
-            if let Ok(dict) = obj.downcast::<PyDict>() {
+            if let Ok(dict) = obj.cast::<PyDict>() {
                 let mut map = serde_json::Map::new();
                 for (k, v) in dict.iter() {
                     if !k.is_instance_of::<PyString>() {
@@ -119,7 +119,7 @@ pub(super) fn pyobject_to_json_at(
                 }
                 return Ok(serde_json::Value::Object(map));
             }
-            let values = if let Ok(list) = obj.downcast::<PyList>() {
+            let values = if let Ok(list) = obj.cast::<PyList>() {
                 list.iter()
                     .enumerate()
                     .map(|(index, v)| {
@@ -128,7 +128,7 @@ pub(super) fn pyobject_to_json_at(
                         convert(&v, depth + 1, path.as_deref(), write)
                     })
                     .collect::<PyResult<Vec<_>>>()?
-            } else if let Ok(tuple) = obj.downcast::<PyTuple>() {
+            } else if let Ok(tuple) = obj.cast::<PyTuple>() {
                 tuple
                     .iter()
                     .enumerate()
@@ -161,7 +161,7 @@ pub(super) fn mapping_dictionary<'py>(
     write: Option<crate::error::WriteErrorInfo>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let py = value.py();
-    if let Ok(dictionary) = value.downcast::<PyDict>() {
+    if let Ok(dictionary) = value.cast::<PyDict>() {
         Ok(dictionary.clone())
     } else {
         let mapping = py.import("collections.abc")?.getattr("Mapping")?;
@@ -177,6 +177,6 @@ pub(super) fn mapping_dictionary<'py>(
         Ok(py
             .get_type::<PyDict>()
             .call1((value,))?
-            .downcast_into::<PyDict>()?)
+            .cast_into::<PyDict>()?)
     }
 }

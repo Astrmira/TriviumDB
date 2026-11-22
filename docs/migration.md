@@ -1,6 +1,6 @@
 # 外部迁移工具
 
-> 本文说明 `0.9.3` 的外部迁移流程。`scripts/migrate.py` 调用独立的 `triviumdb-migrate` 原生执行器，在副本中恢复旧数据，核对完整事实后发布新目录。版本变更见[发布说明](changes/0.9.3.md)。
+> 本文说明 `0.9.4-beta.1` 的外部迁移流程。`scripts/migrate.py` 调用独立的 `triviumdb-migrate` 原生执行器，在副本中恢复旧数据，核对完整事实后发布新目录。版本变更见[发布说明](changes/0.9.4-beta.1.md)。
 
 ---
 
@@ -72,7 +72,7 @@ python scripts/migrate.py --source /data/legacy.tdb --source-dtype f32 --destina
 
 目标是普通数据库文件组。来源快照 manifest 留在来源，目标需要作为 Immutable 代际分发时，再通过当前 SDK 发布新快照或代际。
 
-当前格式的来源副本由当前内核恢复。启用了 Pelorus 的库保留曲率、导航、构建和精排配置，目标索引用恢复后的向量重建，来源和重开后的目标均核对曲率摘要。
+当前格式的来源副本由当前内核恢复。启用了 Pelorus 的库保留曲率、导航、构建和精排配置，目标索引用恢复后的向量重建。迁移及重试时会比对来源和目标的完整 Pelorus 配置摘要。已发布目标的配置发生变化时，重试返回 `TDB_MIGRATION_CONFLICT`。
 
 | 限制 | 默认值与行为 |
 | --- | --- |

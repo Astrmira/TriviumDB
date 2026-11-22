@@ -1,0 +1,12 @@
+body:
+  - type: textarea
+    id: project
+    attributes:
+      label: What did you build or learn? / 做了什么，发现了什么？
+      description: English or Chinese is welcome. Tell us how you used TriviumDB. / 用英文或中文聊聊你是怎么用 TriviumDB 的。
+    validations:
+      required: true
+  - type: input
+    id: link
+    attributes:
+      label: Project or results link (optional) / 项目或结果链接（选填）

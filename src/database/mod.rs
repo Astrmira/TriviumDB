@@ -424,7 +424,7 @@ pub struct PreparedQuiverBuild<T: VectorType> {
     wal: Arc<Mutex<Wal>>,
     _build_guard: QuiverBuildGuard,
     _operation_guard: OperationGuard,
-    _workspace: crate::resources::WorkspaceReservation,
+    _workspace: crate::resources::RequestWorkspace,
     resource_runtime: crate::resources::ResourceRuntime,
     /// 必须晚于存储、操作与工作区析构，防止原 Database 丢弃后提前释放文件锁。
     _file_lock: Arc<Mutex<Option<std::fs::File>>>,
@@ -510,20 +510,10 @@ impl<T: VectorType> QuiverBuildHandle<T> {
                 if !mt.auto_quiver_build_needed() {
                     return Ok(None);
                 }
-                let projected = mt
-                    .estimated_memory_bytes()
-                    .saturating_add(mt.quiver_build_peak_bytes(&config));
-                let memory_limit = mt.reserved_database_bytes();
-                if memory_limit > 0 && projected > memory_limit {
-                    return Err(TriviumError::InvalidInput(format!(
-                        "QuIVer 自动构建预计峰值 {}MB 超过内存上限 {}MB",
-                        projected / (1024 * 1024),
-                        memory_limit / (1024 * 1024)
-                    )));
-                }
-                let workspace = self
-                    .resource_runtime
-                    .reserve_workspace(mt.quiver_build_peak_bytes(&config))?;
+                let workspace = mt.reserve_request_workspace(
+                    mt.reserved_database_bytes(),
+                    mt.quiver_build_peak_bytes(&config),
+                )?;
                 (mt.quiver_build_snapshot(), workspace)
             };
             let Some(snapshot) = snapshot else {
@@ -735,12 +725,23 @@ impl<T: VectorType> SearchHandle<T> {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn search_batch(
         &self,
         query_vectors: &[Vec<T>],
         search_config: &SearchConfig,
         batch_config: &BatchSearchConfig,
     ) -> Result<Vec<Vec<SearchHit>>> {
+        self.search_batch_with_workspace(query_vectors, search_config, batch_config)
+            .map(|(hits, _)| hits)
+    }
+
+    pub(crate) fn search_batch_with_workspace(
+        &self,
+        query_vectors: &[Vec<T>],
+        search_config: &SearchConfig,
+        batch_config: &BatchSearchConfig,
+    ) -> Result<(Vec<Vec<SearchHit>>, crate::resources::RequestWorkspace)> {
         let _operation = self.enter_operation()?;
         if search_config.enable_refractory_fatigue {
             return Err(TriviumError::InvalidInput(
@@ -758,25 +759,21 @@ impl<T: VectorType> SearchHandle<T> {
             ));
         }
         let dim = read_or_recover(&self.memtable).dim();
-        pipeline::validate_config(search_config, dim)?;
-        if query_vectors.is_empty() {
-            return Ok(Vec::new());
-        }
+        pipeline::validate_config::<T>(search_config, dim)?;
         for query in query_vectors {
-            if query.len() != dim {
-                return Err(TriviumError::DimensionMismatch {
-                    expected: dim,
-                    got: query.len(),
-                });
-            }
-            if query.iter().any(|value| !value.to_f32().is_finite()) {
-                return Err(TriviumError::InvalidVector {
-                    reason: "查询向量包含 NaN 或 Infinity (Query vector contains NaN or Infinity)"
-                        .into(),
-                });
-            }
+            crate::vector::validate_query_vector(query, dim)?;
         }
 
+        let response = read_or_recover(&self.memtable).reserve_request_workspace(
+            self.memory_limit,
+            query_vectors
+                .len()
+                .saturating_mul(size_of::<Vec<SearchHit>>()),
+        )?;
+        if query_vectors.is_empty() {
+            return Ok((Vec::new(), response));
+        }
+        let response = Mutex::new(response);
         if !search_config.force_brute_force {
             quiver_runtime::prepare_configured_rerank(
                 &self.memtable,
@@ -790,14 +787,14 @@ impl<T: VectorType> SearchHandle<T> {
         }
 
         let request = crate::request::current();
-        let search_one = |query: &Vec<T>| {
+        let search_one = |query: &Vec<T>| -> Result<Vec<SearchHit>> {
             let _context = request
                 .as_ref()
                 .map(crate::request::RequestContext::enter)
                 .transpose()?;
             crate::request::check_current()?;
             let mut ctx = HookContext::new();
-            pipeline::execute_pipeline_with_limit(
+            let hits = pipeline::execute_pipeline_with_limit(
                 &self.memtable,
                 &self.quiver_builds,
                 self.memory_limit,
@@ -807,13 +804,34 @@ impl<T: VectorType> SearchHandle<T> {
                 search_config,
                 &mut ctx,
                 None,
-            )
-            .map(|output| output.combined_hits)
+            )?
+            .combined_hits;
+            let bytes = hits.iter().fold(
+                hits.capacity().saturating_mul(size_of::<SearchHit>()),
+                |total, hit| {
+                    total.saturating_add(crate::storage::payload_store::query_clone_peak(
+                        &hit.payload,
+                    ))
+                },
+            );
+            let resident = if self.memory_limit == 0 {
+                0
+            } else {
+                read_or_recover(&self.memtable).resident_memory_bytes()
+            };
+            lock_or_recover(&response).grow_by(resident, self.memory_limit, bytes)?;
+            Ok(hits)
         };
-        let first = search_one(&query_vectors[0])?;
+        let mut results = Vec::with_capacity(query_vectors.len());
+        results.push(search_one(&query_vectors[0])?);
         if query_vectors.len() == 1 {
             _operation.check_recovery()?;
-            return Ok(vec![first]);
+            return Ok((
+                results,
+                response
+                    .into_inner()
+                    .unwrap_or_else(|error| error.into_inner()),
+            ));
         }
 
         let available = std::thread::available_parallelism()
@@ -830,20 +848,26 @@ impl<T: VectorType> SearchHandle<T> {
         let batch_task = self.resource_runtime.current_task();
         let remaining_count = query_vectors.len() - 1;
         let chunk_size = remaining_count.div_ceil(parallelism);
-        let chunks = pool.install(|| {
-            query_vectors[1..]
-                .par_chunks(chunk_size)
-                .map(|chunk| {
+        results.resize_with(query_vectors.len(), Vec::new);
+        pool.install(|| {
+            results[1..]
+                .par_chunks_mut(chunk_size)
+                .zip(query_vectors[1..].par_chunks(chunk_size))
+                .try_for_each(|(slots, queries)| -> Result<()> {
                     let _binding = self.resource_runtime.bind_task(batch_task);
-                    chunk.iter().map(search_one).collect::<Result<Vec<_>>>()
+                    for (slot, query) in slots.iter_mut().zip(queries) {
+                        *slot = search_one(query)?;
+                    }
+                    Ok(())
                 })
-                .collect::<Result<Vec<_>>>()
         })?;
-        let mut results = Vec::with_capacity(query_vectors.len());
-        results.push(first);
-        results.extend(chunks.into_iter().flatten());
         _operation.check_recovery()?;
-        Ok(results)
+        Ok((
+            results,
+            response
+                .into_inner()
+                .unwrap_or_else(|error| error.into_inner()),
+        ))
     }
 }
 
@@ -1079,6 +1103,8 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                 .is_some_and(crate::storage::wal::is_main_checkpoint);
             let mut entry_count = 0usize;
             let restored_bytes = std::cell::Cell::new(memtable.estimated_memory_bytes());
+            // 单条日志可能处于事务换键的中间态，唯一约束在完整回放后按最终事实重建。
+            memtable.set_unique_updates_paused(true);
             let valid_offset = Wal::replay_for_open::<T>(
                 path,
                 config.memory_limit,
@@ -1116,6 +1142,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
             memtable.document_publications.finish_replay();
             memtable.finish_text_replay(path)?;
             memtable.document_publications.finish_restore()?;
+            memtable.set_unique_updates_paused(false);
             let unique_definitions = memtable.unique_index_definitions();
             memtable.restore_unique_index_definitions(&unique_definitions)?;
 
@@ -1477,19 +1504,10 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                         mt.dim()
                     )));
                 }
-                let projected = mt
-                    .estimated_memory_bytes()
-                    .saturating_add(mt.quiver_build_peak_bytes(&cfg));
-                if self.memory_limit > 0 && projected > self.memory_limit {
-                    return Err(TriviumError::InvalidInput(format!(
-                        "QuIVer 构建预计峰值 {}MB 超过内存上限 {}MB",
-                        projected / (1024 * 1024),
-                        self.memory_limit / (1024 * 1024)
-                    )));
-                }
-                let workspace = self
-                    .resource_runtime
-                    .reserve_workspace(mt.quiver_build_peak_bytes(&cfg))?;
+                let workspace = mt.reserve_request_workspace(
+                    self.memory_limit,
+                    mt.quiver_build_peak_bytes(&cfg),
+                )?;
                 (workspace, mt.quiver_build_snapshot())
             };
             if let Some(snapshot) = snapshot {
@@ -1551,14 +1569,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                     let extra = mt
                         .quiver()
                         .map_or(0, |index| index.sm_install_peak_extra_bytes());
-                    if self.memory_limit > 0
-                        && mt.estimated_memory_bytes().saturating_add(extra) > self.memory_limit
-                    {
-                        return Err(TriviumError::InvalidInput(
-                            "QuIVer校正安装预计峰值超过内核内存预算".into(),
-                        ));
-                    }
-                    let _workspace = self.resource_runtime.reserve_workspace(extra)?;
+                    let _workspace = mt.reserve_request_workspace(self.memory_limit, extra)?;
                     mt.enable_quiver_corrected_sm(coefficients)
                         .map_err(|error| {
                             TriviumError::InvalidInput(format!("安装QuIVer校正失败：{error}"))
@@ -1594,14 +1605,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                             index.sm_install_peak_extra_bytes()
                         }
                     });
-                    if self.memory_limit > 0
-                        && mt.estimated_memory_bytes().saturating_add(extra) > self.memory_limit
-                    {
-                        return Err(TriviumError::InvalidInput(
-                            "QuIVer重建L2安装预计峰值超过内核内存预算".into(),
-                        ));
-                    }
-                    let _workspace = self.resource_runtime.reserve_workspace(extra)?;
+                    let _workspace = mt.reserve_request_workspace(self.memory_limit, extra)?;
                     mt.enable_quiver_sm_l2().map_err(|error| {
                         TriviumError::InvalidInput(format!("安装QuIVer重建L2失败：{error}"))
                     })
@@ -1631,14 +1635,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                     let extra = mt
                         .quiver()
                         .map_or(0, |index| index.sm_install_peak_extra_bytes());
-                    if self.memory_limit > 0
-                        && mt.estimated_memory_bytes().saturating_add(extra) > self.memory_limit
-                    {
-                        return Err(TriviumError::InvalidInput(
-                            "QuIVer原生欧氏安装预计峰值超过内核内存预算".into(),
-                        ));
-                    }
-                    let _workspace = self.resource_runtime.reserve_workspace(extra)?;
+                    let _workspace = mt.reserve_request_workspace(self.memory_limit, extra)?;
                     mt.enable_quiver_sm_native_l2().map_err(|error| {
                         TriviumError::InvalidInput(format!("安装QuIVer原生欧氏失败：{error}"))
                     })
@@ -2815,10 +2812,20 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         search_config: &SearchConfig,
         batch_config: &BatchSearchConfig,
     ) -> Result<Vec<Vec<SearchHit>>> {
+        self.search_batch_with_workspace(query_vectors, search_config, batch_config)
+            .map(|(hits, _)| hits)
+    }
+
+    pub(crate) fn search_batch_with_workspace(
+        &self,
+        query_vectors: &[Vec<T>],
+        search_config: &SearchConfig,
+        batch_config: &BatchSearchConfig,
+    ) -> Result<(Vec<Vec<SearchHit>>, crate::resources::RequestWorkspace)> {
         let _operation = self.enter_operation()?;
         self.require_reader_determinism(search_config)?;
         self.search_handle()
-            .search_batch(query_vectors, search_config, batch_config)
+            .search_batch_with_workspace(query_vectors, search_config, batch_config)
     }
 
     pub(crate) fn search_handle(&self) -> SearchHandle<T> {
@@ -2851,6 +2858,23 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         self.search_hybrid(None, Some(query_vector), config)
     }
 
+    fn prepare_hybrid_search(
+        &self,
+        config: &SearchConfig,
+        query: Option<&[T]>,
+        alpha: Option<f64>,
+    ) -> Result<()> {
+        let dim = read_or_recover(&self.memtable).dim();
+        pipeline::validate_config::<T>(config, dim)?;
+        if let Some(query) = query {
+            crate::vector::validate_query_vector(query, dim)?;
+            if alpha != Some(0.0) && !config.force_brute_force {
+                self.prepare_quiver_rerank(false)?;
+            }
+        }
+        Ok(())
+    }
+
     /// 带 Hook 上下文的混合检索（完整版）
     ///
     /// 与 `search_hybrid` 相同，但额外返回 `HookContext`，
@@ -2863,9 +2887,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
     ) -> Result<(Vec<SearchHit>, HookContext)> {
         self.require_reader_determinism(config)?;
         let _operation = self.enter_operation()?;
-        if query_vector.is_some() && !config.force_brute_force {
-            self.prepare_quiver_rerank(false)?;
-        }
+        self.prepare_hybrid_search(config, query_vector, None)?;
         #[cfg(feature = "test-hooks")]
         if config.enable_refractory_fatigue {
             crate::test_hooks::hit(crate::test_hooks::ConcurrencyPoint::BeforeStatefulSearchLock);
@@ -2933,9 +2955,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
     ) -> Result<Vec<SearchHit>> {
         self.require_reader_determinism(config)?;
         let _operation = self.enter_operation()?;
-        if alpha != Some(0.0) && query_vector.is_some() && !config.force_brute_force {
-            self.prepare_quiver_rerank(false)?;
-        }
+        self.prepare_hybrid_search(config, query_vector, alpha)?;
         #[cfg(feature = "test-hooks")]
         if config.enable_refractory_fatigue {
             crate::test_hooks::hit(crate::test_hooks::ConcurrencyPoint::BeforeStatefulSearchLock);
@@ -2970,9 +2990,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
     ) -> Result<crate::node::GroupedSearchResult> {
         self.require_reader_determinism(config)?;
         let _operation = self.enter_operation()?;
-        if query_vector.is_some() && !config.force_brute_force {
-            self.prepare_quiver_rerank(false)?;
-        }
+        self.prepare_hybrid_search(config, query_vector, None)?;
         let _stateful_guard = config
             .enable_refractory_fatigue
             .then(|| lock_or_recover(&self.stateful_search));

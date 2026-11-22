@@ -1,0 +1,53 @@
+name: PR description policy
+
+on:
+  pull_request:
+    branches: [dev, master]
+    types: [opened, reopened, edited, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: pr-description-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  description:
+    name: PR description
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check author access / 核对作者权限
+        id: author
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const username = context.payload.pull_request.user.login;
+            let permission;
+            try {
+              const response = await github.rest.repos.getCollaboratorPermissionLevel({owner, repo, username});
+              permission = response.data.permission;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              permission = 'none';
+            }
+            const exempt = ['write', 'maintain', 'admin'].includes(permission);
+            if (exempt) core.info('Template optional for this author. / 此作者有写权限，可免填模板。');
+            return exempt;
+      - name: Read the policy from the target branch / 从目标分支读取规则
+        if: steps.author.outputs.result != 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+          sparse-checkout: scripts/check_pr_description.cjs
+          sparse-checkout-cone-mode: false
+      - name: Check the current description / 检查当前 PR 说明
+        if: steps.author.outputs.result != 'true'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const check = require('./scripts/check_pr_description.cjs');
+            await check({github, context, core});

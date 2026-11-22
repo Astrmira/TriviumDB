@@ -241,3 +241,120 @@ fn 直接物理检索算子在空候选前拒绝非有限输入() {
         }
     }
 }
+
+#[test]
+fn 非法检索保留已发布的不可变代际() {
+    let root = TestDir::new("invalid_search_manifest");
+    let path = root.file("data.tdb");
+    let mut db = Database::<f32>::open(&path, 2).unwrap();
+    let count = triviumdb::storage::memtable::auto_quiver_node_threshold(2);
+    let mut tx = triviumdb::database::TxBuilder::new();
+    for id in 1..=count as u64 {
+        tx.insert_with_id(id, &[1., 0.], json!(id));
+    }
+    db.commit_tx(tx).unwrap();
+    db.publish_generation_manifest("before").unwrap();
+    let idx = std::fs::read(format!("{path}.idx")).unwrap();
+    for (field, config) in [
+        (
+            "min_edge_weight",
+            SearchConfig {
+                min_edge_weight: -1.,
+                ..Default::default()
+            },
+        ),
+        (
+            "bm25_k1",
+            SearchConfig {
+                bm25_k1: 0.,
+                ..Default::default()
+            },
+        ),
+        (
+            "bm25_b",
+            SearchConfig {
+                bm25_b: 1.1,
+                ..Default::default()
+            },
+        ),
+    ] {
+        let error = db
+            .search_hybrid(Some("term"), Some(&[1., 0.]), &config)
+            .unwrap_err();
+        assert_eq!(error.code(), "TDB_INVALID_INPUT");
+        assert_eq!(
+            serde_json::to_value(error.info().target).unwrap(),
+            json!({"field":field})
+        );
+    }
+    db.close().unwrap();
+    assert_eq!(std::fs::read(format!("{path}.idx")).unwrap(), idx);
+    let reader = Database::<f32>::open_immutable(&path, 2).unwrap();
+    assert_eq!(reader.node_count().unwrap(), count);
+    assert_eq!(
+        reader.get_payload(count as u64).unwrap(),
+        Some(json!(count))
+    );
+}
+
+#[test]
+fn 检索批次累计持有结果并在失败后归还配额() {
+    use triviumdb::{ResourceLimits, ResourceRuntime};
+    let mib = 1024 * 1024;
+    for (name, shared, instance, code) in [
+        (
+            "instance",
+            16 * mib,
+            4 * mib,
+            "TDB_CAPACITY_RESERVATION_REJECTED",
+        ),
+        ("runtime", 11 * mib, 8 * mib, "QueueFull"),
+    ] {
+        let root = TestDir::new(name);
+        let runtime = ResourceRuntime::new(ResourceLimits {
+            memory_limit: shared,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut db = Database::<f32>::open_with_runtime(
+            &root.file("data.tdb"),
+            Config {
+                dim: 2,
+                memory_limit: instance,
+                payload_cache_bytes: 0,
+                ..Default::default()
+            },
+            runtime.clone(),
+        )
+        .unwrap();
+        let payload = json!("x".repeat(64 * 1024));
+        db.insert_with_id(1, &[1., 0.], payload.clone()).unwrap();
+        let config = SearchConfig {
+            top_k: 1,
+            expand_depth: 0,
+            ..Default::default()
+        }
+        .with_exact(true);
+        let queries = vec![vec![1., 0.]; 128];
+        for parallelism in [1, 2] {
+            let batch = BatchSearchConfig { parallelism };
+            let initial = runtime.stats().reserved_workspace_bytes;
+            assert_eq!(
+                db.search_batch(&queries, &config, &batch)
+                    .unwrap_err()
+                    .code(),
+                code
+            );
+            assert_eq!(runtime.stats().reserved_workspace_bytes, initial);
+            let rows = db.search_batch(&queries[..2], &config, &batch).unwrap();
+            assert_eq!(rows.len(), 2);
+            for row in rows {
+                assert_eq!(row.len(), 1);
+                assert_eq!(
+                    (row[0].id, row[0].score, &row[0].payload),
+                    (1, 1., &payload)
+                );
+            }
+        }
+    }
+}

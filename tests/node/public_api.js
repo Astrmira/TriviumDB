@@ -411,6 +411,7 @@ async function main() {
     await runErrorContract(root)
     runConsoleContract(root)
     await require('./request_contexts')(root)
+    await require('./vector_buffers')(root, TriviumDB)
     runKernelBoundaries(root)
     runTransactionContract(root)
     runTransactionArgumentBoundaries(root)

@@ -182,9 +182,8 @@ jobs:
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
-        env:
-          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
         with:
+          maturin-version: "v1.16.0"
           command: build
           target: ${{ matrix.target }}
           args: --release --features python -o dist ${{ matrix.sdist && '--sdist' || '' }}
@@ -255,7 +254,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -301,7 +300,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           registry-url: 'https://registry.npmjs.org'
 
       - uses: dtolnay/rust-toolchain@stable
