@@ -299,6 +299,8 @@ The development bindings support GIL-enabled CPython 3.9–3.15 and Node.js 22, 
 `parallelism=0` selects concurrency automatically, with a maximum accepted value of 64. Outer result order always matches input query order. The batch API supports stateless queries only and rejects fatigue semantics.
 
 > 📖 Full API reference, advanced usage, and Rust examples: **[API Reference](docs/api-reference.md)**
+>
+> 📖 Deep dive into architecture and technical details: **[Feature Details](docs/features.md)**
 
 ---
 
@@ -306,9 +308,34 @@ The development bindings support GIL-enabled CPython 3.9–3.15 and Node.js 22, 
 
 Every TriviumDB node can carry a **vector, JSON document, sparse text, and graph relationships**, accessed through one NodeId space and the query path that matches each question. Vector, document, and relationship mutations share transactions and the WAL. Separately registered sparse text is persisted by `flush()` or a writable handle's `close()`; applications should retain authoritative text and alias sources for rebuilding.
 
-### TQL: A DIY-Composable Unified Query Language
+### Composing an agent's retrieval steps with TQL
 
-**TQL (Trivium Query Language)** provides a **freely composable tri-modal execution pipeline**. Every `WITH` stage produces a named NodeSet; vectors, BM25/AC text recall, property indexes, graph expansion, graph algorithms, FISTA, DPP, NMF, paths, and set algebra can be chained according to application semantics, while Cascades picks a physical plan within budget:
+**TQL (Trivium Query Language)** borrows an idea from PowerShell's object pipelines. Each stage can work directly with structured results from the preceding stage. In TQL, `AS` names a result and `WITH` selects the nodes, scores, or fields to carry forward. An agent can find papers by embedding, follow their citations to gather evidence, and rank the candidates against the original question in one query.
+
+Suppose each paper has a two-dimensional embedding and a `title`, and each `cites` edge points from a paper to one it references. The agent can start with a short query to inspect the two papers it would use as seeds.
+
+```sql
+SEARCH VECTOR [0.1, 0.2] TOP 2 AS seed
+WITH seed
+RETURN seed.id AS id, seed.title AS title, similarity(seed) AS score
+ORDER BY score DESC, id
+```
+
+After inspecting the titles, the agent can reuse the opening lines and submit the full query below. It follows citations one or two hops, reranks the papers it finds by exact similarity to the original query vector, and returns up to ten.
+
+```sql
+SEARCH VECTOR [0.1, 0.2] TOP 2 AS seed
+WITH seed
+EXPAND seed [:cites*1..2] AS related
+WITH related
+RANK related BY VECTOR [0.1, 0.2] TOP 10
+RETURN related.id AS id, related.title AS title, similarity(related) AS score
+ORDER BY score DESC, id
+```
+
+Each call executes its own query, and stage names are scoped to that query. Once the retrieval steps are settled, the application can submit the full pipeline directly. Prefix it with `EXPLAIN` to see the physical operators selected by Cascades, estimated row counts, and temporary memory estimates. `EXPLAIN ANALYZE` runs the query and reports actual row counts.
+
+**Other retrieval patterns**
 
 ```sql
 -- Document query: filter JSON fields (property indexes skip full scans when hit)
@@ -330,17 +357,6 @@ WHERE topic.name == "Database"
 RANK paper BY VECTOR [0.12, -0.45, 0.78] TOP 10
 RETURN paper
 
--- 🧪 DIY: vector seed → graph expansion → graph algorithm scoring → similarity filter → rerank
-SEARCH VECTOR [0.12, -0.45, 0.78] TOP 100 AS seed
-WITH seed
-EXPAND seed [:cites*1..2] AS related
-WITH related
-pagerank related AS scored
-WITH scored
-WHERE similarity(scored) > 0.5
-RETURN scored, similarity(scored) AS sim
-ORDER BY sim DESC LIMIT 10
-
 -- Text anchors → parameterized SA-PPR → DPP diversification
 TEXT HYBRID "vector database" TOP 100 K1 1.2 B 0.75 AC_WEIGHT 1 AS text_seed
 WITH text_seed
@@ -358,7 +374,7 @@ WITH route
 RETURN path(route) AS nodes, path_length(route) AS hops
 ```
 
-A query can also use `TEXT BM25/AC/HYBRID` for sparse recall, `RESIDUAL` for FISTA residual recall, `DIVERSIFY` for DPP diversification, `TOPICS` for bounded NMF topic assignment, and `SA_PPR_CONFIG` for parameterized diffusion. `union` / `intersect` / `except`, fixed-point `iterate`, and `COUNT/SUM/AVG/MIN/MAX/COLLECT` remain composable with them. `text_score()`, `residual_score()`, `diversity_score()`, `topic()`, and `topic_score()` are first-class expressions. `EXPLAIN` exposes physical operators, estimated rows, temporary bytes, and budget slices.
+The same pipeline can use `TEXT BM25/AC/HYBRID` for text retrieval, PageRank for graph scores, `RESIDUAL` for FISTA residual recall, or `TOPICS` for topic assignment. Combine candidate sets by union, intersection, or difference before iteration or aggregation. Expressions such as `text_score()`, `graph_score()`, and `diversity_score()` let the application choose which scores to return.
 
 `search_advanced()` uses `SearchConfig` to toggle hybrid text, FISTA, SA-PPR, DPP, and refractory fatigue inside the official fixed-order template. TQL reuses the underlying algorithms and allows developers to reorder stateless operators.
 
@@ -388,35 +404,6 @@ Rust, Python, and Node.js share the same TQL, Prepared queries, four property-in
 | **Prepared TQL** | Parameterized queries; missing / extra / invalid parameters fail closed | Safe reuse of high-frequency business queries |
 
 **Reachability answers “is it structurally reachable?”**, **GraphFirst answers “which item is most similar within this structural constraint?”**, and **SA-PPR answers “which related nodes deserve more relevance?”** Applications can choose among them over the same `.tdb` data or combine document, graph, and vector conditions in one TQL query.
-
----
-
-## Core Features
-
-| Feature                          | Description                                                                                                                |
-| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| 🧪 **DIY hybrid queries**        | TQL `WITH`: freely compose vectors / BM25 / AC / properties / graph expansion / FISTA / DPP / NMF / paths / sets / aggregation, with deterministic Cascades and transparent `EXPLAIN` |
-| 📊 **Four property indexes**     | Hash / Ordered ART / Composite ART / Roaring Bitmap persisted in `.idx`; equality / range / prefix / composite / low-cardinality set operations |
-| 🧮 **Built-in graph algorithms** | PageRank / WCC / Leiden / Betweenness / Degree / Label Propagation / SA-PPR callable inside queries                        |
-| 🛰️ **Paths & set algebra**      | `ALL_PATHS` / `SHORTEST_PATHS` / `UNION` / `INTERSECT` / `EXCEPT` / `ITERATE`, plus Prepared TQL across three languages     |
-| 🔍 **Hybrid retrieval**          | Vector anchor → Top-K → Graph spreading activation → Final ranking                                                         |
-| 🧠 **Cognitive pipeline**        | `search_advanced()` is the toggleable fixed-order official template; TQL freely composes stateless FISTA / parameterized SA-PPR / DPP / NMF, while refractory fatigue remains stateful API-only |
-| 🔌 **Hook system**               | 6-stage pipeline injection points with C/C++ FFI dynamic library plugin support                                            |
-| 📦 **O(1) operations**           | FreeList tombstone reuse + Reverse Hash Net for O(1) reverse edge lookup                                                   |
-| ⚡ **QuIVer ANN index**          | BQ graph construction + default SM-L2 navigation + cosine reranking for f32/f16 embeddings, hot/cold separation, incremental maintenance         |
-| 💾 **Dual storage**              | Mmap (separate mapped vectors and Payload) / Rom (embedded vectors and Payload), switched through checkpoints                                                   |
-| 🛡️ **4-layer disaster recovery** | WAL + atomic replacement + dry-run validation + OS-level COW isolation                                                     |
-| 🔄 **Atomic transactions**    | `begin_tx()` validates operations and capacity before WAL submission, then atomically applies facts and related indexes                                                        |
-| 🔎 **Advanced filtering**        | MongoDB-style operators: `$eq/$ne/$gt/$lt/$in/$and/$or/$startsWith/$contains` + Parallel Bit-Tag Array                     |
-| 📝 **Graph queries**             | Built-in Cypher-like query engine: `MATCH (a)-[:knows]->(b) WHERE b.age > 18 RETURN b`                                     |
-| 🐍 **Python native**             | PyO3 bindings, `pip install` then `import triviumdb`                                                                       |
-| 🌐 **Node.js native**            | napi-rs bindings, `npm install` then `require('triviumdb')`                                                                |
-| 🧰 **Shared resources & diagnostics** | 0.9.0-beta.1: database quotas, protected maintenance memory, thread/task limits, available budgets, and instance/maintenance status |
-| 📸 **Controlled shutdown & snapshots** | 0.9.0-beta.1: shutdown requests, bounded waits, consistent snapshots, verification, and restore to a new directory across Rust/Python/Node |
-
-Floating-point embeddings use cosine retrieval and QuIVer acceleration. Packed `u64` SimHash fingerprints use exact Hamming retrieval with their original bit patterns.
-
-> 📖 Deep dive into architecture and technical details: **[Feature Details](docs/features.md)**
 
 ---
 
@@ -660,6 +647,8 @@ Apache-2.0
 ---
 
 ## Community
+
+Need a hand with installation, an SDK, or TQL? Ask in [Q&A](https://github.com/Astrmira/TriviumDB/discussions/categories/q-a). Explore a design in [Ideas](https://github.com/Astrmira/TriviumDB/discussions/categories/ideas) or share a project in [Show and tell](https://github.com/Astrmira/TriviumDB/discussions/categories/show-and-tell). For a bug or a concrete feature request, [open an issue](https://github.com/Astrmira/TriviumDB/issues/new/choose). English and Chinese are both welcome.
 
 This project is linked to and recognizes the [LINUX DO community](https://linux.do/).
 

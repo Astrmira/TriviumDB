@@ -56,9 +56,11 @@ jobs:
         env:
           BASE_REF: ${{ github.base_ref }}
           HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
         run: |
-          if [[ "$BASE_REF" == "master" && "$HEAD_REF" != "dev" ]]; then
-            echo "master 只接受来自 dev 的发布 PR"
+          if [[ "$BASE_REF" == "master" && ( "$HEAD_REF" != "dev" || "$HEAD_REPO" != "$BASE_REPO" ) ]]; then
+            echo "Only release PRs from this repository's dev branch can target master. / master 只接受本仓库 dev 分支的发布 PR。"
             exit 1
           fi
 

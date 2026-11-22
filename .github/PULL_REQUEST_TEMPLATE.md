@@ -1,65 +1,23 @@
-## 变更说明
+<!-- Thanks for contributing! Answer once in English or Chinese. If you have write access to this repository, the template is optional.
+感谢贡献！用英文或中文填写一次即可。拥有本仓库写权限的作者可以自由撰写或留空。 -->
 
-<!-- 请用自己的话说明问题、实际修改和设计思路，至少包含一句本人对变更的解释。 -->
+## Why / 为什么改
 
-### 解决的问题
+<!-- What problem did you encounter? An issue link is welcome. / 简单说说遇到的问题，也可以附上 Issue 链接。 -->
 
+## Changes / 改了什么
 
-### 实际修改
+<!-- Describe your approach in your own words. / 用自己的话说说改动和思路。 -->
 
+## Verification / 如何验证
 
-### 设计思路
+<!-- What did you check and what happened? For docs, tell us what you reviewed. / 做了哪些检查，结果怎样？文档改动可说明核对了什么。 -->
 
+<!-- For changes to storage, transactions, the planner, ANN, or public APIs, also fill in the three sections below. Otherwise you can remove them.
+涉及存储、事务、查询规划、ANN 或公共 API 时，再填写下面三项。其他改动可以删去这三项。 -->
 
-## 高风险领域检查
+### Invariants / 不变量
 
-<!-- 若涉及 WAL/事务/恢复、磁盘格式、mmap generation、Planner/预算、QuIVer/BQ/ANN 或三端公共 API，请填写以下四项；不涉及可写“不适用”。 -->
+### Compatibility / 兼容性
 
-- **不变量：**
-- **兼容性：**
-- **故障行为：**
-- **测试证据：**
-
-## 提交前确认
-
-- [ ] PR 的目标分支是 `dev`。
-- [ ] 我已阅读 `CONTRIBUTING.md`。
-- [ ] 我已亲自阅读并理解最终变更，并在上方至少用自己的一句话作出说明。
-- [ ] 变更保持聚焦，没有包含无关重构或生成物。
-- [ ] 已补充或更新必要测试。
-- [ ] 已运行与本次变更相关的格式、Clippy、测试、存根及跨端检查。
-- [ ] 若修改公共 API，Rust、Python、Node、`.pyi`、`.d.ts` 与契约测试已同步。
-
----
-
-## Change Description
-
-<!-- Explain the problem, actual changes, and reasoning in your own words, including at least one sentence of your own explanation. -->
-
-### Problem solved
-
-
-### Actual changes
-
-
-### Reasoning
-
-
-## High-risk area checks
-
-<!-- If this PR touches WAL/transactions/recovery, disk formats, mmap generations, Planner/budgets, QuIVer/BQ/ANN, or public language APIs, complete all four items. Otherwise write “Not applicable.” -->
-
-- **Invariants:**
-- **Compatibility:**
-- **Failure behavior:**
-- **Test evidence:**
-
-## Pre-submission checklist
-
-- [ ] This PR targets `dev`.
-- [ ] I have read `CONTRIBUTING.md`.
-- [ ] I personally reviewed and understand the final change, and wrote at least one sentence above in my own words.
-- [ ] The change is focused and contains no unrelated refactoring or generated artifacts.
-- [ ] Necessary tests were added or updated.
-- [ ] Relevant formatting, Clippy, tests, stubs, and cross-language checks were run.
-- [ ] If the public API changed, Rust, Python, Node, `.pyi`, `.d.ts`, and contract tests were updated together.
+### Failure behavior / 失败行为

@@ -1,50 +1,63 @@
 # TriviumDB
 
-The latest stable release is [0.9.3](https://github.com/Astrmira/TriviumDB/releases/tag/v0.9.3). The [ICDE evaluation archive](https://github.com/Astrmira/TriviumDB/tree/master/evaluation) contains frozen measurements and source identities.
+> TriviumDB brings semantic vector search, native hyperbolic nearest-neighbor search, property graphs, and document evidence into one embedded Rust database. A single TQL query can find nearby embeddings inside a named graph, follow their relationships, and return the records behind the result. Rust, Python, and Node.js run the same storage and query kernel in the host process.
 
-Document APIs provide source revisions, logical blocks, grouped text/vector/hybrid retrieval, phrase and proximity evidence, parser mappings, and staged publication. DOCUMENTS sources and GRAPH scopes integrate documents and named graphs into TQL, Prepared queries, and Planner. QuIVer offers centered INT8/INT4 reranking, FP32/INT8/INT4 query representations, SSD/Hot residency, byte-bounded caches, native I/O, and aligned window reuse. Document ANN can select compressed reranking per request. Rust, Python, and Node share Core semantics.
+TriviumDB is designed for agent memory, local RAG, and knowledge graphs. A NodeId can carry an embedding, JSON payload, indexed text, and labeled edges. An agent can keep a passage, its embedding, and its links under one identity. Separate database instances can isolate agents, sessions, or tenants.
 
-> TriviumDB is a native tri-model embedded database engine written in Rust. Vector search, property graphs, and JSON documents share one storage kernel and NodeId space. A unified Cascades optimizer plans cross-model TQL query pipelines. Native APIs are available for Rust, Python, and Node.js. License: Apache-2.0.
+## Composing retrieval with TQL
 
-TriviumDB runs inside the host application. Applications use it for AI agent memory, AI companion memory, retrieval-augmented generation (RAG), local knowledge bases, and knowledge graphs. Independent database instances support per-agent, per-session, and per-tenant data organization in desktop applications and containers.
+Use TQL when the answer depends on both similarity and relationships. For a citation search, an agent can run `SEARCH VECTOR` and return the seed papers' titles, then decide whether to follow their references. To do so, submit a new query with the same search prefix, follow `cites` edges with `EXPAND`, and use `RANK` to score those papers against the original vector. Once the strategy is settled, the host can execute the full pipeline in one call.
 
-- Native tri-model unification: vector, graph, and document operations share the same storage kernel, node identities, and transaction system. NodeIds connect optional vectors, JSON payloads, indexed text, and graph edges. Applications combine semantic similarity, document predicates, and graph relationships over the same data.
-- Typed query values: WITH projections capture per-row values and node identities across graph expansion. Aggregation, DISTINCT, alias ordering, and pagination share evaluation semantics. Unsigned vectors and integers retain their exact values through the corresponding typed APIs.
-- Unified Cascades planning: TQL brings vector recall, document filtering, text retrieval, graph traversal, paths, set operations, aggregation, iteration, and reranking into one query pipeline. The same deterministic, cost-driven Cascades optimizer plans these cross-model pipelines using shared statistics, index availability, and resource budgets. MATCH, FIND, SEARCH, and WITH express the combined query.
-- Vector retrieval: f32, f16, and u64 storage; exact vector search; and the QuIVer approximate nearest-neighbor (ANN) index. QuIVer uses compact 2-bit representations, sign-magnitude SM-L2 navigation, and candidate reranking with stored vectors. Dimension-aware automatic index construction supports growing datasets. The engine supports vector dimensions from 1 to 65,536, with QuIVer ANN covering 1 to 3,072 dimensions.
-- Text retrieval: BM25 ranking and Aho-Corasick keyword matching support text search and hybrid recall. Text and vector recall can feed graph expansion and reranking.
-- Graph operations: directed labeled edges with weights and metadata; neighborhood expansion; reachability; shortest paths; PageRank; connected components; Leiden community detection; and spreading activation with personalized restart (SA-PPR).
-- Property indexes: persistent Hash, Ordered ART, Composite ART, and Roaring Bitmap indexes accelerate equality, range, prefix, composite, and low-cardinality set predicates.
-- Transactions and persistence: vector, JSON payload, and graph mutations share transactions and an append-only write-ahead log (WAL). Text-index registrations persist through flush() and writable close(). Checkpoints, recovery, and background compaction manage durable storage.
-- Storage modes: Rom packs vectors, JSON payloads, and edges into a portable .tdb data file. Mmap uses a .tdb main file, mapped .vec vectors, and generation-scoped .pld payload files. Tiered vector and Payload storage support on-demand reads and byte-bounded parsed JSON caching.
-- Instance management: a shared ResourceRuntime coordinates per-instance heap and workspace budgets, maintenance allocations, worker threads, and task slots. Diagnostics expose instance and resource usage. Controlled shutdown persists data and releases instance resources; directory snapshots support consistent backup and restore.
-- Search customization: six-stage search-pipeline hooks support custom recall, graph expansion, reranking, and result processing through Rust, Python, Node.js, and C/C++ FFI integrations.
+`AS` names results and `WITH` passes selected bindings to later stages of the same query. The Cascades planner can combine vector or BM25 retrieval with graph traversal, graph algorithms, filtering, and reranking. Use `EXPLAIN` for plan estimates and `EXPLAIN ANALYZE` for observed row counts. [TQL syntax and operators](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/tql-reference.md)
+
+## Choose the vector index
+
+- **QuIVer is the default ANN index for dense semantic embeddings.** Use it for cosine retrieval over text, code, or image embeddings with up to 3,072 dimensions. It navigates a graph with 2-bit codes and reranks the candidates. Centered INT8 or INT4 reranking supports hot memory or SSD with a byte-bounded cache. Document ANN can select compressed reranking per request. Use exact search for a reference ranking or for synthetic and hand-engineered features. Packed `u64` fingerprints use exact Hamming distance.
+- **Pelorus brings the geometry of a hierarchy into the query itself.** For models that encode taxonomies, concept hierarchies, or image–text relationships in a fixed-curvature Poincaré ball, explicitly build the Pelorus index with the model's curvature magnitude `c > 0`. Stored and query coordinates must satisfy `c · ‖x‖² < 1`. Its graph navigation preserves radial information and compresses direction to 2 bits per coordinate. Candidates can be reranked in hot memory, from a memory mapping, or from SSD. Set `exact: true` for an exhaustive geodesic search over the stored coordinates.
+
+With a Pelorus index built on two-dimensional embeddings, this TQL query runs ANN search for five neighbors within the `taxonomy` graph. Membership is applied before top-K selection. The vector SDK returns geodesic distance, smallest first. TQL exposes its negative through `similarity(_)`, so higher scores are closer.
+
+```sql
+GRAPH {graph_ids: ['taxonomy']}
+SEARCH PELORUS {vector: [0.12, 0.0], options: {top_k: 5}}
+RETURN _.id AS id, similarity(_) AS score
+ORDER BY score DESC, id
+```
+
+Rust exposes `search_pelorus` and `search_pelorus_batch`. Python uses `pelorus_request` and Node.js uses `pelorusRequest`. For document or passage retrieval, set `pelorus: true` on a `search_vector` or `search_hybrid` document request to use the same geometry.
+
+In the standalone Pelorus benchmark on MERU-1M (one million 512-dimensional native hyperbolic embeddings), Pelorus reached 99.25% Recall@10 at 2,547 queries/s on one thread and 53,483 queries/s on 24 threads on AMD EPYC 9654. [Pelorus paper and measurements](https://arxiv.org/html/2611.22159v1)
+
+## Documents, graphs, and storage
+
+- **Document evidence.** Index source revisions and logical blocks, retrieve passages by text, vector, or hybrid rank, and map phrase and proximity matches back to source spans. Staged publication supports large documents.
+- **Graphs and text.** Follow directed, labeled edges or use shortest paths, PageRank, Leiden communities, and personalized graph diffusion (SA-PPR). For text, BM25 ranks terms and Aho-Corasick matches registered keywords.
+- **Indexed predicates.** Hash, Ordered ART, Composite ART, and Roaring Bitmap indexes accelerate equality, range, prefix, and set predicates over JSON properties.
+- **Persistence and resource budgets.** Vector, payload, and graph mutations share transactions and a write-ahead log. Rom packs vectors and payloads into the main data file. Mmap maps vector and payload files separately. A shared `ResourceRuntime` budgets memory and workers across instances. Directory snapshots support backup and restore.
 
 ## Documentation
 
-- [English overview](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/README_EN.md): Product overview, installation, examples, and usage patterns.
-- [Chinese overview](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/README.md): Chinese product overview, installation, and examples.
-- [API reference](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/api-reference.md): Rust, Python, and Node.js APIs, configuration, parameters, and return values.
-- [TQL reference](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/tql-reference.md): Unified Cascades planning, cross-model query syntax, pipeline operators, graph algorithms, and data mutations.
-- [Features](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/features.md): Native tri-model data model, shared storage kernel, indexing, transactions, and retrieval capabilities.
-- [QuIVer vector index](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/quiver.md): Quantized graph navigation, vector reranking, automatic construction, and index configuration.
-- [Pelorus hyperbolic index](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/pelorus.md): Opt-in fixed-curvature Poincaré search, graph construction, exact distance and storage residency.
-- [Resource runtime](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/resource-runtime.md): Shared resource budgets, thread pools, task admission, and instance diagnostics.
-- [Shutdown, snapshots, and restore](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/lifecycle-snapshots.md): Instance lifecycle, consistent directory snapshots, verification, and restore.
-- [Best practices](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/best-practices.md): Data modeling, application integration, retrieval patterns, and resource configuration.
-
-- [Stable release notes](https://raw.githubusercontent.com/Astrmira/TriviumDB/v0.9.3/docs/changes/0.9.3.md) cover changes, compatibility, and upgrade steps in Chinese and English.
+- [English overview](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/README_EN.md) and [Chinese overview](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/README.md) cover installation and examples.
+- [API reference](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/api-reference.md) covers Rust, Python, and Node.js configuration and return values.
+- [TQL reference](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/tql-reference.md) covers query syntax, graph scopes, operators, and mutations.
+- [QuIVer guide](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/quiver.md) covers dataset selection, automatic construction, reranking, and SSD I/O.
+- [Pelorus guide](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/pelorus.md) covers index construction, curvature, batch and exact search, document queries, and residency settings.
+- [Document retrieval](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/documents.md) and [named graphs](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/named-graphs.md) describe evidence spans and graph membership.
+- [Features](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/features.md) and [best practices](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/best-practices.md) cover the data model and application design.
+- [Resource runtime](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/resource-runtime.md) and [lifecycle and snapshots](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/lifecycle-snapshots.md) cover budgets, shutdown, backup, and restore.
+- [Stable release 0.9.3](https://github.com/Astrmira/TriviumDB/releases/tag/v0.9.3) and its [bilingual release notes](https://raw.githubusercontent.com/Astrmira/TriviumDB/v0.9.3/docs/changes/0.9.3.md) cover compatibility and upgrades.
 
 ## Packages
 
-- [Rust crate](https://crates.io/crates/triviumdb): Embedded Rust API and package installation.
-- [Python package](https://pypi.org/project/triviumdb/): Python bindings and package installation.
-- [Node.js package](https://www.npmjs.com/package/triviumdb): Native Node.js bindings and TypeScript definitions.
+- [Rust crate](https://crates.io/crates/triviumdb)
+- [Python package](https://pypi.org/project/triviumdb/)
+- [Node.js package and TypeScript declarations](https://www.npmjs.com/package/triviumdb)
 
 ## Optional
 
-- [Hook guide](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/hook-guide.md): Search-pipeline extensions, custom recall, reranking, and FFI integration.
-- [CLI guide](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/crates/triviumdb-cli/README.md): The tdb command-line tool, database inspection, REPL, and terminal UI.
-- [Storage integrity and concurrency](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/security.md): Transaction atomicity, generation publication, concurrent access, and FFI contracts.
-- [Source repository](https://github.com/Astrmira/TriviumDB): Rust engine, language bindings, and examples.
-- [Apache-2.0 license](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/LICENSE): Software license.
+- [QuIVer evaluation archive](https://github.com/Astrmira/TriviumDB/tree/master/evaluation) contains frozen measurements, configurations, and source identities.
+- [Pelorus research repository](https://github.com/Astrmira/Pelorus) contains the standalone index and benchmark artifacts.
+- [Hook guide](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/hook-guide.md) covers custom recall, reranking, and FFI integration.
+- [CLI guide](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/crates/triviumdb-cli/README.md) covers the `tdb` command and REPL.
+- [Storage integrity and concurrency](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/security.md) covers transaction atomicity, publication, and concurrent access.
+- [Source repository](https://github.com/Astrmira/TriviumDB) and [Apache-2.0 license](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/LICENSE).
