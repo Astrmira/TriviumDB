@@ -56,6 +56,7 @@ async function verifySearchEntries(root, TriviumDB) {
           verify(result.hits, item)
           assert.equal(result.context.observations.vector_route_quiver, 0)
           verify(db.searchAdvanced(query, { ...config, enableAdvancedPipeline: false }), item)
+          assert.deepEqual(db.searchIds(query, config), item.ids)
           verify(db.searchHybrid(query, '', topK, 0, item.min_score, undefined, item.filter, item.exact), item)
           if (!item.filter) {
             const batch = await db.searchBatch([query, query], topK, 2, item.min_score, item.exact)
@@ -79,6 +80,24 @@ async function verifySearchEntries(root, TriviumDB) {
       if (indexed) {
         db.search(query, 1)
         assert.equal(db.searchWithContext(query, { topK: 1 }).context.observations.vector_route_quiver, 1)
+        const options = { topK: 3, recallK: 200, expandDepth: 0, annRerankLimit: 240 }
+        const { hits, context } = db.searchWithContext(query, options)
+        assert.equal(context.observations.quiver_ef_search, 240)
+        assert.equal(context.observations.quiver_rerank_limit, 240)
+        assert.equal(context.observations.quiver_top_k, 3)
+        assert.equal(hits.length, 3)
+        assert.deepEqual(db.searchAdvanced(query, options), hits.map(hit => ({
+          id: hit.id, score: 1, payload: { id: hit.id },
+        })))
+        assert.deepEqual(db.searchIds(query, options), hits.map(hit => hit.id))
+        assert.deepEqual(
+          await db.searchIdsBatch([query, [0, 1]], { ...options, minScore: 0.5 }, 2),
+          [hits.map(hit => hit.id), []],
+        )
+        assert.throws(
+          () => db.searchAdvanced(query, { annRerankLimit: 0 }),
+          error => error.code === 'TDB_INVALID_INPUT' && error.target?.field === 'annRerankLimit',
+        )
       }
       const result = db.searchWithContext(query, { topK: 3, expandDepth: 0, exact: true })
       assert.equal(result.context.observations.vector_route_quiver, 0)

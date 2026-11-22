@@ -742,6 +742,40 @@ impl<T: VectorType> SearchHandle<T> {
         search_config: &SearchConfig,
         batch_config: &BatchSearchConfig,
     ) -> Result<(Vec<Vec<SearchHit>>, crate::resources::RequestWorkspace)> {
+        self.search_batch_projected(query_vectors, search_config, batch_config, true, |hits| {
+            let bytes = hits.iter().fold(
+                hits.capacity().saturating_mul(size_of::<SearchHit>()),
+                |total, hit| {
+                    total.saturating_add(crate::storage::payload_store::query_clone_peak(
+                        &hit.payload,
+                    ))
+                },
+            );
+            (hits, bytes)
+        })
+    }
+
+    pub(crate) fn search_ids_batch_with_workspace(
+        &self,
+        query_vectors: &[Vec<T>],
+        search_config: &SearchConfig,
+        batch_config: &BatchSearchConfig,
+    ) -> Result<(Vec<Vec<NodeId>>, crate::resources::RequestWorkspace)> {
+        self.search_batch_projected(query_vectors, search_config, batch_config, false, |hits| {
+            let ids: Vec<_> = hits.into_iter().map(|hit| hit.id).collect();
+            let bytes = ids.capacity().saturating_mul(size_of::<NodeId>());
+            (ids, bytes)
+        })
+    }
+
+    fn search_batch_projected<R: Send>(
+        &self,
+        query_vectors: &[Vec<T>],
+        search_config: &SearchConfig,
+        batch_config: &BatchSearchConfig,
+        include_payload: bool,
+        project: impl Fn(Vec<SearchHit>) -> (Vec<R>, usize) + Sync,
+    ) -> Result<(Vec<Vec<R>>, crate::resources::RequestWorkspace)> {
         let _operation = self.enter_operation()?;
         if search_config.enable_refractory_fatigue {
             return Err(TriviumError::InvalidInput(
@@ -766,9 +800,7 @@ impl<T: VectorType> SearchHandle<T> {
 
         let response = read_or_recover(&self.memtable).reserve_request_workspace(
             self.memory_limit,
-            query_vectors
-                .len()
-                .saturating_mul(size_of::<Vec<SearchHit>>()),
+            query_vectors.len().saturating_mul(size_of::<Vec<R>>()),
         )?;
         if query_vectors.is_empty() {
             return Ok((Vec::new(), response));
@@ -787,13 +819,12 @@ impl<T: VectorType> SearchHandle<T> {
         }
 
         let request = crate::request::current();
-        let search_one = |query: &Vec<T>| -> Result<Vec<SearchHit>> {
+        let search_one = |query: &Vec<T>| -> Result<Vec<R>> {
             let _context = request
                 .as_ref()
                 .map(crate::request::RequestContext::enter)
                 .transpose()?;
             crate::request::check_current()?;
-            let mut ctx = HookContext::new();
             let hits = pipeline::execute_pipeline_with_limit(
                 &self.memtable,
                 &self.quiver_builds,
@@ -802,18 +833,12 @@ impl<T: VectorType> SearchHandle<T> {
                 None,
                 Some(query),
                 search_config,
-                &mut ctx,
                 None,
+                None,
+                include_payload,
             )?
             .combined_hits;
-            let bytes = hits.iter().fold(
-                hits.capacity().saturating_mul(size_of::<SearchHit>()),
-                |total, hit| {
-                    total.saturating_add(crate::storage::payload_store::query_clone_peak(
-                        &hit.payload,
-                    ))
-                },
-            );
+            let (hits, bytes) = project(hits);
             let resident = if self.memory_limit == 0 {
                 0
             } else {
@@ -2844,6 +2869,32 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         }
     }
 
+    /// 批量返回命中 ID，保持查询顺序及每条查询的排序。
+    pub fn search_ids_batch(
+        &self,
+        query_vectors: &[Vec<T>],
+        search_config: &SearchConfig,
+        batch_config: &BatchSearchConfig,
+    ) -> Result<Vec<Vec<NodeId>>> {
+        self.search_ids_batch_with_workspace(query_vectors, search_config, batch_config)
+            .map(|(ids, _)| ids)
+    }
+
+    pub(crate) fn search_ids_batch_with_workspace(
+        &self,
+        query_vectors: &[Vec<T>],
+        search_config: &SearchConfig,
+        batch_config: &BatchSearchConfig,
+    ) -> Result<(Vec<Vec<NodeId>>, crate::resources::RequestWorkspace)> {
+        let _operation = self.enter_operation()?;
+        self.require_reader_determinism(search_config)?;
+        self.search_handle().search_ids_batch_with_workspace(
+            query_vectors,
+            search_config,
+            batch_config,
+        )
+    }
+
     pub fn search_exact(&self, query_vector: &[T], top_k: usize) -> Result<Vec<SearchHit>> {
         let _operation = self.enter_operation()?;
         crate::index::exact::search(&read_or_recover(&self.memtable), query_vector, top_k)
@@ -2856,6 +2907,12 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
     ) -> Result<Vec<SearchHit>> {
         let _operation = self.enter_operation()?;
         self.search_hybrid(None, Some(query_vector), config)
+    }
+
+    /// 只返回命中 ID。纯向量路径可跳过结果 Payload 的读取。
+    pub fn search_ids(&self, query_vector: &[T], config: &SearchConfig) -> Result<Vec<NodeId>> {
+        self.search_hybrid_impl(None, Some(query_vector), config, None, false)
+            .map(|hits| hits.into_iter().map(|hit| hit.id).collect())
     }
 
     fn prepare_hybrid_search(
@@ -2908,8 +2965,9 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
             query_text,
             query_vector,
             config,
-            &mut ctx,
+            Some(&mut ctx),
             None,
+            true,
         )?;
         Ok((results.combined_hits, ctx))
     }
@@ -2924,7 +2982,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         query_vector: Option<&[T]>,
         config: &SearchConfig,
     ) -> Result<Vec<SearchHit>> {
-        self.search_hybrid_impl(query_text, query_vector, config, None)
+        self.search_hybrid_impl(query_text, query_vector, config, None, true)
     }
 
     /// 以 alpha 和 1-alpha 融合向量与文本排名。端点只使用对应的召回来源。
@@ -2943,7 +3001,13 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         }
         let mut config = config.clone();
         config.enable_text_hybrid_search = alpha < 1.0;
-        self.search_hybrid_impl(Some(query_text), Some(query_vector), &config, Some(alpha))
+        self.search_hybrid_impl(
+            Some(query_text),
+            Some(query_vector),
+            &config,
+            Some(alpha),
+            true,
+        )
     }
 
     fn search_hybrid_impl(
@@ -2952,6 +3016,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         query_vector: Option<&[T]>,
         config: &SearchConfig,
         alpha: Option<f64>,
+        include_payload: bool,
     ) -> Result<Vec<SearchHit>> {
         self.require_reader_determinism(config)?;
         let _operation = self.enter_operation()?;
@@ -2967,7 +3032,6 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         if _stateful_guard.is_some() {
             crate::test_hooks::hit(crate::test_hooks::ConcurrencyPoint::StatefulSearchEntered);
         }
-        let mut ctx = HookContext::new();
         pipeline::execute_pipeline_with_limit(
             &self.memtable,
             &self.quiver_builds,
@@ -2976,8 +3040,9 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
             query_text,
             query_vector,
             config,
-            &mut ctx,
+            None,
             alpha,
+            include_payload,
         )
         .map(|output| output.combined_hits)
     }
@@ -2994,7 +3059,6 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         let _stateful_guard = config
             .enable_refractory_fatigue
             .then(|| lock_or_recover(&self.stateful_search));
-        let mut ctx = HookContext::new();
         pipeline::execute_pipeline_with_limit(
             &self.memtable,
             &self.quiver_builds,
@@ -3003,11 +3067,12 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
             query_text,
             query_vector,
             config,
-            &mut ctx,
             None,
+            None,
+            true,
         )
         .map(|output| crate::node::GroupedSearchResult {
-            semantic_hits: output.semantic_hits,
+            semantic_hits: output.semantic_hits.unwrap_or(output.combined_hits),
             graph_hits: output.graph_hits,
         })
     }

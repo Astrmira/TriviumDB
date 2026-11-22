@@ -83,7 +83,7 @@ PARAM_TYPES = {
 for _t, _names in {
     "int": "max_threads max_active_tasks id src dst key depth expand_depth min_depth max_depth max_visited_nodes max_frontier_size "
            "max_anchor_nodes parallelism additional mb interval_secs min_community_size "
-           "max_iterations dim new_dim memory_limit_mb expected_nodes max_query_rows top_k recall_k rerank_k "
+           "max_iterations dim new_dim memory_limit_mb expected_nodes max_query_rows top_k recall_k rerank_k ann_rerank_limit "
            "max_edges_per_node max_edges max_results seed payload_cache_mb payload_cache_entry_mb",
     "float": "weight min_score teleport_alpha fista_lambda fista_threshold "
              "dpp_quality_weight text_boost hybrid_alpha min_edge_weight resolution",
@@ -109,6 +109,9 @@ QUALIFIED_PARAM_TYPES = {
     "TriviumDB.search.edge_direction": "EdgeDirection",
     "TriviumDB.search_grouped.edge_direction": "EdgeDirection",
     "TriviumDB.search_advanced.edge_direction": "EdgeDirection",
+    "TriviumDB.search.query_vector": "Vector | memoryview[float] | memoryview[int]",
+    "TriviumDB.search_advanced.query_vector": "Vector | memoryview[float] | memoryview[int]",
+    "TriviumDB.search_ids.query_vector": "Vector | memoryview[float] | memoryview[int]",
     "TriviumDB.reachable.direction": "ReachabilityDirection",
     "TriviumDB.reachable_detailed.direction": "ReachabilityDirection",
     "TriviumDB.query_subgraph.direction": "ReachabilityDirection",
@@ -139,12 +142,13 @@ for _ret, _quals in {
     "int": "TriviumDB.insert TriviumDB.node_count TriviumDB.dim TriviumDB.estimated_memory "
            "TriviumDB.delete_many_atomic "
            "TriviumDB.__len__ Transaction.pending_count",
-    "list[int]": "TriviumDB.all_node_ids TriviumDB.batch_insert TriviumDB.migrate "
+    "list[int]": "TriviumDB.all_node_ids TriviumDB.batch_insert TriviumDB.migrate TriviumDB.search_ids "
                  "TriviumDB.indexed_lookup TriviumDB.substring_lookup "
                  "TriviumDB.neighbors Transaction.commit",
     "list[SearchHit]": "TriviumDB.search TriviumDB.search_advanced TriviumDB.search_hybrid "
                        "TriviumDB.search_graph_first TriviumDB.search_exact",
     "list[list[SearchHit]]": "TriviumDB.search_batch",
+    "list[list[int]]": "TriviumDB.search_ids_batch",
     "list[Edge]": "TriviumDB.get_edges",
     "Edge | None": "TriviumDB.get_edge",
     "list[IncomingEdge]": "TriviumDB.get_incoming_edges",

@@ -225,6 +225,8 @@ export interface JsSearchConfig {
   recallK?: number;
   /** SA-PPR/FISTA/DPP前候选池；0表示自动 */
   rerankK?: number;
+  /** QuIVer 内部精排候选数。导航宽度至少覆盖此预算。 */
+  annRerankLimit?: number;
   /** 图谱扩散跳数 (默认 2) */
   expandDepth?: number;
   /** 余弦相似度下限 (默认 0.0) */
@@ -279,6 +281,9 @@ export interface JsSearchConfig {
   /** 图扩散方向，默认 out */
   edgeDirection?: 'out' | 'in' | 'both';
 }
+
+export type JsIdSearchConfig = Pick<JsSearchConfig,
+  'topK' | 'recallK' | 'annRerankLimit' | 'minScore' | 'payloadFilter' | 'exact'>;
 
 export interface JsClusterResult {
   /** 节点到簇的扁平映射 [nodeId1, clusterId1, nodeId2, clusterId2...] */
@@ -872,6 +877,8 @@ export class TriviumDB {
    * @param config      管线配置（所有字段均可选，有安全默认值）
    */
   searchAdvanced(queryVector: Vector, config?: JsSearchConfig | null): JsSearchHit[];
+  searchIds(queryVector: Vector, config?: JsIdSearchConfig | null): number[];
+  searchIdsBatch(queryVectors: VectorBatch, config?: JsIdSearchConfig | null, parallelism?: number | null): Promise<number[][]>;
 
   /**
    * 向量 + 文本双路混合检索：带图扩散的双路检索入口

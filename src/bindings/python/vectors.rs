@@ -1,4 +1,4 @@
-//! 向量的标量协议转换与连续二维缓冲快照。
+//! 向量的标量协议转换与连续缓冲快照。
 
 use super::arguments::{
     float_value, half_value, integer_value, read_sequence, sequence_with_fast_path, write_list,
@@ -73,6 +73,56 @@ pub(super) fn vector<T: Component>(
     })
 }
 
+fn native_contiguous<T: Component>(view: &Bound<'_, PyMemoryView>) -> PyResult<bool> {
+    let format: String = view.getattr("format")?.extract()?;
+    let native = if cfg!(target_endian = "little") {
+        '<'
+    } else {
+        '>'
+    };
+    let format = format.strip_prefix(['@', '=', native]).unwrap_or(&format);
+    Ok((format == T::FORMAT || (T::FORMAT == "Q" && format == "L"))
+        && view.getattr("itemsize")?.extract::<usize>()? == size_of::<T>()
+        && view.getattr("c_contiguous")?.is_truthy()?)
+}
+
+/// 匹配的单行缓冲只做一次 bytes 快照；其他序列继续按标量协议读取。
+pub(super) fn with_query<T: Component + Sync + Send, R: Send>(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    operation: impl FnOnce(&[T]) -> crate::Result<R> + Send,
+) -> PyResult<R> {
+    const FIELD: &str = "query_vector";
+    let argument_error = |error| argument_input_error(error, FIELD, None);
+    let result = if let Ok(view) = value.cast::<PyMemoryView>()
+        && view
+            .getattr("ndim")
+            .and_then(|value| value.extract::<usize>())
+            .map_err(argument_error)?
+            == 1
+        && native_contiguous::<T>(view).map_err(argument_error)?
+    {
+        // bytes 的只读快照独立于宿主可变数组。快照对象留在调用栈，借出的切片只在本次调用使用。
+        let snapshot = view
+            .call_method0("tobytes")
+            .map_err(argument_error)?
+            .cast_into::<PyBytes>()
+            .map_err(|error| argument_error(error.into()))?;
+        let raw = snapshot.as_bytes();
+        match bytemuck::try_cast_slice::<u8, T>(raw) {
+            Ok(query) => py.detach(move || operation(query)),
+            Err(_) => {
+                let query: Vec<T> = bytemuck::allocation::pod_collect_to_vec(raw);
+                py.detach(move || operation(&query))
+            }
+        }
+    } else {
+        let query = vector(value, FIELD, None)?;
+        py.detach(move || operation(&query))
+    };
+    result.map_err(super::errors::to_py_error)
+}
+
 fn snapshot<T: Component>(
     view: &Bound<'_, PyMemoryView>,
     dim: usize,
@@ -89,27 +139,7 @@ fn snapshot<T: Component>(
         )
     };
     let attribute_error = |error| argument_input_error(error, field, write);
-    let format: String = view
-        .getattr("format")
-        .and_then(|value| value.extract())
-        .map_err(attribute_error)?;
-    let native = if cfg!(target_endian = "little") {
-        '<'
-    } else {
-        '>'
-    };
-    let format = format.strip_prefix(['@', '=', native]).unwrap_or(&format);
-    let itemsize: usize = view
-        .getattr("itemsize")
-        .and_then(|value| value.extract())
-        .map_err(attribute_error)?;
-    if !(format == T::FORMAT || (T::FORMAT == "Q" && format == "L"))
-        || itemsize != size_of::<T>()
-        || !view
-            .getattr("c_contiguous")
-            .and_then(|value| value.is_truthy())
-            .map_err(attribute_error)?
-    {
+    if !native_contiguous::<T>(view).map_err(attribute_error)? {
         return Err(invalid());
     }
     let (rows, columns): (usize, usize) = view
@@ -127,7 +157,7 @@ fn snapshot<T: Component>(
             None => error,
         }));
     }
-    let row_bytes = columns.checked_mul(itemsize).ok_or_else(invalid)?;
+    let row_bytes = columns.checked_mul(size_of::<T>()).ok_or_else(invalid)?;
     let total = rows.checked_mul(row_bytes).ok_or_else(invalid)?;
     if rows != 0 && columns == 0 {
         return Err(invalid());

@@ -2,6 +2,7 @@
 
 import json
 import math
+from array import array
 from pathlib import Path
 
 import triviumdb
@@ -41,6 +42,7 @@ def verify_search_entries(root):
                         options["min_score"] = case["min_score"]
                     filtered = dict(options, payload_filter=case.get("filter"))
                     verify(db.search(query, **filtered), case)
+                    assert db.search_ids(query, **{key: value for key, value in filtered.items() if key != "expand_depth"}) == case["ids"]
                     hits, context = db.search_with_context(query, **filtered)
                     verify(hits, case)
                     assert context.observations["vector_route_quiver"] == 0
@@ -64,6 +66,31 @@ def verify_search_entries(root):
             if indexed:
                 db.search([1, 0], top_k=1)
                 assert db.search_with_context([1, 0], top_k=1)[1].observations["vector_route_quiver"] == 1
+                options = dict(top_k=3, recall_k=200, expand_depth=0, ann_rerank_limit=240)
+                hits, context = db.search_with_context([1, 0], **options)
+                assert context.observations["quiver_ef_search"] == 240
+                assert context.observations["quiver_rerank_limit"] == 240
+                assert context.observations["quiver_top_k"] == 3
+                advanced = db.search_advanced([1, 0], **options)
+                assert len(advanced) == 3
+                assert [(hit.id, hit.score, hit.payload) for hit in advanced] == [
+                    (hit.id, 1.0, {"id": hit.id}) for hit in hits
+                ]
+                assert [hit.id for hit in db.search([1, 0], **options)] == [hit.id for hit in hits]
+                query = memoryview(array("f", [1.0, 0.0]))
+                assert [hit.id for hit in db.search(query, **options)] == [hit.id for hit in hits]
+                assert [hit.id for hit in db.search_advanced(query, **options)] == [hit.id for hit in hits]
+                id_options = {key: value for key, value in options.items() if key != "expand_depth"}
+                assert db.search_ids(query, **id_options) == [hit.id for hit in hits]
+                queries = memoryview(array("f", [1.0, 0.0, 0.0, 1.0])).cast("B").cast("f", shape=[2, 2])
+                batch_ids = db.search_ids_batch(queries, min_score=0.5, parallelism=2, **id_options)
+                assert batch_ids == [[hit.id for hit in hits], []]
+                try:
+                    db.search_advanced([1, 0], ann_rerank_limit=0)
+                except triviumdb.InvalidInputError as error:
+                    assert error.target["field"] == "ann_rerank_limit"
+                else:
+                    raise AssertionError("显式零精排预算必须拒绝")
             hits, context = db.search_with_context([1, 0], top_k=3, expand_depth=0, exact=True)
             assert context.observations["vector_route_quiver"] == 0
             assert [(hit.id, hit.score, hit.payload) for hit in hits] == [(i, 1.0, {"id": i}) for i in (1, 2, 3)]

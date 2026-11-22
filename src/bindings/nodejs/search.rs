@@ -6,7 +6,7 @@ use super::arguments::{
 };
 use super::database::{DbBackend, TriviumDB};
 use super::errors::to_napi_error;
-use super::options::{parse_payload_filter, parse_search_config};
+use super::options::{parse_id_search_config, parse_payload_filter, parse_search_config};
 use super::types::{
     JsGroupedSearchResult, JsHookContext, JsSearchHit, JsSearchWithContextResult, search_hit_to_js,
 };
@@ -278,6 +278,36 @@ impl TriviumDB {
                 .map(|value| search_hit_to_js(env, value))
                 .collect::<napi::Result<_>>()?,
         })
+    }
+
+    /// 只返回向量检索命中的 ID。
+    #[napi]
+    pub fn search_ids(
+        &self,
+        env: Env,
+        query_vector: JsUnknown,
+        config: Option<JsUnknown>,
+    ) -> napi::Result<Vec<f64>> {
+        let vector = read_vector(env, query_vector, "queryVector", &self.dtype)?;
+        let config = parse_id_search_config(env, config)?;
+        let ids = match &self.inner {
+            DbBackend::F32(db) => {
+                let vector: Vec<f32> = vector.iter().map(|&value| value as f32).collect();
+                db.search_ids(&vector, &config)
+            }
+            DbBackend::F16(db) => {
+                let vector: Vec<half::f16> = vector
+                    .iter()
+                    .map(|&value| half::f16::from_f64_component(value))
+                    .collect();
+                db.search_ids(&vector, &config)
+            }
+            DbBackend::U64(db) => db.search_ids(&parse_u64_vector(env, &vector)?, &config),
+        }
+        .map_err(|error| to_napi_error(env, error))?;
+        ids.into_iter()
+            .map(|id| super::arguments::node_id_to_js(env, id))
+            .collect()
     }
 
     /// 认知检索引擎：完全参数化暴露的高级功能 (FISTA, DPP, SA-PPR)

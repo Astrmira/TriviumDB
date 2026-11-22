@@ -229,7 +229,7 @@ curl -X DELETE http://127.0.0.1:8080/v1/indexes/delete \
 请求体必须为连续 little-endian f32，媒体类型为 `application/vnd.triviumdb.vector+f32`：
 
 ```text
-POST /v1/search/vector?top_k=10&recall_k=80&rerank_k=40&min_score=0.1
+POST /v1/search/vector?top_k=10&recall_k=80&rerank_k=40&ann_rerank_limit=64&min_score=0.1
 Content-Type: application/vnd.triviumdb.vector+f32
 ```
 

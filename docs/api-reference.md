@@ -883,6 +883,19 @@ Python 普通／分组检索的整数数量及展开参数、批量检索的数�
 
 Python 的 `search`、`search_grouped`、`search_with_context`、`search_advanced` 和 `search_hybrid` 接受外层 `Mapping` 过滤器，包括 `MappingProxyType` 和 `UserDict`。Mapping 协议在请求范围内执行，转换中的宿主异常保留原对象与 cause。已覆盖 Filter 表示及语义错误定位 `payload_filter`，Node 对应语义错误定位 `payloadFilter`。
 
+### search_ids / search_ids_batch — 只返回命中 ID
+
+```python
+from array import array
+
+query_buffer = memoryview(array("f", query_vector))
+ids = db.search_ids(query_buffer, top_k=100, recall_k=4000, ann_rerank_limit=1000)
+batch_ids = db.search_ids_batch(queries, top_k=100, parallelism=8,
+                                recall_k=4000, ann_rerank_limit=1000)
+```
+
+单条返回 `list[int]`，批量按输入顺序返回 `list[list[int]]`。纯向量查询直接从已排序候选生成 ID，属性过滤仍在截断 Top-K 前执行。Node.js 使用 `searchIds(vector, config)` 和 `searchIdsBatch(vectors, config, parallelism)`。Rust 入口接收 `SearchConfig`。
+
 ### search_batch — 批量并行向量检索
 
 同一个数据库实例一次接收多条向量查询，由 Rust 共享线程池并行执行。所有查询在执行前完成整批校验；任一向量维度错误或包含 NaN/Infinity 时整批失败，不返回部分结果。外层结果顺序严格对应输入顺序。
@@ -1038,8 +1051,9 @@ let results = db.search_advanced(&query_vec, &config)?;
 | 参数 | 类型 | 默认值 | 说明 |
 | ------ | ------ | -------- | ------ |
 | `top_k` | `usize` | `5` | 最终返回的结果数量 |
-| `recall_k` | `usize` | `0`（自动） | 初始召回池；自动值为 `max(top_k × 8, 64)` |
+| `recall_k` | `usize` | `0`（自动） | 初始召回池；自动值为 `max(top_k × 8, 64)`。显式值控制 QuIVer 导航宽度，纯向量查询只向内层请求最终 Top-K |
 | `rerank_k` | `usize` | `0`（自动） | 高级处理候选池；自动值为 `max(top_k × 4, 32)`，且不超过 `recall_k` |
+| `ann_rerank_limit` | `Option<usize>` | `None`（自动） | QuIVer 内部精排候选数，显式传入正整数；Node.js 为 `annRerankLimit` |
 | `expand_depth` | `usize` | `2` | SA-PPR 有限深度扩散跳数 |
 | `min_score` | `f32` | `0.0` | 相似度下限，包含边界值 |
 | `teleport_alpha` | `f32` | `0.0` | PPR 回跳概率 (0.0~1.0)，越高越抑制深层扩散 |

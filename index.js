@@ -61,6 +61,7 @@ const requiredArguments = {
   searchGraphFirst: ['queryVector', 'anchorIds', 'topK'], searchExact: ['queryVector', 'topK'],
   search: ['queryVector'], searchGrouped: ['queryVector'], searchBatch: ['queryVectors'],
   searchAdvanced: ['queryVector'], searchHybrid: ['queryVector', 'queryText'],
+  searchIds: ['queryVector'], searchIdsBatch: ['queryVectors'],
   indexText: ['id', 'text'], indexKeyword: ['id', 'keyword'], rebuildTextIndex: ['documents'],
   indexedLookup: ['equalities'], substringLookup: ['field', 'needle'],
   createIndex: ['field'], createOrderedIndex: ['field'], createCompositeIndex: ['fields'],

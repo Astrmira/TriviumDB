@@ -660,6 +660,7 @@ struct VectorSearchQuery {
     recall_k: usize,
     #[serde(default)]
     rerank_k: usize,
+    ann_rerank_limit: Option<usize>,
     #[serde(default = "default_min_score")]
     min_score: f32,
     #[serde(default)]
@@ -740,6 +741,9 @@ async fn search_vector(
         || query.top_k > 10_000
         || query.recall_k > MAX_SEARCH_CANDIDATES
         || query.rerank_k > MAX_SEARCH_CANDIDATES
+        || query
+            .ann_rerank_limit
+            .is_some_and(|limit| limit == 0 || limit > MAX_SEARCH_CANDIDATES)
         || !query.min_score.is_finite()
     {
         return Err(ApiError::invalid_request(
@@ -766,6 +770,7 @@ async fn search_vector(
         top_k: query.top_k,
         recall_k: query.recall_k,
         rerank_k: query.rerank_k,
+        ann_rerank_limit: query.ann_rerank_limit,
         min_score: query.min_score,
         force_brute_force: query.force_brute_force,
         ..Default::default()

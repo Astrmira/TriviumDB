@@ -5,6 +5,187 @@ use triviumdb::database::{BatchSearchConfig, Config, SearchConfig, StorageMode};
 use triviumdb::{Database, TriviumError, VectorType};
 
 #[test]
+fn 纯向量请求加载返回项的_payload_且诊断采用独立的_ann_预算() {
+    let root = TestDir::new("vector_search_budget");
+    let mut db = Database::<f32>::open_with_config(
+        &root.file("data.tdb"),
+        Config {
+            dim: 2,
+            auto_build_quiver: false,
+            payload_cache_bytes: 0,
+            payload_cache_entry_bytes: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for id in 1..=520 {
+        let vector = if id <= 2 { [1., 0.] } else { [0., 1.] };
+        db.insert_with_id(id, &vector, json!({"编号": id})).unwrap();
+    }
+    db.build_quiver_index(None).unwrap();
+    let query = [1., 0.];
+    let check = |hits: Vec<triviumdb::node::SearchHit>| {
+        assert_eq!(
+            hits.into_iter()
+                .map(|hit| (hit.id, hit.score, hit.payload))
+                .collect::<Vec<_>>(),
+            [(1, 1., json!({"编号": 1})), (2, 1., json!({"编号": 2}))]
+        );
+    };
+    for (recall_k, precision_budget, expected_ef, expected_budget) in [
+        (0, None, 80, 64),
+        (32, None, 64, 64),
+        (200, None, 200, 64),
+        (500, None, 500, 64),
+        (usize::MAX, None, 520, 64),
+        (200, Some(32), 200, 32),
+        (200, Some(400), 400, 400),
+        (200, Some(usize::MAX), 520, 520),
+    ] {
+        let config = SearchConfig {
+            top_k: 10,
+            recall_k,
+            ann_rerank_limit: precision_budget,
+            rerank_k: 200,
+            expand_depth: 0,
+            min_score: 0.5,
+            ..Default::default()
+        };
+        let before = db.payload_memory_stats();
+        check(db.search_advanced(&query, &config).unwrap());
+        assert_eq!(
+            db.payload_memory_stats().payload_lookups - before.payload_lookups,
+            2
+        );
+        let (hits, context) = db
+            .search_hybrid_with_context(None, Some(&query), &config)
+            .unwrap();
+        check(hits);
+        for (key, value) in [
+            ("vector_route_quiver", 1),
+            ("quiver_ef_search", expected_ef),
+            ("quiver_top_k", 10),
+            ("quiver_rerank_limit", expected_budget),
+        ] {
+            assert!(
+                context
+                    .observations
+                    .iter()
+                    .any(|(name, actual)| name == key && *actual == value),
+                "诊断缺失有效预算 {key}={value}"
+            );
+        }
+    }
+    let config = SearchConfig {
+        top_k: 10,
+        recall_k: 200,
+        expand_depth: 0,
+        min_score: 0.5,
+        ..Default::default()
+    };
+    let before = db.payload_memory_stats();
+    let grouped = db
+        .search_hybrid_grouped(None, Some(&query), &config)
+        .unwrap();
+    check(grouped.semantic_hits);
+    assert!(grouped.graph_hits.is_empty());
+    let batch = db
+        .search_batch(
+            &[query.to_vec(), query.to_vec()],
+            &config,
+            &BatchSearchConfig { parallelism: 2 },
+        )
+        .unwrap();
+    assert_eq!(batch.len(), 2);
+    for hits in batch {
+        check(hits);
+    }
+    assert_eq!(
+        db.payload_memory_stats().payload_lookups - before.payload_lookups,
+        6
+    );
+    let before = db.payload_memory_stats();
+    assert_eq!(db.search_ids(&query, &config).unwrap(), [1, 2]);
+    assert_eq!(
+        db.search_ids_batch(
+            &[query.to_vec(), vec![0., 0.], query.to_vec()],
+            &config,
+            &BatchSearchConfig { parallelism: 2 },
+        )
+        .unwrap(),
+        [vec![1, 2], vec![], vec![1, 2]]
+    );
+    assert_eq!(
+        db.payload_memory_stats().payload_lookups,
+        before.payload_lookups
+    );
+    let error = db
+        .search_advanced(
+            &query,
+            &SearchConfig {
+                ann_rerank_limit: Some(0),
+                ..config
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), "TDB_INVALID_INPUT");
+    assert_eq!(
+        serde_json::to_value(error.info().target).unwrap(),
+        json!({"field": "ann_rerank_limit"})
+    );
+    db.close().unwrap();
+}
+
+#[test]
+fn 向量扩散只向ann请求种子池且保留扩散结果() {
+    let root = TestDir::new("graph_seed_budget");
+    let mut db = Database::<f32>::open_with_config(
+        &root.file("data.tdb"),
+        Config {
+            dim: 2,
+            auto_build_quiver: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for id in 1..=520 {
+        let vector = if id == 1 { [1., 0.] } else { [0., 1.] };
+        db.insert_with_id(id, &vector, json!({"编号": id})).unwrap();
+    }
+    db.link(1, 2, "引用", 1.).unwrap();
+    db.build_quiver_index(None).unwrap();
+    let config = SearchConfig {
+        top_k: 2,
+        recall_k: 500,
+        rerank_k: 8,
+        expand_depth: 1,
+        min_score: 0.5,
+        ..Default::default()
+    };
+    let (hits, ctx) = db
+        .search_hybrid_with_context(None, Some(&[1., 0.]), &config)
+        .unwrap();
+    assert_eq!(
+        hits.into_iter()
+            .map(|hit| (hit.id, hit.score, hit.payload))
+            .collect::<Vec<_>>(),
+        [(1, 1., json!({"编号": 1})), (2, 1., json!({"编号": 2}))]
+    );
+    for (key, value) in [
+        ("quiver_ef_search", 500),
+        ("quiver_top_k", 8),
+        ("quiver_rerank_limit", 64),
+    ] {
+        assert!(
+            ctx.observations
+                .iter()
+                .any(|(name, actual)| name == key && *actual == value)
+        );
+    }
+    db.close().unwrap();
+}
+
+#[test]
 fn 检索配置在空批次和正常查询中保留准确字段() {
     let root = TestDir::new("retrieval_config_fields");
     let path = root.file("data.tdb");

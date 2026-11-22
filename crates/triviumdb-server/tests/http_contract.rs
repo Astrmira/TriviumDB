@@ -1958,6 +1958,8 @@ async fn 搜索参数受服务端硬上限和有限值约束() {
         "/v1/search/vector?top_k=10001",
         "/v1/search/vector?top_k=1&recall_k=100001",
         "/v1/search/vector?top_k=1&rerank_k=100001",
+        "/v1/search/vector?top_k=1&ann_rerank_limit=0",
+        "/v1/search/vector?top_k=1&ann_rerank_limit=100001",
     ] {
         let response = raw_request(
             app.clone(),

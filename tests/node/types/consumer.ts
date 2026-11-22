@@ -11,7 +11,11 @@ function check(condition: boolean, message: string): asserts condition {
 
 export function inspectRequestContext(database: TriviumDB): void {
   const exactHits: JsSearchHit[] = database.search([1, 0], 5, 0, undefined, undefined, true);
-  const exactAdvanced: JsSearchHit[] = database.searchAdvanced([1, 0], { exact: true });
+  const exactAdvanced: JsSearchHit[] = database.searchAdvanced([1, 0], { exact: true, annRerankLimit: 128 });
+  const ids: number[] = database.searchIds([1, 0], { annRerankLimit: 128 });
+  const batchIds: Promise<number[][]> = database.searchIdsBatch([[1, 0]]);
+  void ids;
+  void batchIds;
   const exactBatch: Promise<JsSearchHit[][]> = database.searchBatch([[1, 0]], 5, 1, undefined, true);
   void [exactHits, exactAdvanced, exactBatch];
   // @ts-expect-error 精确开关使用布尔值。
