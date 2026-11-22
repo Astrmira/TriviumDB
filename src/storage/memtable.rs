@@ -631,14 +631,7 @@ pub struct MemTable<T: VectorType> {
 }
 
 impl<T: VectorType> MemTable<T> {
-    /// 内部辅助：校验向量中是否包含 NaN 或 Infinity
-    ///
-    /// **为什么在写入时检查而不是查询时？**
-    /// NaN 进入 mmap 基础层后会永久残留。在 BruteForce 并行昦描时，
-    /// `score >= min_score`（NaN 比较永远为 false）会静默将该节点永久消失于检索结果，
-    /// 且权会无任何错误提示。一旦进入就难以排查。
-    ///
-    /// `raw_insert` 是内部恢复路径（WAL 回放 / 文件重建），剛意不加此检查。
+    /// 写入与恢复插入共用有限值检查，防止 NaN 或无穷大进入向量池并影响评分。
     #[inline]
     fn validate_vector(vector: &[T]) -> Result<()> {
         for elem in vector {
