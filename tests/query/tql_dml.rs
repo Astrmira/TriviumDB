@@ -342,39 +342,42 @@ fn 测试_DELETE_删除节点() {
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
-fn 测试_DETACH_DELETE_删除节点及边() {
-    let path = tmp_db("detach_delete");
-    cleanup(&path);
-    let mut db = Database::<f32>::open(&path, DIM).unwrap();
+fn 两种删除语法均级联删除关联边() {
+    for keyword in ["DELETE", "DETACH DELETE"] {
+        let path = tmp_db("detach_delete");
+        cleanup(&path);
+        let mut db = Database::<f32>::open(&path, DIM).unwrap();
 
-    let alice_id = db
-        .insert(&[1.0, 0.0, 0.0, 0.0], serde_json::json!({"name": "Alice"}))
-        .unwrap();
-    let bob_id = db
-        .insert(&[0.0, 1.0, 0.0, 0.0], serde_json::json!({"name": "Bob"}))
-        .unwrap();
-    db.link(alice_id, bob_id, "knows", 1.0).unwrap();
+        let alice_id = db
+            .insert(&[1.0, 0.0, 0.0, 0.0], serde_json::json!({"name": "Alice"}))
+            .unwrap();
+        let bob_id = db
+            .insert(&[0.0, 1.0, 0.0, 0.0], serde_json::json!({"name": "Bob"}))
+            .unwrap();
+        db.link(alice_id, bob_id, "knows", 1.0).unwrap();
 
-    // DETACH DELETE Alice → 应自动断开 Alice->Bob 的边
-    let result = db
-        .tql_mut(r#"MATCH (a {name: "Alice"}) DETACH DELETE a"#)
-        .unwrap();
-    assert_eq!(result.affected, 1, "应删除 1 个节点");
+        db.link(bob_id, alice_id, "knows", 1.0).unwrap();
+        // 两种语法均在同一事务中清理入边和出边。
+        let result = db
+            .tql_mut(&format!(r#"MATCH (a {{name: "Alice"}}) {keyword} a"#))
+            .unwrap();
+        assert_eq!(result.affected, 1, "应删除 1 个节点");
 
-    // Alice 已删除
-    let found = db.tql_nodes(r#"FIND {name: "Alice"} RETURN *"#).unwrap();
-    assert_eq!(found.len(), 0, "Alice 应已被删除");
+        // Alice 已删除
+        let found = db.tql_nodes(r#"FIND {name: "Alice"} RETURN *"#).unwrap();
+        assert_eq!(found.len(), 0, "Alice 应已被删除");
 
-    // Bob 仍存在
-    let bob = db.tql_nodes(r#"FIND {name: "Bob"} RETURN *"#).unwrap();
-    assert_eq!(bob.len(), 1, "Bob 应仍存在");
+        // Bob 仍存在
+        let bob = db.tql_nodes(r#"FIND {name: "Bob"} RETURN *"#).unwrap();
+        assert_eq!(bob.len(), 1, "Bob 应仍存在");
 
-    // 无边残留
-    let edges = db.tql_nodes("MATCH (a)-[:knows]->(b) RETURN a, b").unwrap();
-    assert_eq!(edges.len(), 0, "knows 边应已被移除");
-
-    drop(db);
-    cleanup(&path);
+        // 无边残留
+        let edges = db.tql_nodes("MATCH (a)-[:knows]->(b) RETURN a, b").unwrap();
+        assert_eq!(edges.len(), 0, "knows 边应已被移除");
+        assert!(db.get_edges(bob_id).unwrap().is_empty());
+        drop(db);
+        cleanup(&path);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════

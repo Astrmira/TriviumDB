@@ -796,10 +796,12 @@ impl EngineHandle {
         .await
     }
 
-    pub async fn reachable(
+    pub async fn shortest_path(
         &self,
         id: u64,
-        config: ReachabilityConfig,
+        target: u64,
+        max_depth: usize,
+        label: Option<String>,
         deadline: Instant,
     ) -> Result<(ReachabilityOutput, VersionSnapshot), ApiError> {
         let versions = self.inner.versions.clone();
@@ -807,7 +809,7 @@ impl EngineHandle {
         self.run_read(deadline, control.clone(), move |database| {
             control.check().map_err(ApiError::from)?;
             let result = database
-                .reachable_detailed(id, &config)
+                .shortest_path_detailed(id, target, max_depth, label)
                 .map_err(ApiError::from)?;
             control.check().map_err(ApiError::from)?;
             Ok((result, lock_or_recover(&versions).snapshot()))

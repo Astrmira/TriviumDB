@@ -76,6 +76,135 @@ fn 属性索引与反转计划保持平行边的完整行重数() {
 }
 
 #[test]
+fn 匹配的聚合与同分分页使用实体身份() {
+    let root = TestDir::new("match_identity");
+    let path = root.file("fixture.tdb");
+    let mut db = Database::<f32>::open(&path, 1).unwrap();
+    for id in 1..=8 {
+        db.insert_with_id(
+            id,
+            &[1.],
+            json!({"n":if id == 1 {json!(1)} else {json!(1.0)}, "selected":matches!(id, 3|4)}),
+        )
+        .unwrap();
+    }
+    for (source, target) in [(1, 4), (2, 3)] {
+        db.link(source, target, "r", 1.).unwrap();
+    }
+    for phase in 0..3 {
+        if phase == 1 {
+            db.create_index("selected").unwrap();
+        }
+        if phase == 2 {
+            db.close().unwrap();
+            db = Database::open_read_only(&path, 1).unwrap();
+        }
+        let rows = db.tql("MATCH (a)-[:r]->(b {selected:true}) RETURN COLLECT(a.id) AS ids, MIN(a.n) AS lo, MAX(a.n) AS hi").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(&rows[0]["ids"], TqlValue::List(ids) if ids == &[json!(1),json!(2)]));
+        for key in ["lo", "hi"] {
+            assert!(
+                matches!(rows[0][key], TqlValue::Int(1)),
+                "{key}: {:?}",
+                rows[0]
+            );
+        }
+        for pattern in ["(a)-[e:r]->(z)", "(z)-[e:r]->(a)"] {
+            for (offset, expected) in [(0, (1, 4)), (1, (2, 3))] {
+                let rows = db.tql(&format!("MATCH {pattern} RETURN e.source AS s, e.target AS t ORDER BY e.weight LIMIT 1 OFFSET {offset}")).unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!((number(&rows[0]["s"]), number(&rows[0]["t"])), expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn 字符串转义按码点持久化且非法代理项原子拒绝() {
+    let root = TestDir::new("string_escapes");
+    let path = root.file("escape.tdb");
+    let mut db = Database::<f32>::open(&path, 1).unwrap();
+    db.tql_mut(r#"CREATE ({v:"\u732b\r\b\f\/\n\t\\\"\uD83D\uDC08"})"#)
+        .unwrap();
+    for invalid in [r#""\uD800""#, r#""\uDC08""#, r#""\u12xy""#, r#""\q""#] {
+        let error = db
+            .tql_mut(&format!("CREATE ({{v:{invalid}}})"))
+            .unwrap_err();
+        assert_eq!(error.code(), "TDB_QUERY_PARSE");
+    }
+    db.close().unwrap();
+    let db = Database::<f32>::open_read_only(&path, 1).unwrap();
+    assert_eq!(db.all_node_ids().unwrap(), [1]);
+    assert_eq!(
+        db.get_payload(1).unwrap().unwrap(),
+        json!({"v":"猫\r\x08\x0c/\n\t\\\"🐈"})
+    );
+}
+
+#[test]
+fn 预算仅覆盖返回页与实际节点投影() {
+    let root = TestDir::new("graph_projection");
+    let mut db = Database::<f32>::open(&root.file("data.tdb"), 1).unwrap();
+    for id in 1..=4 {
+        db.insert_with_id(id, &[1.], json!({"g":"x"})).unwrap();
+    }
+    db.link(1, 2, "r", 1.).unwrap();
+    db.upsert_edge(1, 4, "other", 1., json!({"s":"x".repeat(65536)}))
+        .unwrap();
+    db.upsert_edge(3, 4, "r", 1., json!({"s":"x".repeat(65536)}))
+        .unwrap();
+    db.set_memory_limit(db.estimated_memory() + 16384).unwrap();
+    let rows = db
+        .tql("MATCH ()-[e:r]->() RETURN e.source AS i LIMIT 1")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(number(&rows[0]["i"]), 1);
+    let endpoints = db
+        .tql("MATCH (a)-[e:r]->(b) RETURN a.id AS s, b.id AS t LIMIT 1")
+        .unwrap();
+    assert_eq!(endpoints.len(), 1);
+    assert_eq!(
+        (number(&endpoints[0]["s"]), number(&endpoints[0]["t"])),
+        (1, 2)
+    );
+    // FIND 按 Payload 过滤，选取带大出边的节点。
+    let ids = db
+        .tql(r#"FIND {g:"x"} RETURN _.id AS i LIMIT 1 OFFSET 2"#)
+        .unwrap();
+    assert_eq!(ids.len(), 1);
+    assert_eq!(number(&ids[0]["i"]), 3);
+    let direct = db
+        .shortest_path_detailed(1, 2, 3, Some("r".to_owned()))
+        .unwrap();
+    assert_eq!(direct.results[0].path, [1, 2]);
+    assert_eq!(direct.traversed_edges, 1);
+    assert!(!direct.truncated);
+    for error in [
+        db.edge_page(3, Default::default(), None, 0, 1).unwrap_err(),
+        db.reachable_detailed(3, &Default::default()).unwrap_err(),
+        db.search_graph_first(&[1.], &vec![1; 16384], 1, 1)
+            .unwrap_err(),
+    ] {
+        assert_eq!(error.code(), "TDB_CAPACITY_RESERVATION_REJECTED");
+    }
+    assert_eq!(
+        db.edge_page(3, Default::default(), None, 1, 1)
+            .unwrap()
+            .0
+            .len(),
+        0
+    );
+    db.set_memory_limit(0).unwrap();
+    assert_eq!(
+        db.edge_page(3, Default::default(), None, 0, 1).unwrap().0[0].metadata["s"]
+            .as_str()
+            .unwrap()
+            .len(),
+        65536
+    );
+}
+
+#[test]
 fn 双向单跳自环只计一次且平行边分别计数() {
     let root = TestDir::new("self_loop_match");
     let mut db = Database::<f32>::open(&root.file("data.tdb"), 1).unwrap();

@@ -8,6 +8,9 @@
 
 本页记录下一批变更。最近的预发布版本见 [0.9.4-beta.1 双语说明](0.9.4-beta.1.md)，最近的正式版本见 [0.9.3 双语说明](0.9.3.md)。
 
+- WAL 组提交保留已写入帧的最高同步强度。离线迁移原子发布暂存归属，支持原命令从空暂存目录重试。CLI 导出遇到受管理文档时提示使用快照并保留目标文件。
+- MATCH 聚合与同分分页按实体身份确定顺序。TQL 字符串按 JSON 规则解码转义。显式具名边分页收齐即停，FIND 返回节点属性时跳过向量和出边的复制。
+- 图边分页、可达性、GraphFirst 锚点和 Python／Node.js 批量向量输入纳入实例与共享内存额度。HTTP 最短路径在找到目标后结束，已有节点到自身返回零跳路径。
 - 同一向量代际的 QuIVer 构建共用一次快照和工作区。手动等待者在目标配置发布后收到成功回执。事务删除造成索引退化时，提交节点变更并失效索引，下一次构建单独申请额度。
 - 过滤解码、认知重排矩阵、标量 TQL 与邻域遍历按实例剩余额度准入。排队的 Node.js 批量检索在开始执行时读取实例限额。疲劳状态在整次检索成功后更新，失败请求可按原状态重试。PROFILE 仅对实际解码计入解析字节。
 - FIND 满足显式 LIMIT 后结束扫描。DPP 保持向量缩放与候选排序前缀一致，Rust NMF 查询分析使用双精度投影。只读属性索引统计按实际条目计数，Mmap 存储诊断报告当前代际的 Payload 文件。
@@ -26,6 +29,9 @@
 
 This page tracks upcoming changes. See the [0.9.4-beta.1 prerelease notes](0.9.4-beta.1.md) and the [0.9.3 stable release notes](0.9.3.md).
 
+- Group commit honors the strongest sync mode used by writes in the group. Offline migration publishes staging ownership atomically and can retry an empty legacy stage. CLI export directs managed documents to snapshots and preserves the destination on error.
+- MATCH aggregation and tie-breaking use entity identities. TQL strings decode JSON escapes. Explicit named-edge pages stop at the requested row count, and FIND property projections skip vector and edge snapshots.
+- Edge pages, reachability, GraphFirst anchors and Python/Node.js batch query inputs reserve both instance and shared memory. HTTP shortest-path searches stop upon finding the target and return a zero-hop path for an existing node queried against itself.
 - QuIVer builds for the same vector generation share one snapshot and workspace. A manual waiter confirms publication of the requested configuration. Transactions invalidate degraded indexes after deletes, and the next build reserves its own workspace.
 - Filter decoding, cognitive reranking matrices, scalar TQL and neighborhood traversal use the remaining instance budget. Queued Node.js batch searches read the instance limit when execution begins. Fatigue updates take effect after successful search completion. PROFILE counts bytes decoded on cache misses.
 - FIND stops scanning once it satisfies an explicit LIMIT. DPP preserves direction under rescaling and produces consistent ranking prefixes. Rust NMF query analysis uses double-precision projection. Read-only index statistics count each posting once, and Mmap diagnostics recognize the active generation's payload file.

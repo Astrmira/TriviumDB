@@ -1864,7 +1864,7 @@ async fn 图探索端点批量返回真实节点边和路径() {
         Some(serde_json::json!({"operations": [
             {"op":"insert","id":1,"vector":[1.0,0.0],"payload":{"name":"a"}},
             {"op":"insert","id":2,"vector":[0.0,1.0],"payload":{"name":"b"}},
-            {"op":"insert","id":3,"vector":[0.5,0.5],"payload":{"name":"c"}},
+            {"op":"insert","id":3,"vector":[0.5,0.5],"payload":{"name":"c","type":"keep"}},
             {"op":"link","source":1,"target":2,"label":"knows","weight":1.0},
             {"op":"link","source":2,"target":3,"label":"knows","weight":0.5}
         ]})),
@@ -1887,6 +1887,21 @@ async fn 图探索端点批量返回真实节点边和路径() {
     assert_eq!(neighbors["nodes"].as_array().unwrap().len(), 3);
     assert_eq!(neighbors["edges"].as_array().unwrap().len(), 2);
     assert_eq!(neighbors["truncated"], false);
+    for (limit, ids, truncated) in [(1, vec!["1"], true), (2, vec!["1", "3"], false)] {
+        let url = format!("/v1/nodes/1/neighbors?depth=2&direction=out&types=keep&limit={limit}");
+        let filtered = json(request(app.clone(), "GET", &url, None, &[]).await).await;
+        assert_eq!(
+            filtered["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|node| node["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert_eq!(filtered["truncated"], truncated);
+        assert_eq!(filtered["edges"], serde_json::json!([]));
+    }
 
     let edges = json(
         request(
@@ -1933,6 +1948,22 @@ async fn 图探索端点批量返回真实节点边和路径() {
         serde_json::json!(["1", "2", "3"])
     );
     assert_eq!(paths["paths"][0]["edges"][0]["label"], "knows");
+    let self_path = json(
+        request(
+            app.clone(),
+            "GET",
+            "/v1/nodes/1/paths/to/1?maxHops=1",
+            None,
+            &[],
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        self_path["paths"],
+        serde_json::json!([{"nodes":["1"],"edges":[]}])
+    );
+    assert_eq!(self_path["truncated"], false);
 
     let tql = json(
         request(

@@ -31,6 +31,21 @@ function verifyHybridWeights(root, TriviumDB) {
 
 async function verifySearchEntries(root, TriviumDB) {
   verifyHybridWeights(root, TriviumDB)
+  const budgeted = new TriviumDB(path.join(root, 'batch-input.tdb'), { dim: 2 })
+  try {
+    budgeted.insertWithId(7, [1, 0], {})
+    budgeted.setMemoryLimit(1)
+    const tooWide = new Array(100000)
+    Object.defineProperty(tooWide, 0, { get() { throw new Error('超额行不应开始读取元素') } })
+    for (const search of [q => budgeted.searchIdsBatch(q), q => budgeted.searchBatch(q)]) {
+      for (const input of [[tooWide], new Float32Array(512 * 1024)]) {
+        assert.throws(() => search(input), error => error.code === 'TDB_CAPACITY_RESERVATION_REJECTED')
+      }
+    }
+    assert.deepEqual(await budgeted.searchIdsBatch([[1, 0]], { exact: true }), [[7]])
+  } finally {
+    budgeted.close()
+  }
   const query = entries.query
   const records = new Map(entries.records.map(record => [record.id, record]))
   function verify(hits, item) {

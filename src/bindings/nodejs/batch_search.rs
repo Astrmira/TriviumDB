@@ -21,6 +21,7 @@ pub struct BatchSearchTask {
     context: Option<crate::sdk::RequestContext>,
     backend: SearchBackendHandle,
     queries: Batch,
+    input_workspace: Option<crate::resources::RequestWorkspace>,
     response_workspace: Option<crate::resources::RequestWorkspace>,
     search_config: crate::database::SearchConfig,
     batch_config: crate::database::BatchSearchConfig,
@@ -67,6 +68,7 @@ impl napi::Task for BatchSearchTask {
         if let Err(error) = crate::request::check_current() {
             return Ok(Err(error));
         }
+        let _input = self.input_workspace.take();
         let queries = std::mem::replace(&mut self.queries, Batch::Numbers(Vec::new()));
         let output = match &self.backend {
             SearchBackendHandle::F32(db) => queries.into_f32().and_then(|rows| self.run(db, rows)),
@@ -106,6 +108,32 @@ impl napi::Task for BatchSearchTask {
     }
 }
 
+impl TriviumDB {
+    fn batch_input(
+        &self,
+        env: Env,
+        input: JsUnknown,
+    ) -> napi::Result<(Batch, crate::resources::RequestWorkspace)> {
+        let reserve = |bytes| {
+            dispatch!(self, db => db.reserve_request_workspace(bytes))
+                .map_err(|e| to_napi_error(env, e))
+        };
+        let mut workspace = reserve(0)?;
+        let queries = Batch::read_admitted(
+            env,
+            input,
+            self.dim() as usize,
+            &self.dtype,
+            false,
+            |bytes| {
+                workspace.absorb(reserve(bytes)?);
+                Ok(())
+            },
+        )?;
+        Ok((queries, workspace))
+    }
+}
+
 #[napi]
 impl TriviumDB {
     #[napi]
@@ -118,8 +146,7 @@ impl TriviumDB {
         min_score: Option<JsUnknown>,
         exact: Option<JsUnknown>,
     ) -> napi::Result<napi::bindgen_prelude::AsyncTask<BatchSearchTask>> {
-        let query_vectors =
-            Batch::read(env, query_vectors, self.dim() as usize, &self.dtype, false)?;
+        let (query_vectors, input_workspace) = self.batch_input(env, query_vectors)?;
         let top_k = parse_search_usize(env, top_k, 5.0, "topK", true)?;
         let parallelism = parse_search_usize(env, parallelism, 0.0, "parallelism", false)?;
         let backend = match &self.inner {
@@ -131,6 +158,7 @@ impl TriviumDB {
             context: crate::request::current(),
             backend,
             queries: query_vectors,
+            input_workspace: Some(input_workspace),
             response_workspace: None,
             search_config: crate::database::SearchConfig {
                 top_k,
@@ -153,7 +181,7 @@ impl TriviumDB {
         config: Option<JsUnknown>,
         parallelism: Option<Either<f64, JsUnknown>>,
     ) -> napi::Result<napi::bindgen_prelude::AsyncTask<BatchSearchTask>> {
-        let queries = Batch::read(env, query_vectors, self.dim() as usize, &self.dtype, false)?;
+        let (queries, input_workspace) = self.batch_input(env, query_vectors)?;
         let search_config = parse_id_search_config(env, config)?;
         let parallelism = parse_search_usize(env, parallelism, 0.0, "parallelism", false)?;
         let backend = match &self.inner {
@@ -165,6 +193,7 @@ impl TriviumDB {
             context: crate::request::current(),
             backend,
             queries,
+            input_workspace: Some(input_workspace),
             response_workspace: None,
             search_config,
             batch_config: crate::database::BatchSearchConfig { parallelism },

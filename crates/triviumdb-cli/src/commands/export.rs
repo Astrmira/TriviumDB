@@ -21,7 +21,7 @@ pub fn run(handle: &DbHandle, db_path: &str, output: &str) -> CliResult {
     {
         let mut writer = BufWriter::new(staged.as_file_mut());
         for id in ids {
-            if let Some(record) = handle.export_node(id)? {
+            if let Some(record) = handle.export_node(id, count + 1)? {
                 writeln!(writer, "{}", serde_json::to_string(&record)?)?;
                 count += 1;
             }

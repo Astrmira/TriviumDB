@@ -23,9 +23,6 @@ pub(crate) trait GraphRead<T: VectorType>: Sync {
     fn ensure_readable(&self) -> Result<()> {
         self.facts().ensure_readable()
     }
-    fn resource_runtime(&self) -> &crate::ResourceRuntime {
-        self.facts().resource_runtime()
-    }
     fn get_in_degree(&self, id: NodeId) -> usize {
         self.get_incoming_sources(id)
             .iter()

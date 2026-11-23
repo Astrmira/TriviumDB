@@ -683,7 +683,7 @@ fn execute_tql_context_inner<T: VectorType>(
     if let QueryEntry::Match { pattern } | QueryEntry::OptionalMatch { pattern } = &query.entry
         && pattern.edges.iter().any(|edge| edge.var.is_some())
     {
-        let expanded = collect_single_edge_rows(query, pattern, memtable, &limits, &memory)?;
+        let expanded = collect_single_edge_rows(query, pattern, memtable, &limits, &memory, false)?;
         let edge_var = pattern.edges[0].var.as_deref().ok_or_else(|| {
             TriviumError::QueryExecution("缺少边变量 (Missing edge variable)".into())
         })?;
@@ -703,7 +703,7 @@ fn execute_tql_context_inner<T: VectorType>(
         };
         return returning::into_nodes(returning::finish(&inputs, &scope)?, &inputs, &scope);
     }
-    let (results, _) = execute_binding_rows(query, memtable, &limits, &memory)?;
+    let (results, _) = execute_binding_rows(query, memtable, &limits, &memory, false)?;
     let inputs = results
         .iter()
         .map(|row| returning::Input::Nodes(row, None))
@@ -723,8 +723,9 @@ fn execute_binding_rows<T: VectorType>(
     memtable: &MemTable<T>,
     limits: &ExecutionContext,
     memory: &QueryMemory,
+    values_only: bool,
 ) -> Result<(TqlResult<T>, bool), TriviumError> {
-    execute_binding_rows_inner(query, memtable, limits, memory)
+    execute_binding_rows_inner(query, memtable, limits, memory, values_only)
         .map_err(|error| limits.error(error, QueryErrorStage::Execute, SourceSelector::Entry))
 }
 
@@ -733,6 +734,7 @@ fn execute_binding_rows_inner<T: VectorType>(
     memtable: &MemTable<T>,
     limits: &ExecutionContext,
     memory: &QueryMemory,
+    values_only: bool,
 ) -> Result<(TqlResult<T>, bool), TriviumError> {
     let ordered_find = matches!(
         &query.entry,
@@ -762,6 +764,7 @@ fn execute_binding_rows_inner<T: VectorType>(
             scan_limit,
             limits.query_control.as_ref(),
             memory,
+            values_only,
         )?,
         QueryEntry::Match { pattern } => (
             execute_match(
@@ -1855,7 +1858,7 @@ fn execute_tql_values_context_inner<T: VectorType>(
     }
     if !uses_pipeline(query) {
         limits.compose_memory(query, mt, &memory, &[]);
-        let (rows, _) = execute_binding_rows(query, mt, &limits, &memory)?;
+        let (rows, _) = execute_binding_rows(query, mt, &limits, &memory, true)?;
         let inputs = rows
             .iter()
             .map(|row| returning::Input::Nodes(row, None))
@@ -1896,7 +1899,7 @@ fn execute_single_edge_values<T: VectorType>(
     limits: ExecutionContext,
     memory: &QueryMemory,
 ) -> Result<TqlValueResult<T>, TriviumError> {
-    let expanded = collect_single_edge_rows(query, pattern, mt, &limits, memory)?;
+    let expanded = collect_single_edge_rows(query, pattern, mt, &limits, memory, true)?;
     let edge_var = pattern.edges[0]
         .var
         .as_deref()
@@ -1981,8 +1984,9 @@ fn collect_single_edge_rows<T: VectorType>(
     mt: &MemTable<T>,
     limits: &ExecutionContext,
     memory: &QueryMemory,
+    values_only: bool,
 ) -> Result<Vec<EdgeBindingRow<T>>, TriviumError> {
-    collect_single_edge_rows_inner(query, pattern, mt, limits, memory)
+    collect_single_edge_rows_inner(query, pattern, mt, limits, memory, values_only)
         .map_err(|error| limits.error(error, QueryErrorStage::Execute, SourceSelector::Entry))
 }
 
@@ -1992,6 +1996,7 @@ fn collect_single_edge_rows_inner<T: VectorType>(
     mt: &MemTable<T>,
     limits: &ExecutionContext,
     memory: &QueryMemory,
+    values_only: bool,
 ) -> Result<Vec<EdgeBindingRow<T>>, TriviumError> {
     if pattern.edges.len() != 1 || pattern.edges[0].hop_range.is_some() || pattern.nodes.len() != 2
     {
@@ -2017,7 +2022,12 @@ fn collect_single_edge_rows_inner<T: VectorType>(
     } else {
         Box::new(plan.candidates.iter().copied())
     };
-    let (row_limit, _) = requested_row_limit(query, requires_full_input(query, false), limits, mt)?;
+    let (row_limit, user_limited) =
+        requested_row_limit(query, requires_full_input(query, false), limits, mt)?;
+    let scan_limit = row_limit.saturating_add(usize::from(!user_limited));
+    if scan_limit == 0 || query.limit == Some(0) {
+        return Ok(Vec::new());
+    }
     let scope = returning::Scope {
         memory,
         query,
@@ -2026,6 +2036,45 @@ fn collect_single_edge_rows_inner<T: VectorType>(
         pipeline: None,
     };
     let count_only = counts_match_rows(query);
+    let snapshot_endpoint = |id, var: &str| {
+        // 只返回边或标量时保留端点身份，整节点返回和排名继续使用完整快照。
+        let full_node = match &query.returns {
+            ReturnClause::All => true,
+            ReturnClause::Variables(names) => names.iter().any(|name| name == var),
+            ReturnClause::Expressions(items) => items.iter().any(|item| match &item.kind {
+                ReturnExprKind::Var(name) => name == var,
+                ReturnExprKind::Scalar(_) => true,
+                _ => false,
+            }),
+        };
+        if !values_only || query.rank.is_some() || full_node {
+            return memory.snapshot(id, mt);
+        }
+        let needs_payload = !query.order_by.is_empty()
+            || matches!(&query.returns,
+            ReturnClause::Expressions(items) if items.iter().any(|item| match &item.kind {
+                ReturnExprKind::Property(name, field) => name == var && field != "id",
+                ReturnExprKind::Aggregate(..) => true,
+                _ => false,
+            }));
+        memory.retain(256)?;
+        let payload = if needs_payload {
+            let _decode = memory.temporary(mt.payload_query_peak(id)?)?;
+            let payload = mt
+                .try_get_payload(id)?
+                .ok_or(TriviumError::NodeNotFound(id))?;
+            memory.retain(crate::storage::payload_store::query_clone_peak(&payload))?;
+            (*payload).clone()
+        } else {
+            serde_json::Value::Null
+        };
+        Ok(Node {
+            id,
+            vector: Vec::new(),
+            edges: Vec::new(),
+            payload,
+        })
+    };
     let mut predicate_vars = Vec::new();
     if let Some(predicate) = &query.predicate {
         let default_node = pattern.nodes.iter().find_map(|node| node.var.as_deref());
@@ -2116,7 +2165,7 @@ fn collect_single_edge_rows_inner<T: VectorType>(
                     view = Some(candidate);
                     for (endpoint, id) in [(left, start), (right, end)] {
                         if let Some(var) = &endpoint.var {
-                            nodes.insert(var.clone(), memory.snapshot(id, mt)?);
+                            nodes.insert(var.clone(), snapshot_endpoint(id, var)?);
                         }
                     }
                 }
@@ -2127,21 +2176,21 @@ fn collect_single_edge_rows_inner<T: VectorType>(
                 edge: view,
                 anchor: if plan.reversed { end } else { start },
             });
-            if expanded.len() > row_limit {
+            if expanded.len() >= scan_limit {
                 break 'anchors;
             }
         }
         if optional && !matched {
             let mut nodes = HashMap::new();
             if !count_only && let Some(var) = &left.var {
-                nodes.insert(var.clone(), memory.snapshot(start, mt)?);
+                nodes.insert(var.clone(), snapshot_endpoint(start, var)?);
             }
             expanded.push(EdgeBindingRow {
                 nodes,
                 edge: None,
                 anchor: start,
             });
-            if expanded.len() > row_limit {
+            if expanded.len() >= scan_limit {
                 break;
             }
         }
@@ -2458,9 +2507,9 @@ impl<T: VectorType> crate::query::pipeline::PipelineOperator<T> for TqlMatchSour
             }
         };
         let rows = if pattern.edges.iter().any(|edge| edge.var.is_some()) {
-            collect_single_edge_rows(&self.query, pattern, mt, &self.limits, &memory)?
+            collect_single_edge_rows(&self.query, pattern, mt, &self.limits, &memory, false)?
         } else {
-            execute_binding_rows(&self.query, mt, &self.limits, &memory)?
+            execute_binding_rows(&self.query, mt, &self.limits, &memory, false)?
                 .0
                 .into_iter()
                 .map(|nodes| {
@@ -3045,6 +3094,7 @@ fn execute_find<T: VectorType>(
     row_limit: usize,
     control: Option<&QueryControl>,
     memory: &QueryMemory,
+    values_only: bool,
 ) -> Result<(TqlResult<T>, bool), TriviumError> {
     if row_limit == 0 || query.limit == Some(0) {
         return Ok((Vec::new(), false));
@@ -3078,6 +3128,18 @@ fn execute_find<T: VectorType>(
             Box::new(plan.candidates.into_iter())
         }
     };
+    let fields = match &query.returns {
+        ReturnClause::Expressions(items)
+            if values_only
+                && query.rank.is_none()
+                && items
+                    .iter()
+                    .all(|item| matches!(&item.kind, ReturnExprKind::Property(..))) =>
+        {
+            Some(items)
+        }
+        _ => None,
+    };
     for (scanned, id) in candidate_ids.enumerate() {
         if scanned & 0xff == 0
             && let Some(control) = control
@@ -3103,10 +3165,43 @@ fn execute_find<T: VectorType>(
             continue;
         }
 
-        memory.retain(memory::node_bytes(id, mt)?)?;
-        let node = match build_node_with_payload(id, payload, mt) {
-            Some(node) => node,
-            None => continue,
+        let node = if let Some(fields) = fields {
+            let projected = if query.order_by.is_empty() {
+                memory.retain(256)?;
+                let mut selected = serde_json::Map::new();
+                for item in fields {
+                    if let ReturnExprKind::Property(var, field) = &item.kind
+                        && var == "_"
+                        && field != "id"
+                        && !selected.contains_key(field)
+                        && let Some(value) = payload.get(field)
+                    {
+                        memory.retain(field.len().saturating_add(128).saturating_add(
+                            crate::storage::payload_store::query_clone_peak(value),
+                        ))?;
+                        selected.insert(field.clone(), value.clone());
+                    }
+                }
+                serde_json::Value::Object(selected)
+            } else {
+                // 排序可以读取未投影字段和别名对象。
+                memory.retain(
+                    crate::storage::payload_store::query_clone_peak(&payload).saturating_add(256),
+                )?;
+                (*payload).clone()
+            };
+            Node {
+                id,
+                payload: projected,
+                vector: Vec::new(),
+                edges: Vec::new(),
+            }
+        } else {
+            memory.retain(memory::node_bytes(id, mt)?)?;
+            let Some(node) = build_node_with_payload(id, payload, mt) else {
+                continue;
+            };
+            node
         };
 
         // FIND 的节点身份固定绑定到 _，返回列和聚合分别从同一个输入求值。

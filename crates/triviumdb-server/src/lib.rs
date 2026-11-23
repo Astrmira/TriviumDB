@@ -1392,25 +1392,19 @@ async fn get_paths(
             "maxHops 必须为 1..=64 (maxHops must be 1..=64)",
         ));
     }
-    let config = triviumdb::graph::reachability::ReachabilityConfig {
-        min_depth: 1,
-        max_depth: query.max_hops,
-        labels: query.label.map(|label| vec![label]),
-        direction: triviumdb::graph::reachability::ReachabilityDirection::Outgoing,
-        ..Default::default()
-    };
     let (result, version) = state
         .engine
-        .reachable(
+        .shortest_path(
             from,
-            config,
+            to,
+            query.max_hops,
+            query.label,
             request_deadline(Instant::now(), state.request_timeout)?,
         )
         .await?;
     let paths = result
         .results
         .into_iter()
-        .filter(|result| result.target_id == to)
         .map(|result| {
             serde_json::json!({
                 "nodes": result.path.into_iter().map(|id| id.to_string()).collect::<Vec<_>>(),

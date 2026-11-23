@@ -1,7 +1,7 @@
 //! 向量的标量协议转换与连续缓冲快照。
 
 use super::arguments::{
-    float_value, half_value, integer_value, read_sequence, sequence_with_fast_path, write_list,
+    float_value, half_value, integer_value, sequence_items, sequence_with_fast_path, write_list,
 };
 use super::errors::argument_input_error;
 use crate::error::WriteErrorInfo;
@@ -128,6 +128,7 @@ fn snapshot<T: Component>(
     dim: usize,
     field: &str,
     write: Option<WriteErrorInfo>,
+    admit: impl FnOnce(usize, usize) -> PyResult<()>,
 ) -> PyResult<Vec<Vec<T>>> {
     let invalid = || {
         argument_input_error(
@@ -162,6 +163,7 @@ fn snapshot<T: Component>(
     if rows != 0 && columns == 0 {
         return Err(invalid());
     }
+    admit(rows, total)?;
     // abi3-py39 通过只读 bytes 快照访问缓冲；释放 GIL 或转换 Payload 时宿主可重新使用原数组。
     let bytes = view
         .call_method0("tobytes")
@@ -178,11 +180,75 @@ fn snapshot<T: Component>(
         .collect())
 }
 
-pub(super) fn queries<T: Component>(value: &Bound<'_, PyAny>, dim: usize) -> PyResult<Vec<Vec<T>>> {
+pub(super) fn queries<
+    T: Component + crate::VectorType + serde::Serialize + serde::de::DeserializeOwned,
+>(
+    value: &Bound<'_, PyAny>,
+    db: &crate::Database<T>,
+) -> PyResult<(Vec<Vec<T>>, crate::resources::RequestWorkspace)> {
+    const FIELD: &str = "query_vectors";
+    let dim = db.dim();
+    let reserve = |bytes| {
+        db.reserve_request_workspace(bytes)
+            .map_err(super::errors::to_py_error)
+    };
+    let mut workspace = reserve(0)?;
     if let Ok(view) = value.cast::<PyMemoryView>() {
-        return snapshot(view, dim, "query_vectors", None);
+        let mut temporary = None;
+        let rows = snapshot(view, dim, FIELD, None, |rows, bytes| {
+            temporary = Some(reserve(bytes)?);
+            workspace.absorb(reserve(
+                bytes.saturating_add(rows.saturating_mul(size_of::<Vec<T>>())),
+            )?);
+            Ok(())
+        })?;
+        drop(temporary);
+        return Ok((rows, workspace));
     }
-    read_sequence(value, "query_vectors", |row, path| vector(row, path, None))
+    let mut rows = Vec::new();
+    for (i, item) in sequence_items(value, FIELD, None)?.enumerate() {
+        let row = item?;
+        let field = crate::sdk::field_member(FIELD, &i.to_string());
+        let items = sequence_items(&row, &field, None)?;
+        workspace.absorb(reserve(
+            dim.saturating_mul(size_of::<T>())
+                .saturating_add(4 * size_of::<Vec<T>>()),
+        )?);
+        let mut parsed = Vec::new();
+        parsed.try_reserve_exact(dim).map_err(|error| {
+            super::errors::to_py_error(
+                crate::TriviumError::CapacityAllocationFailed {
+                    reason: format!("向量行分配失败 (Vector row allocation failed): {error}"),
+                }
+                .at_field(&field),
+            )
+        })?;
+        let mismatch = |got| {
+            super::errors::to_py_error(
+                crate::TriviumError::DimensionMismatch { expected: dim, got }.at_field(&field),
+            )
+        };
+        for item in items {
+            if parsed.len() == dim {
+                return Err(mismatch(dim + 1));
+            }
+            let item = item?;
+            let component = match T::builtin(&item) {
+                Some(value) => value,
+                None => T::parse(
+                    &item,
+                    &crate::sdk::field_member(&field, &parsed.len().to_string()),
+                    None,
+                )?,
+            };
+            parsed.push(component);
+        }
+        if parsed.len() != dim {
+            return Err(mismatch(parsed.len()));
+        }
+        rows.push(parsed);
+    }
+    Ok((rows, workspace))
 }
 
 pub(super) enum WriteRows<'py, T> {
@@ -198,6 +264,7 @@ impl<'py, T: Component> WriteRows<'py, T> {
                     dim,
                     "vectors",
                     Some(WriteErrorInfo::MAINTENANCE_VALIDATION),
+                    |_, _| Ok(()),
                 )?
                 .into_iter(),
             ));

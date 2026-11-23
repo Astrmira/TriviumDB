@@ -171,7 +171,7 @@ RUST_LOG=triviumdb_server=info,triviumdb=warn ./triviumdb-server
 | POST | `/v1/nodes/batch-get` | 按 ID 批量读取节点并报告缺失 ID |
 | GET | `/v1/nodes/{id}/neighbors` | 有界多跳邻域子图，返回真实节点、边和截断状态 |
 | GET | `/v1/nodes/{id}/edges` | 按方向、标签和分页列举真实边 |
-| GET | `/v1/nodes/{from}/paths/to/{to}` | 有界最短路径及逐跳边标签 |
+| GET | `/v1/nodes/{from}/paths/to/{to}` | 目标导向的最短路径，含逐跳边标签、权重与元数据。已存在节点到自身返回单节点路径和空边数组 |
 | GET | `/v1/indexes` | 查询四类属性索引及统计 |
 | POST | `/v1/indexes` | 创建属性索引 |
 | DELETE | `/v1/indexes/delete` | 删除属性索引 |
@@ -179,6 +179,8 @@ RUST_LOG=triviumdb_server=info,triviumdb=warn ./triviumdb-server
 | POST | `/v1/indexes/quiver` | 按 Core 资格和预算启动 QuIVer 构建 |
 | POST | `/v1/import/nodes` | 有界、整请求原子的节点 NDJSON 导入 |
 | POST | `/v1/import/edges` | 有界、整请求原子的边 NDJSON 导入 |
+
+邻域接口的 `limit` 限制遍历发现的邻居数量，根节点单独保留。`types` 在遍历后筛选节点及两端均保留的边。`truncated` 描述遍历是否触及预算，因此筛选后的邻居数可以小于 `limit`。
 
 ### TQL
 

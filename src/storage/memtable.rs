@@ -3551,6 +3551,20 @@ impl<T: VectorType> MemTable<T> {
         self.reserve_request_workspace(self.instance_memory_limit, bytes)
     }
 
+    pub(crate) fn resize_instance_workspace(
+        &self,
+        workspace: &mut crate::resources::RequestWorkspace,
+        bytes: usize,
+    ) -> Result<()> {
+        let limit = self.instance_memory_limit;
+        let resident = if limit == 0 {
+            0
+        } else {
+            self.resident_memory_bytes()
+        };
+        workspace.resize_result(bytes, resident, limit)
+    }
+
     pub(crate) fn resident_memory_bytes(&self) -> usize {
         self.base_memory_bytes()
             .saturating_add(

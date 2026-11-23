@@ -2768,6 +2768,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         }
         let mut page = Vec::new();
         let mut total = 0usize;
+        let mut workspace = mt.reserve_instance_workspace(0)?;
         let mut visit = |source, outgoing: bool| -> Result<()> {
             crate::request::check_current()?;
             let edges = mt.get_edges(source).unwrap_or_default();
@@ -2785,6 +2786,14 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                     continue;
                 }
                 if total >= offset && page.len() < limit {
+                    let bytes = workspace
+                        .bytes()
+                        .saturating_add(std::mem::size_of::<SubgraphEdge>() * 4)
+                        .saturating_add(edge.label.len())
+                        .saturating_add(crate::storage::payload_store::query_clone_peak(
+                            &edge.metadata,
+                        ));
+                    mt.resize_instance_workspace(&mut workspace, bytes)?;
                     page.push(SubgraphEdge {
                         source_id: source,
                         target_id: edge.target_id,
@@ -3166,19 +3175,20 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                         }) {
                             continue;
                         }
-                        let projected = distances.len().saturating_add(1).max(4);
-                        if !distances.contains_key(&edge.target_id) {
-                            let bytes = projected
-                                .checked_mul(192)
-                                .and_then(|bytes| bytes.checked_add(256))
-                                .ok_or_else(|| TriviumError::CapacityAllocationFailed {
-                                    reason: "邻域工作区估算溢出 (Neighborhood workspace estimate overflowed)"
-                                        .into(),
-                                })?;
-                            workspace.resize_result(bytes, resident, self.memory_limit)?;
-                            distances.insert(edge.target_id, current_depth + 1);
-                            queue.push_back(edge.target_id);
+                        if distances.contains_key(&edge.target_id) {
+                            continue;
                         }
+                        // 取得新增节点额度后才允许哈希表扩容。
+                        let bytes = distances.len().saturating_add(1).max(4)
+                            .checked_mul(192)
+                            .and_then(|bytes| bytes.checked_add(256))
+                            .ok_or_else(|| TriviumError::CapacityAllocationFailed {
+                                reason: "邻域工作区估算溢出 (Neighborhood workspace estimate overflowed)"
+                                    .into(),
+                            })?;
+                        workspace.resize_result(bytes, resident, self.memory_limit)?;
+                        distances.insert(edge.target_id, current_depth + 1);
+                        queue.push_back(edge.target_id);
                     }
                 }
             }
@@ -3214,6 +3224,24 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
     ) -> Result<crate::graph::reachability::ReachabilityOutput> {
         let _operation = self.enter_operation()?;
         crate::graph::reachability::traverse_detailed(&read_or_recover(&self.memtable), id, config)
+    }
+
+    /// 在默认图沿出边查找到目标的最短路径，保留逐跳边事实。
+    pub fn shortest_path_detailed(
+        &self,
+        source: NodeId,
+        target: NodeId,
+        max_depth: usize,
+        label: Option<String>,
+    ) -> Result<crate::graph::reachability::ReachabilityOutput> {
+        let _operation = self.enter_operation()?;
+        crate::graph::reachability::shortest_detailed(
+            &read_or_recover(&self.memtable),
+            source,
+            target,
+            max_depth,
+            label,
+        )
     }
 
     pub fn query_subgraph(

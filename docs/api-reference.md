@@ -725,6 +725,8 @@ const paths = db.reachable(1, {
 
 `labels=None` 或省略表示全部 label，空列表表示禁止遍历。`min_depth=0` 可让源节点作为深度 0 结果返回。三个预算分别限制访问节点、结果和扫描边；详细接口在超限时保留已完成结果并设置 `truncated=true`。
 
+Rust 的 `shortest_path_detailed(source, target, max_depth, label)` 沿默认图出边查找一条最短路径，结果带有逐跳边标签、权重与元数据。存在的源节点到自身返回零跳路径。
+
 `max_edges` 在读取邻接表时扣减，`traversed_edges` 包含因标签、端点或去重而舍弃的扫描记录。出边按目标 ID 和标签扫描，反向来源按源 ID 扫描。详细结果只包含预算范围内已发现的路径。
 
 Rust 与 Python 使用 `max_frontier_size`，Node.js 使用 `maxFrontierSize`。该参数限制 BFS 每层新发现的节点数，默认 10,000。Python 的 `reachable`、`reachable_detailed` 和 `query_subgraph` 均接受这个关键字，Node.js 的对应方法通过遍历选项传入。
@@ -1459,7 +1461,7 @@ Rust 使用 `TqlValue::Object(serde_json::Map<String, serde_json::Value>)` 承�
 
 多字段 SET 按节点累计，重复字段采用最后一次赋值。MATCH … CREATE 每条匹配建立独立的新节点作用域，零匹配返回零次创建。SET VECTOR 按目标 dtype 检查，u64 整数字面量覆盖完整范围；任一目标失败时整个 mutation 保持原子性。
 
-DETACH DELETE 按去重后的节点集合生成统一事务删除，由内核清理入边、出边、平行边与自环。相连节点和同一节点的重复匹配共享同一个 WAL 提交边界，集合外的节点与其剩余关系保持完整。
+`DELETE` 和 `DETACH DELETE` 均按去重后的节点集合生成统一事务删除，由内核清理入边、出边、平行边与自环。相连节点和同一节点的重复匹配共享同一个 WAL 提交边界，集合外的节点与其剩余关系保持完整。
 
 **Python：**
 ```python

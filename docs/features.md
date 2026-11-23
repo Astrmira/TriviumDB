@@ -497,7 +497,7 @@ WITH 保存每行的带类型投影，EXPAND 传递起点快照，多源汇合�
 | ------ | ------ | ------ |
 | **CREATE** | 创建节点 | `CREATE (a {name: "Alice", age: 30})` |
 | **SET** | 更新属性 | `MATCH (a {name: "Alice"}) SET a.age == 31` |
-| **DELETE** | 删除节点 | `MATCH (a {name: "Alice"}) DELETE a` |
+| **DELETE** | 删除节点及关联边 | `MATCH (a {name: "Alice"}) DELETE a` |
 | **DETACH DELETE** | 删除节点及关联边 | `MATCH (a {name: "Alice"}) DETACH DELETE a` |
 
 ### 支持的语法元素

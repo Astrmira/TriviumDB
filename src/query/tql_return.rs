@@ -26,23 +26,38 @@ pub(super) struct Row<T> {
 }
 
 // 同分行按完整绑定身份比较，保持不同访问路径和 HashMap 顺序下的分页一致。
-fn compare_input_identity<T>(left: &Input<'_, T>, right: &Input<'_, T>) -> std::cmp::Ordering {
+fn compare_input_identity<T>(
+    left: &Input<'_, T>,
+    right: &Input<'_, T>,
+    entry: &QueryEntry,
+) -> std::cmp::Ordering {
     match (left, right) {
-        (Input::Nodes(_, Some((left_name, left))), Input::Nodes(_, Some((right_name, right)))) => (
-            left_name,
-            &left.graph_id,
-            left.source_id,
-            left.target_id,
-            &left.label,
-        )
-            .cmp(&(
-                right_name,
-                &right.graph_id,
-                right.source_id,
-                right.target_id,
-                &right.label,
-            )),
-        (Input::Nodes(_, left), Input::Nodes(_, right)) => left.is_some().cmp(&right.is_some()),
+        (Input::Nodes(a, x), Input::Nodes(b, y)) => {
+            let edge_key = |edge: &EdgeView| (edge.source_id, edge.target_id);
+            let edge_order = match (x, y) {
+                (Some((_, x)), Some((_, y))) => x
+                    .graph_id
+                    .cmp(&y.graph_id)
+                    .then_with(|| edge_key(x).cmp(&edge_key(y)))
+                    .then_with(|| x.label.cmp(&y.label)),
+                _ => x.is_some().cmp(&y.is_some()),
+            };
+            edge_order.then_with(|| match entry {
+                QueryEntry::Match { pattern } | QueryEntry::OptionalMatch { pattern } => pattern
+                    .nodes
+                    .iter()
+                    .filter_map(|node| node.var.as_ref())
+                    .map(|var| a.get(var).map(|n| n.id))
+                    .cmp(
+                        pattern
+                            .nodes
+                            .iter()
+                            .filter_map(|node| node.var.as_ref())
+                            .map(|var| b.get(var).map(|n| n.id)),
+                    ),
+                _ => a.get("_").map(|n| n.id).cmp(&b.get("_").map(|n| n.id)),
+            })
+        }
         (Input::Pipeline(left), Input::Pipeline(right)) => left
             .id
             .cmp(&right.id)
@@ -578,7 +593,12 @@ fn finish_inner<T: VectorType>(
         if inputs.is_empty() && group_items.is_empty() {
             groups.insert(Vec::new(), Vec::new());
         }
-        for (group_key, group) in groups {
+        for (group_key, mut group) in groups {
+            if scope.pipeline.is_none() && scope.query.rank.is_none() {
+                group.sort_unstable_by(|&a, &b| {
+                    compare_input_identity(&inputs[a], &inputs[b], &scope.query.entry)
+                });
+            }
             let source = group.first().copied();
             let mut values = HashMap::new();
             for (item_index, item) in items.iter().enumerate() {
@@ -648,18 +668,10 @@ fn finish_inner<T: VectorType>(
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                let mut identity = match row.source.map(|index| &inputs[index]) {
-                    Some(Input::Nodes(nodes, _)) => nodes
-                        .iter()
-                        .map(|(name, node)| (name.as_str(), node.id))
-                        .collect::<Vec<_>>(),
-                    _ => Vec::new(),
-                };
-                identity.sort_unstable();
-                Ok((row, keys, identity))
+                Ok((row, keys))
             })
             .collect::<Result<Vec<_>, TriviumError>>()?;
-        sorted.sort_by(|(left, a, left_identity), (right, b, right_identity)| {
+        sorted.sort_by(|(left, a), (right, b)| {
             for ((a, b), order) in a.iter().zip(b).zip(&scope.query.order_by) {
                 let cmp = compare_for_sort(a, b);
                 let cmp = if order.descending { cmp.reverse() } else { cmp };
@@ -669,15 +681,14 @@ fn finish_inner<T: VectorType>(
             }
             left.group_key
                 .cmp(&right.group_key)
-                .then_with(|| left_identity.cmp(right_identity))
                 .then_with(|| match (left.source, right.source) {
                     (Some(left), Some(right)) => {
-                        compare_input_identity(&inputs[left], &inputs[right])
+                        compare_input_identity(&inputs[left], &inputs[right], &scope.query.entry)
                     }
                     _ => std::cmp::Ordering::Equal,
                 })
         });
-        rows = sorted.into_iter().map(|(row, _, _)| row).collect();
+        rows = sorted.into_iter().map(|(row, _)| row).collect();
     }
     apply_offset_limit(&mut rows, scope.query.offset, scope.query.limit);
     if !has_agg {

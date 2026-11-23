@@ -138,7 +138,7 @@ struct PathState {
     path: Vec<NodeId>,
     steps: Vec<ReachabilityStep>,
     heap_bytes: usize,
-    _workspace: crate::resources::WorkspaceReservation,
+    _workspace: crate::resources::RequestWorkspace,
 }
 
 pub fn traverse<T: VectorType>(
@@ -173,31 +173,48 @@ pub(crate) fn traverse_detailed_view<T: VectorType>(
 ) -> Result<ReachabilityOutput> {
     let control = crate::request::control().unwrap_or_default();
     control.check()?;
-    Ok(traverse_leased(db, source_id, config)?.0)
+    Ok(traverse_leased(db, source_id, config, None)?.0)
+}
+
+pub(crate) fn shortest_detailed<T: VectorType>(
+    db: &MemTable<T>,
+    source_id: NodeId,
+    target: NodeId,
+    max_depth: usize,
+    label: Option<String>,
+) -> Result<ReachabilityOutput> {
+    let config = ReachabilityConfig {
+        min_depth: 0,
+        max_depth,
+        labels: label.map(|label| vec![label]),
+        ..Default::default()
+    };
+    Ok(traverse_leased(db, source_id, &config, Some(target))?.0)
 }
 
 fn traverse_leased<T: VectorType>(
     db: &impl GraphRead<T>,
     source_id: NodeId,
     config: &ReachabilityConfig,
+    target: Option<NodeId>,
 ) -> Result<(
     ReachabilityOutput,
-    Vec<crate::resources::WorkspaceReservation>,
-    crate::resources::WorkspaceReservation,
+    Vec<crate::resources::RequestWorkspace>,
+    crate::resources::RequestWorkspace,
 )> {
     let control = crate::request::control().unwrap_or_default();
     control.check()?;
     validate(db, source_id, config)?;
     let mut base = db
-        .resource_runtime()
-        .reserve_workspace(state_bytes(1, true, 0, 1)?)?;
+        .facts()
+        .reserve_instance_workspace(state_bytes(1, true, 0, 1)?)?;
     let mut result_leases = Vec::new();
     let mut queue = VecDeque::from([PathState {
         node: source_id,
         path: vec![source_id],
         steps: vec![],
         heap_bytes: 16,
-        _workspace: db.resource_runtime().reserve_workspace(16)?,
+        _workspace: db.facts().reserve_instance_workspace(16)?,
     }]);
     let mut best_depth = HashMap::from([(source_id, 0usize)]);
     let mut results = vec![];
@@ -213,8 +230,8 @@ fn traverse_leased<T: VectorType>(
         max_depth: config.max_depth,
         exhaustion_policy: config.exhaustion_policy,
     };
-    if config.min_depth == 0 {
-        result_leases.push(db.resource_runtime().reserve_workspace(16)?);
+    if config.min_depth == 0 && target.is_none_or(|id| id == source_id) {
+        result_leases.push(db.facts().reserve_instance_workspace(16)?);
         results.push(ReachabilityResult {
             source_id,
             target_id: source_id,
@@ -222,6 +239,9 @@ fn traverse_leased<T: VectorType>(
             path: vec![source_id],
             steps: vec![],
         });
+    }
+    if target.is_some_and(|id| id == source_id || !db.contains(id)) {
+        queue.clear();
     }
     let mut layer = 0;
     let mut next_width = 0usize;
@@ -234,7 +254,12 @@ fn traverse_leased<T: VectorType>(
         if depth >= config.max_depth {
             continue;
         }
-        let collected = collect_steps(db, state.node, config, &scans)?;
+        let mut collected = collect_steps(db, state.node, config, &scans, target)?;
+        if let Some(target) = target
+            && collected.steps.iter().any(|step| step.to == target)
+        {
+            collected.steps.retain(|step| step.to == target);
+        }
         traversed_edges += collected.scanned;
         for step in collected.steps {
             crate::graph::budget::check_control(&control)?;
@@ -271,7 +296,10 @@ fn traverse_leased<T: VectorType>(
                 )?;
                 break 'walk;
             }
-            base.resize(state_bytes(best_depth.len().saturating_add(1), true, 0, 1)?)?;
+            db.facts().resize_instance_workspace(
+                &mut base,
+                state_bytes(best_depth.len().saturating_add(1), true, 0, 1)?,
+            )?;
             best_depth.insert(step.to, next_depth);
             depth_reached = depth_reached.max(next_depth);
             let added = std::mem::size_of::<NodeId>()
@@ -284,7 +312,7 @@ fn traverse_leased<T: VectorType>(
                 .heap_bytes
                 .checked_add(added.checked_mul(2).ok_or_else(workspace_overflow)?)
                 .ok_or_else(workspace_overflow)?;
-            let workspace = db.resource_runtime().reserve_workspace(heap_bytes)?;
+            let workspace = db.facts().reserve_instance_workspace(heap_bytes)?;
             let mut path = state.path.clone();
             path.push(step.to);
             let mut steps = state.steps.clone();
@@ -297,12 +325,24 @@ fn traverse_leased<T: VectorType>(
                 weight: step.edge.weight,
                 metadata: step.edge.metadata.clone(),
             });
-            if next_depth >= config.min_depth {
+            if target == Some(step.to) {
+                result_leases.push(workspace);
+                results.push(ReachabilityResult {
+                    source_id,
+                    target_id: step.to,
+                    depth: next_depth,
+                    path,
+                    steps,
+                });
+                peak_frontier_size = peak_frontier_size.max(next_width + 1);
+                break 'walk;
+            }
+            if next_depth >= config.min_depth && target.is_none() {
                 if results.len().saturating_add(1) > config.max_results {
                     truncated = true;
                     break 'walk;
                 }
-                result_leases.push(db.resource_runtime().reserve_workspace(heap_bytes)?);
+                result_leases.push(db.facts().reserve_instance_workspace(heap_bytes)?);
                 results.push(ReachabilityResult {
                     source_id,
                     target_id: step.to,
@@ -381,8 +421,8 @@ pub(crate) fn traverse_compact_with_edge_budget<T: VectorType>(
     control.check()?;
     validate(db, source_id, config)?;
     let mut workspace = db
-        .resource_runtime()
-        .reserve_workspace(state_bytes(1, false, 0, 1)?)?;
+        .facts()
+        .reserve_instance_workspace(state_bytes(1, false, 0, 1)?)?;
     let mut queue = VecDeque::from([(source_id, 0usize)]);
     let mut best_depth = HashMap::from([(source_id, 0usize)]);
     let mut results = Vec::new();
@@ -421,12 +461,10 @@ pub(crate) fn traverse_compact_with_edge_budget<T: VectorType>(
                         .into(),
                 ));
             }
-            workspace.resize(state_bytes(
-                best_depth.len().saturating_add(1),
-                false,
-                0,
-                1,
-            )?)?;
+            db.facts().resize_instance_workspace(
+                &mut workspace,
+                state_bytes(best_depth.len().saturating_add(1), false, 0, 1)?,
+            )?;
             best_depth.insert(target, next_depth);
             if next_depth >= config.min_depth {
                 if results.len() >= config.max_results {
@@ -500,8 +538,8 @@ pub(crate) fn traverse_compact_parallel_view<T: VectorType>(
     let slot_count = db.internal_slot_count();
     let word_count = slot_count.div_ceil(64);
     let mut workspace = db
-        .resource_runtime()
-        .reserve_workspace(state_bytes(1, false, word_count, 1)?)?;
+        .facts()
+        .reserve_instance_workspace(state_bytes(1, false, word_count, 1)?)?;
     let source_slot = db
         .internal_slot_of(source_id)
         .ok_or(TriviumError::NodeNotFound(source_id))?;
@@ -521,7 +559,10 @@ pub(crate) fn traverse_compact_parallel_view<T: VectorType>(
     for depth in 0..config.max_depth {
         crate::graph::budget::check_control(&control)?;
         let workers = rayon::current_num_threads().min(frontier.len()).max(1);
-        workspace.resize(state_bytes(visited_count, false, word_count, workers)?)?;
+        db.facts().resize_instance_workspace(
+            &mut workspace,
+            state_bytes(visited_count, false, word_count, workers)?,
+        )?;
         let partials = if frontier.len() < 1_024 || workers == 1 {
             let mut bitmap = vec![0u64; word_count];
             let mut edges = 0usize;
@@ -597,14 +638,17 @@ pub(crate) fn traverse_compact_parallel_view<T: VectorType>(
                             .into(),
                     ));
                 }
-                workspace.resize(state_bytes(
-                    visited_count
-                        .saturating_add(next_frontier.len())
-                        .saturating_add(1),
-                    false,
-                    word_count,
-                    workers,
-                )?)?;
+                db.facts().resize_instance_workspace(
+                    &mut workspace,
+                    state_bytes(
+                        visited_count
+                            .saturating_add(next_frontier.len())
+                            .saturating_add(1),
+                        false,
+                        word_count,
+                        workers,
+                    )?,
+                )?;
                 next_frontier.push(slot);
             }
         }
@@ -642,7 +686,7 @@ fn collect_targets<T: VectorType>(
     current: NodeId,
     config: &ReachabilityConfig,
     scans: &EdgeScanBudget,
-) -> Result<(Vec<NodeId>, crate::resources::WorkspaceReservation, usize)> {
+) -> Result<(Vec<NodeId>, crate::resources::RequestWorkspace, usize)> {
     let control = crate::request::control().unwrap_or_default();
     control.check()?;
     let CollectedSteps {
@@ -650,7 +694,7 @@ fn collect_targets<T: VectorType>(
         mut lease,
         scanned,
         truncated,
-    } = collect_steps(db, current, config, scans)?;
+    } = collect_steps(db, current, config, scans, None)?;
     if truncated {
         return Err(TriviumError::QueryExecution(
             "图扩展检查边数超过预算 (Graph expansion examined-edge budget exceeded)".into(),
@@ -661,7 +705,7 @@ fn collect_targets<T: VectorType>(
         .max(4)
         .checked_mul((std::mem::size_of::<BorrowedStep<'_>>() + std::mem::size_of::<NodeId>()) * 2)
         .ok_or_else(workspace_overflow)?;
-    lease.resize(bytes)?;
+    db.facts().resize_instance_workspace(&mut lease, bytes)?;
     let mut targets = steps.iter().map(|step| step.to).collect::<Vec<_>>();
     targets.sort_unstable();
     targets.dedup();
@@ -675,7 +719,7 @@ pub fn query_subgraph<T: VectorType>(
 ) -> Result<SubgraphResult> {
     let control = crate::request::control().unwrap_or_default();
     control.check()?;
-    let (output, _result_leases, _base) = traverse_leased(db, source_id, config)?;
+    let (output, _result_leases, _base) = traverse_leased(db, source_id, config, None)?;
     let mut ids = BTreeSet::from([source_id]);
     let mut edges = BTreeMap::new();
     for result in &output.results {
@@ -701,7 +745,7 @@ pub fn query_subgraph<T: VectorType>(
             })
             .ok_or_else(workspace_overflow)
     })?;
-    let _materialization = db.resource_runtime().reserve_workspace(bytes)?;
+    let _materialization = db.facts().reserve_instance_workspace(bytes)?;
     let nodes = ids
         .into_iter()
         .map(|id| {
@@ -790,7 +834,7 @@ fn state_bytes(nodes: usize, detailed: bool, bitmap_words: usize, workers: usize
 
 struct CollectedSteps<'a> {
     steps: Vec<BorrowedStep<'a>>,
-    lease: crate::resources::WorkspaceReservation,
+    lease: crate::resources::RequestWorkspace,
     scanned: usize,
     truncated: bool,
 }
@@ -800,11 +844,12 @@ fn collect_steps<'a, T: VectorType>(
     current: NodeId,
     c: &ReachabilityConfig,
     budget: &EdgeScanBudget,
+    target: Option<NodeId>,
 ) -> Result<CollectedSteps<'a>> {
     let control = crate::request::control().unwrap_or_default();
     control.check()?;
     let mut steps = Vec::new();
-    let mut lease = db.resource_runtime().reserve_workspace(0)?;
+    let mut lease = db.facts().reserve_instance_workspace(0)?;
     let mut scanned = 0;
     let mut truncated = false;
 
@@ -829,7 +874,7 @@ fn collect_steps<'a, T: VectorType>(
                     .checked_mul(std::mem::size_of::<BorrowedStep<'_>>() * 2)
             })
             .ok_or_else(workspace_overflow)?;
-        lease.resize(bytes)?;
+        db.facts().resize_instance_workspace(&mut lease, bytes)?;
         steps.push(BorrowedStep {
             from: current,
             to: if source == current {
@@ -844,6 +889,21 @@ fn collect_steps<'a, T: VectorType>(
     };
     let mut scan = |source, incoming: bool| -> Result<bool> {
         let edges = db.get_edges(source).unwrap_or_default();
+        if let Some(target) = target {
+            // 目标路径只读取到第一条匹配边，按实际检查的原始边数扣费。
+            for edge in edges {
+                crate::graph::budget::check_control(&control)?;
+                if budget.admit(1) == 0 {
+                    return Ok(true);
+                }
+                scanned += 1;
+                add(source, edge)?;
+                if edge.target_id == target && allowed(&edge.label, c.labels.as_deref()) {
+                    break;
+                }
+            }
+            return Ok(false);
+        }
         let allowed_count = budget.admit(edges.len());
         scanned += allowed_count;
         for edge in &edges[..allowed_count] {

@@ -238,9 +238,10 @@ impl DbHandle {
     }
 
     /// 导出直接读取原始 dtype，整数指纹通过 JSON 整数保留完整位模式。
-    pub fn export_node(&self, id: NodeId) -> Result<Option<Value>> {
+    pub fn export_node(&self, id: NodeId, line: usize) -> Result<Option<Value>> {
         dispatch!(self, db => {
             db.get(id)?.map(|node| {
+                triviumdb::document::validate_node_import_payload(&node.payload, line)?;
                 let vector = node.vector.into_iter().map(VectorType::to_json_number)
                     .collect::<Result<Vec<_>>>()?;
                 Ok(serde_json::json!({

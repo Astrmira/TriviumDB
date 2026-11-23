@@ -36,11 +36,11 @@ tdb exec mydata.tdb 'MATCH (n) RETURN n LIMIT 5'
 # 非交互执行写入 TQL
 tdb exec mydata.tdb 'CREATE (n {name: "Alice"})' --mutate
 
-# 导出全部节点为 JSONL
-tdb export mydata.tdb backup.jsonl
+# 导出普通节点和默认图边为 JSONL
+tdb export mydata.tdb nodes.jsonl
 
 # 从 JSONL 导入；创建新库时需要指定维度
-tdb import newdata.tdb backup.jsonl --dim 4
+tdb import newdata.tdb nodes.jsonl --dim 4
 
 # 快速检查数据库文件头与 WAL 状态
 tdb repair check mydata.tdb
@@ -88,7 +88,7 @@ tdb ui mydata.tdb
 
 > **精度提醒**　u64 JSONL 向量使用整数字面量。浮点和指数表示在解析时可能发生舍入，导入入口会拒绝这些表示。此前经过 f32 舍入的导出文件，需要从原始数据库或完整备份重新导出。
 
-> **备份提醒**　完整数据库备份使用快照接口，保留文档正文、命名图、文本登记、索引定义及关联文件。JSONL 适用于上述节点与默认图边的数据交换。
+> **备份提醒**　完整数据库备份使用快照接口，保留文档正文、命名图、文本登记、索引定义及关联文件。JSONL 用于普通节点与默认图边的数据交换。遇到受管理文档时，导出会报错并保留已有目标文件。
 
 ## REPL 元命令
 
@@ -164,7 +164,7 @@ graph_marker  = "auto"  # auto | braille | dot | block | half_block
 
 ## 安全注意事项
 
-- 导出目标使用独立文件名，例如 `backup.jsonl`。数据库制品名称族由 CLI 路径保护检查维护。
+- 导出目标使用独立文件名，例如 `nodes.jsonl`。数据库制品名称族由 CLI 路径保护检查维护。
 - **导入会写入数据库**，建议对重要数据先备份。
 - **创建新库时必须提供 `--dim`**，否则无法确定向量维度。
 

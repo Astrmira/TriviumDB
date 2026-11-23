@@ -93,7 +93,7 @@ impl PyTriviumDB {
         let parallelism = extract_argument(py, parallelism.bind(py), "parallelism", None)?;
         let batch = crate::database::BatchSearchConfig { parallelism };
         let (ids, _workspace) = dispatch!(db, inner => {
-            let queries = super::vectors::queries(&query_vectors, inner.dim())?;
+            let (queries, _input) = super::vectors::queries(&query_vectors, inner)?;
             py.detach(|| inner.search_ids_batch_with_workspace(&queries, &config, &batch))
         })
         .map_err(to_py_error)?;
@@ -401,21 +401,10 @@ impl PyTriviumDB {
         }
         .with_exact(exact);
         let batch_config = crate::database::BatchSearchConfig { parallelism };
-        let (results, _response_workspace) = match &this.inner {
-            DbBackend::F32(db) => {
-                let queries: Vec<Vec<f32>> = super::vectors::queries(&query_vectors, db.dim())?;
-                py.detach(|| db.search_batch_with_workspace(&queries, &config, &batch_config))
-            }
-            DbBackend::F16(db) => {
-                let queries: Vec<Vec<half::f16>> =
-                    super::vectors::queries(&query_vectors, db.dim())?;
-                py.detach(|| db.search_batch_with_workspace(&queries, &config, &batch_config))
-            }
-            DbBackend::U64(db) => {
-                let queries: Vec<Vec<u64>> = super::vectors::queries(&query_vectors, db.dim())?;
-                py.detach(|| db.search_batch_with_workspace(&queries, &config, &batch_config))
-            }
-        }
+        let (results, _response_workspace) = dispatch!(this, db => {
+            let (queries, _input) = super::vectors::queries(&query_vectors, db)?;
+            py.detach(|| db.search_batch_with_workspace(&queries, &config, &batch_config))
+        })
         .map_err(to_py_error)?;
 
         results

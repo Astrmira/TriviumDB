@@ -24,6 +24,20 @@ def verify_search_entries(root):
         db.set_memory_limit(0)
         assert db.search_ids([1], payload_filter={"large": {"$exists": True}}, exact=True) == [1]
 
+    with triviumdb.TriviumDB(str(Path(root) / "batch-input.tdb"), dim=128) as db:
+        unit = [1.0] + [0.0] * 127
+        db.insert_with_id(7, unit, {})
+        db.set_memory_limit(1)
+        matrix = memoryview(bytearray(2048 * 128 * 4)).cast("f", shape=(2048, 128))
+        for query in (db.search_ids_batch, db.search_batch):
+            try:
+                query(matrix)
+            except triviumdb.CapacityError as error:
+                assert error.code == "TDB_CAPACITY_RESERVATION_REJECTED"
+            else:
+                raise AssertionError("复制二维输入前必须取得实例额度")
+        assert db.search_ids_batch([unit], exact=True) == [[7]]
+
     half_path = str(Path(root) / "half-rounding.tdb")
     with triviumdb.TriviumDB(half_path, dim=2, dtype="f16") as half:
         half.insert_with_id(1, [1 + 2**-11 + 2**-28, 65519.9999], {})

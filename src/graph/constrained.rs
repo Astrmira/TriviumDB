@@ -29,7 +29,7 @@ pub fn rank_within<T: VectorType>(
         .ok_or_else(|| TriviumError::CapacityAllocationFailed {
             reason: "GraphFirst anchor 工作区溢出 (GraphFirst anchor workspace overflowed)".into(),
         })?;
-    let _workspace = db.resource_runtime().reserve_workspace(bytes)?;
+    let _workspace = db.reserve_instance_workspace(bytes)?;
     let mut anchors = anchor_ids.to_vec();
     anchors.sort_unstable();
     anchors.dedup();

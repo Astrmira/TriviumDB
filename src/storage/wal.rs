@@ -175,7 +175,7 @@ pub struct Wal {
     cumulative_written_bytes: u64,
     cumulative_logical_bytes: u64,
     group_commit_active: bool,
-    group_commit_pending: bool,
+    group_commit_pending: Option<SyncMode>,
     cumulative_sync_count: u64,
     checkpoint_token: Option<[u8; 16]>,
 }
@@ -211,7 +211,7 @@ impl Wal {
     pub(crate) fn release_writer(&mut self) {
         self.writer.take();
         self.group_commit_active = false;
-        self.group_commit_pending = false;
+        self.group_commit_pending = None;
     }
 
     pub fn disabled(db_path: &str, sync_mode: SyncMode) -> Self {
@@ -222,7 +222,7 @@ impl Wal {
             cumulative_written_bytes: 0,
             cumulative_logical_bytes: 0,
             group_commit_active: false,
-            group_commit_pending: false,
+            group_commit_pending: None,
             cumulative_sync_count: 0,
             checkpoint_token: None,
         }
@@ -291,7 +291,7 @@ impl Wal {
             cumulative_written_bytes: base_written,
             cumulative_logical_bytes: 0,
             group_commit_active: false,
-            group_commit_pending: false,
+            group_commit_pending: None,
             cumulative_sync_count: 0,
             checkpoint_token: token.or(clean_token),
         })
@@ -349,11 +349,7 @@ impl Wal {
         if !matches!(entry, WalEntry::Checkpoint { .. }) {
             self.cumulative_logical_bytes = self.cumulative_logical_bytes.saturating_add(len);
         }
-        if self.group_commit_active {
-            self.group_commit_pending = true;
-        } else {
-            self.sync_writer()?;
-        }
+        self.sync_after_append()?;
         Ok(())
     }
 
@@ -418,11 +414,7 @@ impl Wal {
         self.cumulative_logical_bytes = self.cumulative_logical_bytes.saturating_add(logical_bytes);
 
         // Group Commit 中只追加完整事务帧，组尾统一执行同步。
-        if self.group_commit_active {
-            self.group_commit_pending = true;
-        } else {
-            self.sync_writer()?;
-        }
+        self.sync_after_append()?;
         Ok(())
     }
 
@@ -437,7 +429,7 @@ impl Wal {
             ));
         }
         self.group_commit_active = true;
-        self.group_commit_pending = false;
+        self.group_commit_pending = None;
         Ok(())
     }
 
@@ -449,11 +441,10 @@ impl Wal {
             ));
         }
         self.group_commit_active = false;
-        let pending = std::mem::take(&mut self.group_commit_pending);
-        if !pending {
-            return Ok(false);
+        match self.group_commit_pending.take() {
+            Some(mode) => self.sync_writer(mode),
+            None => Ok(false),
         }
-        self.sync_writer()
     }
 
     pub fn stats(&self) -> WalStats {
@@ -464,19 +455,33 @@ impl Wal {
         }
     }
 
-    fn sync_writer(&mut self) -> Result<bool> {
-        let result = self.sync_writer_inner();
+    fn sync_after_append(&mut self) -> Result<()> {
+        if self.group_commit_active {
+            // 已写入帧的持久性要求持续到组结束，运行期调低模式仅影响后续写入。
+            self.group_commit_pending = Some(match (self.group_commit_pending, self.sync_mode) {
+                (Some(SyncMode::Full), _) | (_, SyncMode::Full) => SyncMode::Full,
+                (Some(SyncMode::Normal), _) | (_, SyncMode::Normal) => SyncMode::Normal,
+                _ => SyncMode::Off,
+            });
+        } else {
+            self.sync_writer(self.sync_mode)?;
+        }
+        Ok(())
+    }
+
+    fn sync_writer(&mut self, mode: SyncMode) -> Result<bool> {
+        let result = self.sync_writer_inner(mode);
         if result.is_err() {
             self.release_writer();
         }
         result
     }
 
-    fn sync_writer_inner(&mut self) -> Result<bool> {
+    fn sync_writer_inner(&mut self, mode: SyncMode) -> Result<bool> {
         let Some(writer) = self.writer.as_mut() else {
             return Err(TriviumError::WalClosed);
         };
-        match self.sync_mode {
+        match mode {
             SyncMode::Full => {
                 #[cfg(feature = "test-hooks")]
                 crate::test_hooks::io_result(crate::test_hooks::IoPoint::WalFlush)?;

@@ -644,7 +644,18 @@ fn 分组提交异常子进程() {
             .0
             .is_ok()
     );
-    // 绕过析构，独立验证已经确认的 Full 写入可以恢复。
+    for (id, mode, synced) in [(4, SyncMode::Full, true), (5, SyncMode::Normal, false)] {
+        db.set_sync_mode(mode).unwrap();
+        let (write, physical) = db
+            .group_commit(|db| -> triviumdb::Result<()> {
+                db.insert_with_id(id, &[id as f32; 4], json!({"id":id}))?;
+                db.set_sync_mode(SyncMode::Off)
+            })
+            .unwrap();
+        write.unwrap();
+        assert_eq!(physical, synced);
+    }
+    // 绕过析构，核对 Full 同步与 Normal 刷出缓冲后的恢复内容。
     std::process::exit(0);
 }
 
@@ -678,7 +689,14 @@ fn 分组异常后确认的Full写入跨进程恢复() {
         "分组提交异常子进程启动或执行失败：{status}"
     );
     let mut db = Database::<f32>::open(&path.to_string_lossy(), 4).unwrap();
-    for id in 1..=3 {
+    for id in 4..=5 {
+        let node = db.get(id).unwrap().unwrap();
+        assert_eq!(node.vector, [id as f32; 4]);
+        assert_eq!(node.payload, json!({"id":id}));
+    }
+    db.close().unwrap();
+    let mut db = Database::<f32>::open(&path.to_string_lossy(), 4).unwrap();
+    for id in 1..=5 {
         assert!(
             db.contains(id).unwrap(),
             "Full 确认写入的节点 {id} 必须恢复"

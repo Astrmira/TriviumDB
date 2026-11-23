@@ -381,13 +381,29 @@ impl Stage {
             root,
             check_dir,
         };
-        if !check {
-            if std::fs::symlink_metadata(&stage.root).is_ok() {
-                stage.cleanup(owner)?;
+        if check {
+            write_json(&stage.root.join("owner.json"), owner)?;
+        } else {
+            match std::fs::symlink_metadata(&stage.root) {
+                Ok(meta)
+                    if meta.file_type().is_dir()
+                        && std::fs::read_dir(&stage.root)?.next().is_none() =>
+                {
+                    // 旧工具中断时可能留下空目录。非递归删除只接受仍为空的目录。
+                    std::fs::remove_dir(&stage.root)?;
+                }
+                Ok(_) => stage.cleanup(owner)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
-            std::fs::create_dir(&stage.root)?;
+            let prepared = tempfile::Builder::new()
+                .prefix(&format!(".{stem}.migration-init-"))
+                .tempdir_in(parent)?;
+            write_json(&prepared.path().join("owner.json"), owner)?;
+            triviumdb::database::inspection::sync_directory(prepared.path())?;
+            std::fs::rename(prepared.path(), &stage.root)?;
+            triviumdb::database::inspection::sync_directory(parent)?;
         }
-        write_json(&stage.root.join("owner.json"), owner)?;
         std::fs::create_dir(&stage.database)?;
         std::fs::create_dir(&stage.source)?;
         std::fs::create_dir(&stage.facts)?;
@@ -425,7 +441,21 @@ impl Stage {
             ));
         }
         // 路径由规范父目录和固定目标叶名称生成；删除前校验全部后代均为普通文件或目录。
-        std::fs::remove_dir_all(&self.root)?;
+        // 最后移除归属记录。清理中断后，重试只会遇到完整归属或空目录。
+        let marker = self.root.join("owner.json");
+        for child in std::fs::read_dir(&self.root)? {
+            let child = child?;
+            if child.path() == marker {
+                continue;
+            }
+            if child.file_type()?.is_dir() {
+                std::fs::remove_dir_all(child.path())?;
+            } else {
+                std::fs::remove_file(child.path())?;
+            }
+        }
+        std::fs::remove_file(marker)?;
+        std::fs::remove_dir(&self.root)?;
         Ok(())
     }
 }

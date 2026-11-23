@@ -294,21 +294,8 @@ pub(super) fn sequence_with_fast_path<T>(
     fast: impl Fn(&Bound<'_, PyAny>) -> Option<T>,
     parse: impl Fn(&Bound<'_, PyAny>, &str) -> PyResult<T>,
 ) -> PyResult<Vec<T>> {
-    // SAFETY: Bound 保持对象存活且 GIL 覆盖检测；只调用 CPython 协议检测，不解引用裸内存。
-    let sequence = unsafe { pyo3::ffi::PySequence_Check(value.as_ptr()) != 0 };
-    if !sequence || value.is_instance_of::<PyString>() {
-        return Err(argument_input_error(
-            pyo3::exceptions::PyTypeError::new_err(
-                "参数必须是非字符串序列 (Argument must be a non-string sequence)",
-            ),
-            field,
-            write,
-        ));
-    }
-    // 复用 PyO3 的长度提示容错规则；按真实元素增长，避免相信宿主提供的巨大提示。
-    let _ = value.len();
     let mut result = Vec::new();
-    for (index, item) in value.try_iter()?.enumerate() {
+    for (index, item) in sequence_items(value, field, write)?.enumerate() {
         let item = item?;
         let path = || crate::sdk::field_member(field, &index.to_string());
         let parsed = match fast(&item) {
@@ -328,4 +315,25 @@ pub(super) fn sequence_with_fast_path<T>(
         result.push(parsed);
     }
     Ok(result)
+}
+
+pub(super) fn sequence_items<'py>(
+    value: &Bound<'py, PyAny>,
+    field: &str,
+    write: Option<crate::error::WriteErrorInfo>,
+) -> PyResult<Bound<'py, pyo3::types::PyIterator>> {
+    // SAFETY: Bound 保持对象存活且 GIL 覆盖检测；只调用 CPython 协议检测，不解引用裸内存。
+    let sequence = unsafe { pyo3::ffi::PySequence_Check(value.as_ptr()) != 0 };
+    if !sequence || value.is_instance_of::<PyString>() {
+        return Err(argument_input_error(
+            pyo3::exceptions::PyTypeError::new_err(
+                "参数必须是非字符串序列 (Argument must be a non-string sequence)",
+            ),
+            field,
+            write,
+        ));
+    }
+    // 沿用宿主序列长度提示协议，实际容量始终依据消费的元素确定。
+    let _ = value.len();
+    value.try_iter()
 }

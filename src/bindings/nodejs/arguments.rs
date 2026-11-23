@@ -198,13 +198,20 @@ fn array_value<T>(
     write: Option<crate::error::WriteErrorInfo>,
     mut parse: impl FnMut(Env, JsUnknown, &str) -> napi::Result<T>,
 ) -> napi::Result<Vec<T>> {
-    array_items(env, value, field, write, |item, index| {
-        parse(
-            env,
-            item,
-            &crate::sdk::field_member(field, &index.to_string()),
-        )
-    })
+    array_items(
+        env,
+        value,
+        field,
+        write,
+        |_| Ok(()),
+        |item, index| {
+            parse(
+                env,
+                item,
+                &crate::sdk::field_member(field, &index.to_string()),
+            )
+        },
+    )
 }
 
 fn array_items<T>(
@@ -212,6 +219,7 @@ fn array_items<T>(
     value: JsUnknown,
     field: &str,
     write: Option<crate::error::WriteErrorInfo>,
+    admit: impl FnOnce(usize) -> napi::Result<()>,
     mut parse: impl FnMut(JsUnknown, u32) -> napi::Result<T>,
 ) -> napi::Result<Vec<T>> {
     let invalid = || {
@@ -230,7 +238,9 @@ fn array_items<T>(
         return Err(invalid());
     }
     let mut result = Vec::new();
-    for index in 0..array.get_array_length()? {
+    let length = array.get_array_length()?;
+    admit(length as usize)?;
+    for index in 0..length {
         let item = parse(array.get_element(index)?, index)?;
         result.try_reserve(1).map_err(|error| {
             let error = crate::TriviumError::CapacityAllocationFailed {
@@ -292,7 +302,18 @@ pub(super) fn vector_numbers(
     check_u64: bool,
     write: Option<crate::error::WriteErrorInfo>,
 ) -> napi::Result<Vec<f64>> {
-    array_items(env, value, field, write, |item, index| {
+    vector_numbers_admitted(env, value, field, check_u64, write, |_| Ok(()))
+}
+
+pub(super) fn vector_numbers_admitted(
+    env: Env,
+    value: JsUnknown,
+    field: &str,
+    check_u64: bool,
+    write: Option<crate::error::WriteErrorInfo>,
+    admit: impl FnOnce(usize) -> napi::Result<()>,
+) -> napi::Result<Vec<f64>> {
+    array_items(env, value, field, write, admit, |item, index| {
         let path = || crate::sdk::field_member(field, &index.to_string());
         // JsNumber 的转换检查实际类型，逐元素读取 getter 一次，仅失败时生成成员路径。
         let number = napi::JsNumber::try_from(item)

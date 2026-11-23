@@ -207,7 +207,7 @@ Rust `Database::commit_tx` 和 `Transaction::commit` 按值取得操作，进入
 
 Node `commitTransaction` 的 Core 拒绝保留相同字段，绑定内已知的构造校验与同步重入拒绝提供相应阶段和 `transaction_consumed=false`。Node 参数数组由调用方继续持有，消费字段描述绑定生成的内核操作缓冲。参数自动提取和宿主自行抛出的异常继续使用各自语言契约。
 
-分组提交在组尾完成同步。组尾失败返回 `group_sync/unknown`，消费字段省略。Server 将该错误逐一送回本组已经成功执行的等待请求，独立操作已返回的校验或执行错误保持原字段。分组准入失败将 `admission/not_committed` 送回尚未执行的请求。
+分组提交在组尾按组内实际写入采用的最高同步强度完成同步。组尾失败返回 `group_sync/unknown`，消费字段省略。Server 将该错误逐一送回本组已经成功执行的等待请求，独立操作已返回的校验或执行错误保持原字段。分组准入失败将 `admission/not_committed` 送回尚未执行的请求。
 
 Server 入队前的关闭、过期和队列满，以及 Worker 明确拒绝的待执行请求，提供 `admission/not_committed`。入队后等待响应超时或响应通道丢失，提供 `response/unknown`。Server 省略这些边界的消费字段，具体事务的执行结果由有效回执或事实对账确认。
 
