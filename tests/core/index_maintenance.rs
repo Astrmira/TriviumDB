@@ -6,6 +6,80 @@ use serde_json::json;
 use triviumdb::database::{AccessMode, Config, StorageMode};
 use triviumdb::{Database, VectorType};
 
+#[test]
+fn 查询限额和制品统计在重开前后一致() {
+    use triviumdb::query::tql_executor::TqlValue;
+    let root = super::support::TestDir::new("limit-and-stats");
+    let path = root.file("records.tdb");
+    let cfg = Config {
+        dim: 1,
+        auto_build_quiver: false,
+        payload_cache_bytes: 0,
+        ..Default::default()
+    };
+    let mut db = Database::<f32>::open_with_config(&path, cfg).unwrap();
+    db.insert_with_id(1, &[1.], json!({"g":1})).unwrap();
+    db.insert_with_id(2, &[1.], json!({"g":2,"p":"x".repeat(600_000)}))
+        .unwrap();
+    db.link(1, 2, "next", 1.).unwrap();
+    db.close().unwrap();
+    let mut db = Database::<f32>::open_with_config(&path, cfg).unwrap();
+    db.set_memory_limit(db.estimated_memory() + 1).unwrap();
+    assert_eq!(
+        db.neighbors(1, 1).unwrap_err().code(),
+        "TDB_CAPACITY_RESERVATION_REJECTED"
+    );
+    assert_eq!(
+        db.tql("MATCH (n {id:1}) RETURN n.id AS n")
+            .unwrap_err()
+            .code(),
+        "TDB_CAPACITY_RESERVATION_REJECTED"
+    );
+    db.set_memory_limit(0).unwrap();
+    assert_eq!(db.neighbors(1, 1).unwrap(), [2]);
+    for indexed in [false, true] {
+        if indexed {
+            db.set_memory_limit(0).unwrap();
+            db.create_index("g").unwrap();
+        }
+        db.set_memory_limit(1 << 20).unwrap();
+        let rows = db.tql("FIND {g:1} RETURN _.id AS n LIMIT 1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0]["n"], TqlValue::Int(1)));
+        assert!(
+            db.tql("FIND {g:2} RETURN _.id AS n ORDER BY n LIMIT 0")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.tql("MATCH (n {id:2}) WHERE n.g == 99 RETURN n.id")
+                .unwrap_err()
+                .code(),
+            "TDB_CAPACITY_RESERVATION_REJECTED"
+        );
+        assert!(
+            db.tql("FIND {g:2} RETURN _.id AS n LIMIT 0")
+                .unwrap()
+                .is_empty()
+        );
+    }
+    assert_eq!(db.index_memory_stats().posting_entries, 2);
+    db.set_memory_limit(0).unwrap();
+    db.close().unwrap();
+    let mut db = Database::<f32>::open_read_only(&path, 1).unwrap();
+    assert!(db.storage_info().sidecars[".pld"]);
+    assert_eq!(db.index_memory_stats().posting_entries, 2);
+    let fields = db.index_info().unwrap();
+    assert_eq!(
+        fields
+            .iter()
+            .map(|f| (&*f.field, f.entry_count))
+            .collect::<Vec<_>>(),
+        [("g", 2)]
+    );
+    db.close().unwrap();
+}
+
 fn matrix<T: VectorType + serde::Serialize + serde::de::DeserializeOwned>(dtype: &str) {
     let root = super::support::TestDir::new(dtype);
     let contract = maintenance::contract();

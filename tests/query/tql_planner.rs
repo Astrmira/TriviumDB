@@ -523,7 +523,14 @@ fn explain_limit_只对允许提前停止的查询标注优化() {
     db.create_ordered_index("sequence").unwrap();
     let ordered = plan(&db, "EXPLAIN FIND {sequence: {$gte: 0}} RETURN * LIMIT 10");
     assert_eq!(ordered["access_path"]["kind"], "ordered_property_index");
-    assert_eq!(ordered["estimated_rows"], 11);
+    assert_eq!(ordered["estimated_rows"], 10);
+    let rows = db
+        .tql_nodes("FIND {sequence: {$gte: 0}} RETURN * LIMIT 10")
+        .unwrap();
+    assert_eq!(
+        rows.iter().map(|row| row["_"].id).collect::<Vec<_>>(),
+        (1..=10).collect::<Vec<_>>()
+    );
     drop(db);
     cleanup(&path);
 }

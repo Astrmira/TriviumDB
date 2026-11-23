@@ -200,7 +200,7 @@ Server 不为认知算子维护另一套 HTTP API；`TEXT`、`RESIDUAL`、`DIVER
 
 TQL 普通 JSON、`/v1/search/vector` 和 `/v1/nodes/batch-get` 在编码过程中执行 16 MiB 响应上限。超限返回 `413 TDB_HTTP_RESPONSE_TOO_LARGE`。TQL 可缩小投影、设置 `LIMIT` 或使用 NDJSON，向量检索可降低 `top_k`，批量读取可拆分 ID 列表。
 
-请求头设置 `Accept: application/x-ndjson` 时，响应按 `meta → row... → summary` 输出；`meta.columns` 明确声明每个投影列的 `node`、`edge`、`path` 或标量类型。同一列含多种非空类型时标记为 `mixed`，只有空值或零行时标记为 `null`。普通 JSON 响应也在顶层 `columns` 返回相同元数据。HTTP 输出逐行生成，但排序、聚合和 Top-K 等 Core 算子仍可能先物化结果。
+查询默认返回 JSON。请求支持通过 `Accept` 指定媒体类型和权重，例如 `application/x-ndjson;q=1.0, application/json;q=0.5`。两种格式均不可接受时返回 HTTP 406。选择 NDJSON 时，响应按 `meta → row... → summary` 输出；`meta.columns` 明确声明每个投影列的 `node`、`edge`、`path` 或标量类型。同一列含多种非空类型时标记为 `mixed`，只有空值或零行时标记为 `null`。普通 JSON 响应也在顶层 `columns` 返回相同元数据。HTTP 输出逐行生成，但排序、聚合和 Top-K 等 Core 算子仍可能先物化结果。
 
 普通及 Prepared TQL 的空结果保留静态投影列名。没有结果值可推断类型时，`kind` 为 `null`。查询诊断的字节位置按客户端提交的原始 UTF-8 计算。
 
@@ -274,7 +274,7 @@ Content-Type: application/vnd.triviumdb.vector+f32
 ## OCC、幂等与错误模型
 
 - 全局 ETag 为 `"<epoch>-g<n>"`，成功写入后递增；
-- `GET /v1/nodes/{id}` 返回节点和边 ETag；
+- `GET /v1/nodes/{id}` 的 HTTP ETag 覆盖整个响应，包括全库 generation。响应的 `version` 字段是节点版本，可交给 `expectedNodes` 校验；其他节点的独立写入只推进全库代际。
 - `If-Match`、`expectedGeneration`、`expectedNodes` 和 `expectedEdges` 提供 OCC；
 - 删除节点或边后移除对应版本条目，并更新仍存在的关联节点版本。对已删除实体使用旧 ETag 会返回冲突。TQL 写入统一推进细粒度版本代际并释放旧版本表。
 - Core 版本不匹配返回 `409 TDB_WRITE_CONFLICT`，HTTP 前置头条件拒绝使用 `TDB_HTTP_PRECONDITION_FAILED` 并保留 `legacyCode=WRITE_CONFLICT`。

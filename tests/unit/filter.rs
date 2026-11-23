@@ -382,6 +382,11 @@ fn from_json_exists_非布尔报错() {
 
 #[test]
 fn from_json_size_非正整数报错() {
+    let wide = Filter::from_json(&json!({"x":{"$size":1u64<<32}}));
+    #[cfg(target_pointer_width = "32")]
+    assert!(wide.is_err());
+    #[cfg(target_pointer_width = "64")]
+    assert!(!wide.unwrap().matches(&json!({"x":[]})));
     let r = Filter::from_json(&json!({"x": {"$size": "big"}}));
     assert!(r.is_err());
 }

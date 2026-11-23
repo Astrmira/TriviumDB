@@ -202,21 +202,17 @@ pub(crate) fn dpp_greedy_wide(
     quality_weight: f32,
 ) -> Vec<usize> {
     let n = scores.len();
-    if n <= k {
-        return (0..n).collect();
+    let k = k.min(n);
+    if k == 0 {
+        return Vec::new();
     }
 
     // L2 归一化，用于计算余弦相似度核
     let normed: Vec<Vec<f32>> = vecs
         .iter()
         .map(|v| {
-            let norm = v
-                .iter()
-                .map(|&x| f64::from(x).powi(2))
-                .sum::<f64>()
-                .sqrt()
-                .max(1e-10);
-            let inv = 1.0 / norm;
+            let norm = v.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>().sqrt();
+            let inv = if norm > 0.0 { norm.recip() } else { 0.0 };
             v.iter().map(|&x| (f64::from(x) * inv) as f32).collect()
         })
         .collect();
@@ -462,19 +458,21 @@ pub fn nmf_analyze_query(
     k: usize,
     d: usize,
 ) -> (f32, usize, f32, Vec<f32>) {
-    let q_abs: Vec<f32> = query.iter().map(|&x| x.abs()).collect();
-
-    // 投影主题 q @ H.T -> (k,)
-    let mut raw_scores = vec![0.0f32; k];
-    for ki in 0..k {
-        raw_scores[ki] = dot(&q_abs, &h_flat[ki * d..(ki + 1) * d]);
+    let q_abs: Vec<f64> = query.iter().map(|&x| f64::from(x).abs()).collect();
+    let mut raw_scores = vec![0.0f64; k];
+    for (ki, score) in raw_scores.iter_mut().enumerate() {
+        *score = q_abs
+            .iter()
+            .zip(&h_flat[ki * d..(ki + 1) * d])
+            .map(|(q, &h)| q * f64::from(h))
+            .sum();
     }
-
-    // 主题权重 Softmax 操作
-    let max_s = raw_scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let exp_scores: Vec<f32> = raw_scores.iter().map(|&s| (s - max_s).exp()).collect();
-    let sum_exp: f32 = exp_scores.iter().sum();
-    let q_topics: Vec<f32> = exp_scores.iter().map(|&e| e / (sum_exp + 1e-10)).collect();
+    let max_s = raw_scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    for s in &mut raw_scores {
+        *s = (*s - max_s).exp();
+    }
+    let sum_exp: f64 = raw_scores.iter().sum();
+    let q_topics: Vec<f32> = raw_scores.iter().map(|s| (s / sum_exp) as f32).collect();
 
     // 1. 语义聚焦深度 = 1 - 归一化信息熵 (完全均匀发布意味着毫无深度)
     let entropy: f32 = q_topics
@@ -489,19 +487,27 @@ pub fn nmf_analyze_query(
     let topic_coverage = q_topics.iter().filter(|&&p| p > threshold).count();
 
     // 3. 意图新颖脱轨程度: 当 H 矩阵重构不出 Query 的真实全貌，即代表有未被索引的“新颖逻辑”
-    let mut q_recon = vec![0.0f32; d];
+    let mut q_recon = vec![0.0f64; d];
     for ki in 0..k {
         let w = q_topics[ki];
         if w > 1e-10 {
             for di in 0..d {
-                q_recon[di] += w * h_flat[ki * d + di];
+                q_recon[di] += f64::from(w) * f64::from(h_flat[ki * d + di]);
             }
         }
     }
-    let diff = vec_sub(&q_abs, &q_recon);
-    let q_norm = l2_norm(&q_abs).max(1e-10);
-    // 约束到 0..=1 内部
-    let novelty = (l2_norm(&diff) / q_norm).min(1.0);
+    let diff = q_abs
+        .iter()
+        .zip(q_recon)
+        .map(|(q, r)| (q - r).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let q_norm = q_abs.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let novelty = if q_norm > 0.0 {
+        (diff / q_norm).min(1.0) as f32
+    } else {
+        f32::from(diff > 0.0)
+    };
 
     (semantic_depth, topic_coverage, novelty, q_topics)
 }

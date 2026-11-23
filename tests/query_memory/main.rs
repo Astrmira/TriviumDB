@@ -226,17 +226,19 @@ fn sample(path: &str, mode: StorageMode) -> Database<f32> {
     db
 }
 
-fn rejected<T: std::fmt::Debug>(result: triviumdb::Result<T>) {
-    assert!(
-        matches!(
-            result.as_ref().unwrap_err().underlying(),
-            TriviumError::ResourceBudgetExceeded {
-                resource: "query_memory_bytes",
-                ..
-            }
-        ),
-        "{result:?}"
-    );
+fn rejected<T: std::fmt::Debug>(result: triviumdb::Result<T>, limit: usize) {
+    match result.unwrap_err().underlying() {
+        TriviumError::CapacityReservationRejected {
+            estimated_bytes,
+            current_bytes,
+            memory_limit,
+            ..
+        } => {
+            assert_eq!(*memory_limit, limit);
+            assert!(current_bytes.saturating_add(*estimated_bytes) > limit);
+        }
+        error => panic!("实例工作区应在分配前拒绝，实际为 {error:?}"),
+    }
 }
 
 #[test]
@@ -253,14 +255,14 @@ fn 多变量快照和写匹配在复制前拒绝并限制实际分配峰值() {
             "OPTIONAL MATCH (a)-[:rel]->(b) RETURN a,b",
         ] {
             let (result, peak) = measured(|| db.tql_values(query));
-            rejected(result);
+            rejected(result, LIMIT);
             assert!(
                 peak <= LIMIT,
                 "{mode:?}/{query}: 实际查询线程峰值 {peak} 超过 {LIMIT}"
             );
         }
         let (result, peak) = measured(|| db.tql_mut("MATCH (a)-[:rel]->(b) SET a.touched == true"));
-        rejected(result);
+        rejected(result, LIMIT);
         assert!(peak <= LIMIT, "写查询实际峰值 {peak} 超过 {LIMIT}");
         for id in 1..=20 {
             assert!(
@@ -305,7 +307,7 @@ fn 长字面量按投影行数计入内存准入() {
     let literal = "v".repeat(65536);
     let query = format!("FIND {{k:1}} RETURN \"{literal}\" AS value");
     db.set_memory_limit(1 << 20).unwrap();
-    rejected(db.tql(&query));
+    rejected(db.tql(&query), 1 << 20);
     db.set_memory_limit(0).unwrap();
     let rows = db.tql(&query).unwrap();
     assert_eq!(rows.len(), 20);

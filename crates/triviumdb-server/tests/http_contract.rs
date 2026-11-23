@@ -861,6 +861,11 @@ async fn 节点级occ允许无关节点更新并拒绝过期版本() {
     .await;
     assert_eq!(update1.status(), StatusCode::OK);
 
+    let new_node2 = request(app.clone(), "GET", "/v1/nodes/2", None, &[]).await;
+    assert_ne!(
+        new_node2.headers()[header::ETAG].to_str().unwrap(),
+        node2_etag
+    );
     let unrelated = request(
         app.clone(),
         "POST",
@@ -1533,6 +1538,38 @@ async fn prepared_cache参数绑定profile和淘汰契约完整() {
 #[tokio::test]
 async fn ndjson分块协议包含meta_rows_summary与profile() {
     let (app, _directory) = app("ndjson").await;
+    for (accept, status) in [
+        (
+            "application/x-ndjson;q=0, application/*;q=0.8",
+            StatusCode::OK,
+        ),
+        (
+            "application/json;q=0, application/x-ndjson;q=0",
+            StatusCode::NOT_ACCEPTABLE,
+        ),
+    ] {
+        let response = request(
+            app.clone(),
+            "POST",
+            "/v1/tql",
+            Some(serde_json::json!({"query": r#"FIND {kind: "stream"} RETURN _.id AS id"#})),
+            &[("accept", accept)],
+        )
+        .await;
+        assert_eq!(response.status(), status);
+        if status == StatusCode::OK {
+            assert_eq!(response.headers()[header::VARY], "accept");
+            assert!(
+                response.headers()[header::CONTENT_TYPE]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("application/json")
+            );
+            assert_eq!(json(response).await["rows"], serde_json::json!([]));
+        } else {
+            assert_eq!(json(response).await["code"], "TDB_HTTP_NOT_ACCEPTABLE");
+        }
+    }
     request(
         app.clone(),
         "POST",
@@ -1546,7 +1583,10 @@ async fn ndjson分块协议包含meta_rows_summary与profile() {
         "POST",
         "/v1/tql",
         Some(serde_json::json!({"query": "FIND {kind: \"stream\"} RETURN *", "profile": true})),
-        &[("accept", "application/x-ndjson")],
+        &[(
+            "accept",
+            "application/json;q=0.4, application/x-ndjson;q=1.0",
+        )],
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);

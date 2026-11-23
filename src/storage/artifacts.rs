@@ -54,17 +54,22 @@ pub const RESERVED_SUFFIXES: &[&str] = &[
 
 /// 判断同一目录中的名称是否属于数据库保留名称族。
 pub fn is_reserved_name(candidate: &str, database: &str) -> bool {
+    reserved_suffix(candidate, database).is_some()
+}
+
+/// 返回实际文件名中的保留后缀，主文件对应空字符串。
+pub fn reserved_suffix<'a>(candidate: &'a str, database: &str) -> Option<&'a str> {
     #[cfg(windows)]
     let candidate = candidate.trim_end_matches(['.', ' ']);
     if names_equal(candidate, database) {
-        return true;
+        return Some("");
     }
-    candidate.match_indices('.').any(|(at, _)| {
+    candidate.match_indices('.').find_map(|(at, _)| {
         let (stem, suffix) = candidate.split_at(at);
         if !names_equal(stem, database) {
-            return false;
+            return None;
         }
-        RESERVED_SUFFIXES
+        (RESERVED_SUFFIXES
             .iter()
             .any(|prefix| names_equal(suffix, prefix))
             || suffix.match_indices('.').skip(1).any(|(end, _)| {
@@ -74,7 +79,8 @@ pub fn is_reserved_name(candidate: &str, database: &str) -> bool {
             })
             || suffix
                 .split_once('-')
-                .is_some_and(|(prefix, _)| names_equal(prefix, ".qssd"))
+                .is_some_and(|(prefix, _)| names_equal(prefix, ".qssd")))
+        .then_some(suffix)
     })
 }
 

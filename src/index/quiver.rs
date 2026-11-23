@@ -927,6 +927,7 @@ pub struct QuIVer {
     connectivity_parents: Vec<u32>,
 }
 
+#[derive(Clone, Copy, PartialEq)]
 pub struct QuIVerConfig {
     pub m: usize,
     pub ef_construction: usize,
@@ -972,6 +973,12 @@ impl QuIVerSearchConfig {
 }
 
 impl QuIVer {
+    pub(crate) fn matches_build_config(&self, config: &QuIVerConfig) -> bool {
+        self.m == config.m
+            && self.ef_construction == config.ef_construction
+            && self.alpha == config.alpha
+    }
+
     pub fn new(dim: usize, config: &QuIVerConfig) -> Self {
         assert!(
             dim <= crate::index::bq::MAX_BQ_DIM,

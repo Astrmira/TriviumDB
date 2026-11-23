@@ -21,6 +21,7 @@ pub enum ConcurrencyPoint {
     QuiverColdAfterPublish,
     /// 命名图复制前的受控读视图，用于取消和资源归还验收。
     NamedGraphRead,
+    NeighborhoodEdges,
     /// 文档精确向量评分及ANN导航的受控执行点。
     DocumentRecordCommitted,
     DocumentVectorStep,

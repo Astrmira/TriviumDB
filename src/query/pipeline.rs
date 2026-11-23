@@ -499,7 +499,7 @@ pub struct PipelineContext<'a, T: VectorType> {
     vector_read_bytes: usize,
     payload_meter: Arc<crate::request::PayloadMeter>,
     workspace_bytes: usize,
-    workspaces: Vec<crate::resources::WorkspaceReservation>,
+    workspaces: Vec<crate::resources::RequestWorkspace>,
 }
 
 impl<'a, T: VectorType> PipelineContext<'a, T> {
@@ -535,13 +535,15 @@ impl<'a, T: VectorType> PipelineContext<'a, T> {
                 .map_or(0, |graph| graph.reserved_bytes());
             self.memtable.ensure_additional_memory(
                 self.database_memory_limit,
-                bytes.saturating_add(graph_bytes),
+                bytes
+                    .saturating_sub(self.workspace_bytes)
+                    .saturating_add(graph_bytes),
             )?;
         }
         if bytes > self.workspace_bytes {
             let extra = bytes - self.workspace_bytes;
             self.workspaces
-                .push(self.memtable.resource_runtime().reserve_workspace(extra)?);
+                .push(self.memtable.reserve_instance_workspace(extra)?);
             self.workspace_bytes = bytes;
         }
         Ok(())
@@ -717,7 +719,7 @@ pub fn execute_pipeline<T: VectorType>(
 pub(crate) fn execute_pipeline_with_workspace<T: VectorType>(
     context: &mut PipelineContext<'_, T>,
     operators: &[Box<dyn PipelineOperator<T> + '_>],
-) -> Result<(NodeSet, Vec<crate::resources::WorkspaceReservation>)> {
+) -> Result<(NodeSet, Vec<crate::resources::RequestWorkspace>)> {
     let mut workspace = PipelineWorkspace(context);
     workspace.metrics.clear();
     workspace.stages = 0;
@@ -829,10 +831,7 @@ fn scan_nodes<T: VectorType>(
     for id in context.memtable.active_node_ids() {
         crate::request::check_current()?;
         if let Some(filter) = filter
-            && !context
-                .memtable
-                .try_get_payload(id)?
-                .is_some_and(|payload| filter.matches(&payload))
+            && !context.memtable.matches_payload_filter(id, filter)?
         {
             continue;
         }
@@ -1129,10 +1128,7 @@ impl<T: VectorType> PipelineOperator<T> for DppDiversify {
                 "DPP 超过临时内存预算 (DPP exceeds temporary memory budget)".into(),
             ));
         }
-        let _matrix_workspace = context
-            .memtable
-            .resource_runtime()
-            .reserve_workspace(temp_bytes)?;
+        let _matrix_workspace = context.memtable.reserve_instance_workspace(temp_bytes)?;
         context.charge_vectors(input.len())?;
         let mut rows = input.into_rows();
         rows.sort_by_key(|row| row.id);
@@ -1212,10 +1208,7 @@ impl<T: VectorType> PipelineOperator<T> for FistaResidualRecall<T> {
                 "FISTA Gram 矩阵超过临时内存预算 (FISTA Gram matrix exceeds temporary memory budget)".into(),
             ));
         }
-        let _matrix_workspace = context
-            .memtable
-            .resource_runtime()
-            .reserve_workspace(gram_bytes)?;
+        let _matrix_workspace = context.memtable.reserve_instance_workspace(gram_bytes)?;
         context.charge_vectors(input.len())?;
         let entities = input
             .rows()
@@ -1343,10 +1336,7 @@ impl<T: VectorType> PipelineOperator<T> for NmfTopics {
                 "NMF 矩阵超过临时内存预算 (NMF matrices exceed temporary memory budget)".into(),
             ));
         }
-        let _matrix_workspace = context
-            .memtable
-            .resource_runtime()
-            .reserve_workspace(matrix_bytes)?;
+        let _matrix_workspace = context.memtable.reserve_instance_workspace(matrix_bytes)?;
         context.charge_vectors(input.len())?;
         let mut rows = input.into_rows();
         rows.sort_by_key(|row| row.id);
@@ -1614,12 +1604,17 @@ impl<T: VectorType> PipelineOperator<T> for PayloadFilter {
     }
 
     fn apply(&self, mut input: NodeSet, context: &mut PipelineContext<'_, T>) -> Result<NodeSet> {
-        input.rows.retain(|row| {
-            context
+        let mut retained = 0;
+        for index in 0..input.rows.len() {
+            if context
                 .memtable
-                .get_payload(row.id)
-                .is_some_and(|payload| self.filter.matches(&payload))
-        });
+                .matches_payload_filter(input.rows[index].id, &self.filter)?
+            {
+                input.rows.swap(retained, index);
+                retained += 1;
+            }
+        }
+        input.rows.truncate(retained);
         Ok(input)
     }
 }
@@ -3023,6 +3018,7 @@ impl<T: VectorType> PipelineOperator<T> for SaPprOperator {
             self.max_edges_per_node,
             self.min_edge_weight,
             crate::database::EdgeDirection::Outgoing,
+            &mut crate::graph::traversal::FatigueDelta::default(),
             admit,
         )?;
         context.record_graph_work(admitted.visited_nodes, admitted.examined_edges);

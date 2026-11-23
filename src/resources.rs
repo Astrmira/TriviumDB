@@ -736,6 +736,9 @@ pub(crate) struct RequestWorkspace {
 }
 
 impl RequestWorkspace {
+    pub(crate) fn bytes(&self) -> usize {
+        self.shared.bytes()
+    }
     pub(crate) fn reserve(
         runtime: &ResourceRuntime,
         ledger: &Arc<AtomicUsize>,

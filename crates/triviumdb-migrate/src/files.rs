@@ -97,6 +97,27 @@ pub(crate) struct SourceFile {
     pub sha256: String,
 }
 
+#[cfg(all(test, windows))]
+#[test]
+fn 迁移清单从实际文件名取得代际后缀() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("Ⱥ.tdb");
+    std::fs::write(&base, b"db").unwrap();
+    std::fs::write(dir.path().join("ⱥ.tdb.wal"), b"wal").unwrap();
+    let files = inventory(&base, 5).unwrap();
+    assert_eq!(
+        files.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["", ".wal"]
+    );
+    for (suffix, bytes) in [("", b"db".as_slice()), (".wal", b"wal".as_slice())] {
+        assert_eq!(files[suffix].bytes, bytes.len() as u64);
+        assert_eq!(
+            std::fs::read(dir.path().join(format!("Ⱥ.tdb{suffix}"))).unwrap(),
+            bytes
+        );
+    }
+}
+
 pub(crate) fn inventory(source: &Path, maximum: u64) -> Result<BTreeMap<String, SourceFile>> {
     let parent = source.parent().ok_or_else(|| {
         Failure::new(
@@ -116,10 +137,9 @@ pub(crate) fn inventory(source: &Path, maximum: u64) -> Result<BTreeMap<String, 
         let item = item?;
         let name = item.file_name();
         let Some(name) = name.to_str() else { continue };
-        if !triviumdb::storage::artifacts::is_reserved_name(name, base) {
+        let Some(suffix) = triviumdb::storage::artifacts::reserved_suffix(name, base) else {
             continue;
-        }
-        let suffix = &name[base.len()..];
+        };
         if suffix.eq_ignore_ascii_case(".lock") {
             continue;
         }

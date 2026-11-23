@@ -831,7 +831,7 @@ fn quiver_手动构建和失效() {
 }
 
 #[test]
-fn quiver_事务同步超过退化阈值后立即重建() {
+fn quiver_事务同步失效退化索引并保留存活节点() {
     use triviumdb::index::quiver::QuIVerConfig;
     use triviumdb::storage::wal::WalEntry;
 
@@ -848,7 +848,10 @@ fn quiver_事务同步超过退化阈值后立即重建() {
 
     mt.quiver_sync_tx_entries(&[WalEntry::Delete { id: 1 }, WalEntry::Delete { id: 2 }]);
 
-    let quiver = mt.quiver().expect("事务提交后必须恢复可用的 QuIVer 索引");
+    assert!(mt.quiver().is_none());
+    assert_eq!(mt.active_node_ids().collect::<Vec<_>>(), [3, 4, 5]);
+    mt.build_quiver(&QuIVerConfig::default());
+    let quiver = mt.quiver().expect("显式重建后须包含存活节点");
     assert_eq!(quiver.total_count(), 3);
     assert_eq!(quiver.active_count(), 3);
 }

@@ -165,10 +165,7 @@ fn check_hook_error(ctx: &mut HookContext) -> Result<()> {
 /// 将 ~500 行的检索实现独立为专门文件，便于维护和测试。
 pub(crate) fn execute_pipeline_with_limit<T: VectorType>(
     memtable: &Arc<RwLock<MemTable<T>>>,
-    quiver_builds: &Arc<(
-        std::sync::Mutex<std::collections::HashSet<u64>>,
-        std::sync::Condvar,
-    )>,
+    quiver_builds: &super::QuiverBuilds,
     memory_limit: usize,
     hook: &Arc<dyn SearchHook>,
     query_text: Option<&str>,
@@ -184,7 +181,7 @@ pub(crate) fn execute_pipeline_with_limit<T: VectorType>(
     let runtime = read_or_recover(memtable).resource_runtime().clone();
     let quiver_config = crate::index::quiver::QuIVerConfig::default();
     let mut safe_cfg = config.clone();
-    let (auto_build_snapshot, _build_workspace) = {
+    let prepared = {
         let mt = read_or_recover(memtable);
         mt.ensure_readable()?;
         sanitize_config::<T>(&mut safe_cfg, mt.dim())?;
@@ -196,29 +193,34 @@ pub(crate) fn execute_pipeline_with_limit<T: VectorType>(
             && query_vector.is_some()
             && !config.force_brute_force
             && mt.auto_quiver_build_needed()
+            && let Ok(guard) =
+                try_start_quiver_build(quiver_builds, mt.vector_generation(), &quiver_config)
         {
             let workspace = mt.reserve_request_workspace(
                 memory_limit,
                 mt.quiver_build_peak_bytes(&quiver_config),
             )?;
-            (mt.quiver_build_snapshot(), Some(workspace))
+            mt.quiver_build_snapshot()
+                .map(|snapshot| (snapshot, guard, workspace))
         } else {
-            (None, None)
+            None
         }
     };
-    if let Some(snapshot) = auto_build_snapshot
-        && let Some(_build_guard) = try_start_quiver_build(quiver_builds, snapshot.generation)
-    {
+    if let Some((snapshot, _guard, _workspace)) = prepared {
         let source_generation = snapshot.generation;
         let index = runtime
             .pool(runtime.parallelism())?
             .install(|| MemTable::<T>::build_quiver_snapshot(snapshot, &quiver_config));
         #[cfg(feature = "test-hooks")]
         crate::test_hooks::hit(crate::test_hooks::ConcurrencyPoint::BeforeQuiverPublish);
-        let _ = write_or_recover(memtable).publish_quiver_if_current(source_generation, index);
+        let published =
+            write_or_recover(memtable).publish_quiver_if_current(source_generation, index);
+        _guard
+            .flight
+            .published
+            .store(published, std::sync::atomic::Ordering::Release);
     }
 
-    drop(_build_workspace);
     let mt = read_or_recover(memtable);
     mt.ensure_readable()?;
     #[cfg(feature = "test-hooks")]
@@ -309,6 +311,13 @@ pub(crate) fn execute_pipeline_with_limit<T: VectorType>(
         return Ok(PipelineOutput::empty());
     }
 
+    if safe_cfg.enable_refractory_fatigue && !config.enable_refractory_fatigue {
+        return Err(crate::TriviumError::InvalidInput(
+            "Hook 启用疲劳需要调用方显式授权 (Enabling fatigue in a hook requires caller opt-in)"
+                .into(),
+        )
+        .at_field("enable_refractory_fatigue"));
+    }
     sanitize_config::<T>(&mut safe_cfg, dim)?;
     let _query_workspace = (!pure_vector)
         .then(|| reserve_candidate_workspace(&mt, None))
@@ -388,7 +397,7 @@ pub(crate) fn execute_pipeline_with_limit<T: VectorType>(
         }
     } else {
         // QuIVer 构建已完成；精确回退直接读取基础层和增量层。
-        recall_text_ranked(&mt, config, query_text, &mut sparse_ranking);
+        recall_text_ranked(&mt, config, query_text, &mut sparse_ranking)?;
         let vector_recall_started = std::time::Instant::now();
         let vector_limit = if pure_vector {
             config.top_k
@@ -441,7 +450,7 @@ pub(crate) fn execute_pipeline_with_limit<T: VectorType>(
                     .ok_or_else(|| crate::error::TriviumError::CapacityAllocationFailed {
                         reason: "残差查询工作区估算溢出".into(),
                     })?;
-                Some(runtime.reserve_workspace(cells)?)
+                Some(mt.reserve_instance_workspace(cells)?)
             } else {
                 None
             };
@@ -520,6 +529,7 @@ pub(crate) fn execute_pipeline_with_limit<T: VectorType>(
     //  L6 + L7: SA-PPR 有限深度图谱扩散 + 不应期/侧向抑制
     // ═══════════════════════════════════════════════════════
     let t_graph = std::time::Instant::now();
+    let mut fatigue = crate::graph::traversal::FatigueDelta::default();
     let mut expanded = crate::graph::traversal::expand_graph_with_labels_checked(
         &*mt,
         seeds,
@@ -533,6 +543,7 @@ pub(crate) fn execute_pipeline_with_limit<T: VectorType>(
         config.max_edges_per_node,
         config.min_edge_weight,
         config.edge_direction,
+        &mut fatigue,
         crate::request::check_current,
         |scores| {
             let bytes = hit_payload_bytes(
@@ -545,6 +556,7 @@ pub(crate) fn execute_pipeline_with_limit<T: VectorType>(
             )?;
             result_workspace.resize_result(bytes, resident(), memory_limit)
         },
+        |id| mt.try_get_payload(id),
     )?;
     ctx.record_timing("graph_expand", t_graph.elapsed());
 
@@ -564,7 +576,10 @@ pub(crate) fn execute_pipeline_with_limit<T: VectorType>(
     }
 
     if config.payload_filter.is_some() {
-        expanded.retain(|hit| matches_payload_filter(&mt, config.payload_filter.as_ref(), hit.id));
+        with_filter_callback(&mt, config.payload_filter.as_ref(), |matches| {
+            expanded.retain(|hit| matches(hit.id));
+            Ok(())
+        })?;
     }
 
     let graph = expanded
@@ -587,7 +602,7 @@ pub(crate) fn execute_pipeline_with_limit<T: VectorType>(
                 .ok_or_else(|| crate::error::TriviumError::CapacityAllocationFailed {
                     reason: "DPP 查询工作区估算溢出".into(),
                 })?;
-            Some(runtime.reserve_workspace(cells)?)
+            Some(mt.reserve_instance_workspace(cells)?)
         } else {
             None
         };
@@ -619,6 +634,8 @@ pub(crate) fn execute_pipeline_with_limit<T: VectorType>(
         expanded.len().saturating_mul(size_of::<NodeId>())
     };
     result_workspace.resize_result(retained, resident(), memory_limit)?;
+    crate::request::check_current()?;
+    fatigue.apply(&mt);
     Ok(PipelineOutput {
         combined_hits: expanded,
         result_workspace: Some(result_workspace),
@@ -652,7 +669,7 @@ fn effective_rerank_k(config: &SearchConfig) -> usize {
 fn reserve_candidate_workspace<T: VectorType>(
     mt: &MemTable<T>,
     ann: Option<&QuIVerSearchConfig>,
-) -> Result<crate::resources::WorkspaceReservation> {
+) -> Result<crate::resources::RequestWorkspace> {
     let candidates = ann.map_or(mt.internal_slot_count(), |search| search.ef_search);
     let bytes = candidates
         .checked_mul(std::mem::size_of::<SearchHit>() + 32)
@@ -668,8 +685,7 @@ fn reserve_candidate_workspace<T: VectorType>(
             .saturating_mul(16)
             .saturating_add(mt.dim().saturating_mul(size_of::<f32>() * 2))
     });
-    mt.resource_runtime()
-        .reserve_workspace(bytes.saturating_add(navigation))
+    mt.reserve_instance_workspace(bytes.saturating_add(navigation))
 }
 
 /// L1: 文本稀疏召回（AC 自动机精准锚点 + BM25 兜底打分）
@@ -678,9 +694,9 @@ fn recall_text_ranked<T: VectorType>(
     config: &SearchConfig,
     query_text: Option<&str>,
     ranking: &mut Vec<(NodeId, f32)>,
-) {
+) -> Result<()> {
     if !config.enable_text_hybrid_search {
-        return;
+        return Ok(());
     }
     if let Some(txt) = query_text {
         let text_engine = mt.text_engine();
@@ -691,11 +707,15 @@ fn recall_text_ranked<T: VectorType>(
         for (id, score) in text_engine.search_bm25(txt, config.bm25_k1, config.bm25_b) {
             *combined.entry(id).or_insert(0.0) += score;
         }
-        combined.retain(|id, _| matches_payload_filter(mt, config.payload_filter.as_ref(), *id));
-        ranking.extend(combined);
+        for (id, score) in combined {
+            if matches_payload_filter(mt, config.payload_filter.as_ref(), id)? {
+                ranking.push((id, score));
+            }
+        }
         ranking.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         ranking.truncate(effective_recall_k(config));
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -706,7 +726,7 @@ fn recall_text<T: VectorType>(
     seed_map: &mut std::collections::HashMap<NodeId, f32>,
 ) {
     let mut ranking = Vec::new();
-    recall_text_ranked(mt, config, query_text, &mut ranking);
+    recall_text_ranked(mt, config, query_text, &mut ranking).unwrap();
     seed_map.extend(ranking);
 }
 
@@ -835,18 +855,20 @@ fn brute_force_pipeline<T: VectorType + Sync>(
         .map(|f| f.extract_must_have_mask())
         .unwrap_or(0);
     let (base, delta) = mt.vec_pool().vector_segments();
-    let id_filter_map = |idx| eligible_node_id(mt, config.payload_filter.as_ref(), bloom_mask, idx);
-    let control = crate::request::control();
-    brute_force::search_segments_controlled(
-        query_vector,
-        base,
-        delta,
-        dim,
-        limit,
-        config.min_score,
-        id_filter_map,
-        control.as_ref(),
-    )
+    with_filter_callback(mt, config.payload_filter.as_ref(), |matches| {
+        let id_filter_map = |idx| eligible_node_id(mt, bloom_mask, idx).filter(|&id| matches(id));
+        let control = crate::request::control();
+        brute_force::search_segments_controlled(
+            query_vector,
+            base,
+            delta,
+            dim,
+            limit,
+            config.min_score,
+            id_filter_map,
+            control.as_ref(),
+        )
+    })
 }
 
 /// QuIVer 管线：BQ-native Vamana 图搜索（替代三级火箭）
@@ -878,47 +900,43 @@ fn quiver_pipeline<T: VectorType + Sync>(
     // 转为 f32 写入复用缓冲区。整个查询只触达 ~ef 个候选，
     // 不再物化全量 f32 数组（不触发 merged 缓存），冷数据始终留在 OS PageCache。
     let vec_pool = mt.vec_pool();
-    let configured = mt.configured_quiver_search(
-        &q_f32,
-        search_cfg,
-        &|id| matches_payload_filter(mt, filter_ref, id),
-        None,
-    )?;
-    let raw_results = if let Some(hits) = configured {
-        hits
-    } else {
-        quiver.search(
-            &q_f32,
-            |slot, buf| {
-                if eligible_node_id(mt, filter_ref, bloom_mask, slot).is_none() {
-                    return false;
-                }
-                match vec_pool.get(slot) {
-                    Some(v) => {
-                        buf.clear();
-                        buf.extend(v.iter().map(|x| x.to_f32()));
-                        true
+    let raw_results = with_filter_callback(mt, filter_ref, |matches| {
+        let configured =
+            mt.configured_quiver_search(&q_f32, search_cfg, &|id| matches(id), None)?;
+        let raw_results = if let Some(hits) = configured {
+            hits
+        } else {
+            quiver.search(
+                &q_f32,
+                |slot, buf| {
+                    if !eligible_node_id(mt, bloom_mask, slot).is_some_and(matches) {
+                        return false;
                     }
-                    None => false,
-                }
-            },
-            search_cfg,
-        )
-    };
+                    match vec_pool.get(slot) {
+                        Some(v) => {
+                            buf.clear();
+                            buf.extend(v.iter().map(|x| x.to_f32()));
+                            true
+                        }
+                        None => false,
+                    }
+                },
+                search_cfg,
+            )
+        };
 
-    // 应用 payload 过滤 + min_score 阈值
-    let mut hits: Vec<SearchHit> = raw_results
-        .into_iter()
-        .filter(|&(id, score)| {
-            score >= config.min_score && matches_payload_filter(mt, filter_ref, id)
-        })
-        .map(|(id, score)| SearchHit {
-            id,
-            score,
-            payload: serde_json::Value::Null,
-        })
-        .collect();
-
+        Ok(raw_results)
+    })?;
+    let mut hits = Vec::new();
+    for (id, score) in raw_results {
+        if score >= config.min_score && matches_payload_filter(mt, filter_ref, id)? {
+            hits.push(SearchHit {
+                id,
+                score,
+                payload: serde_json::Value::Null,
+            });
+        }
+    }
     hits.sort_unstable_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
     Ok(hits)
 }
@@ -940,16 +958,14 @@ fn recall_residual<T: VectorType>(
 
     let filter_ref = config.payload_filter.as_ref();
 
-    let entity_vecs: Vec<Vec<f32>> = seed_map
-        .keys()
-        .filter_map(|&id| {
-            if !matches_payload_filter(mt, filter_ref, id) {
-                return None;
-            }
-            mt.get_vector(id)
-                .map(|v| v.iter().map(|&x| x.to_f32()).collect())
-        })
-        .collect();
+    let mut entity_vecs = Vec::new();
+    for &id in seed_map.keys() {
+        if matches_payload_filter(mt, filter_ref, id)?
+            && let Some(v) = mt.get_vector(id)
+        {
+            entity_vecs.push(v.iter().map(|x| x.to_f32()).collect());
+        }
+    }
     if entity_vecs.is_empty() {
         return Ok(());
     }
@@ -1012,19 +1028,12 @@ fn aggregate_seeds<T: VectorType>(
     anchor_hits: &mut Vec<SearchHit>,
 ) -> Result<crate::resources::RequestWorkspace> {
     let filter_ref = config.payload_filter.as_ref();
-    let mut candidates = seed_map
-        .iter()
-        .filter_map(|(&id, &score)| {
-            (score >= config.min_score)
-                .then_some((id, score))
-                .filter(|(id, _)| match filter_ref {
-                    None => mt.contains(*id),
-                    Some(filter) => mt
-                        .get_payload(*id)
-                        .is_some_and(|payload| filter.matches(&payload)),
-                })
-        })
-        .collect::<Vec<_>>();
+    let mut candidates = Vec::new();
+    for (&id, &score) in seed_map {
+        if score >= config.min_score && matches_payload_filter(mt, filter_ref, id)? {
+            candidates.push((id, score));
+        }
+    }
     candidates.sort_by(|left, right| {
         right
             .1
@@ -1051,22 +1060,44 @@ fn matches_payload_filter<T: VectorType>(
     mt: &MemTable<T>,
     filter: Option<&crate::filter::Filter>,
     id: NodeId,
-) -> bool {
-    if id == 0 {
-        return false;
-    }
+) -> Result<bool> {
     match filter {
-        None => mt.contains(id),
-        Some(filter) => mt
-            .get_payload(id)
-            .is_some_and(|payload| filter.matches(&payload)),
+        Some(filter) => mt.matches_payload_filter(id, filter),
+        None => Ok(mt.contains(id)),
+    }
+}
+
+// ANN 和并行精确扫描共用布尔回调；将首次读取错误传回请求线程。
+fn with_filter_callback<T: VectorType, R>(
+    mt: &MemTable<T>,
+    filter: Option<&crate::filter::Filter>,
+    run: impl FnOnce(&(dyn Fn(NodeId) -> bool + Sync)) -> Result<R>,
+) -> Result<R> {
+    if filter.is_none() {
+        return run(&|id| mt.contains(id));
+    }
+    let error = std::sync::OnceLock::new();
+    let result = run(&|id| {
+        if error.get().is_some() {
+            return false;
+        }
+        match matches_payload_filter(mt, filter, id) {
+            Ok(matched) => matched,
+            Err(cause) => {
+                let _ = error.set(cause);
+                false
+            }
+        }
+    });
+    match error.into_inner() {
+        Some(cause) => Err(cause),
+        None => result,
     }
 }
 
 #[inline]
 fn eligible_node_id<T: VectorType>(
     mt: &MemTable<T>,
-    filter: Option<&crate::filter::Filter>,
     bloom_mask: u64,
     idx: usize,
 ) -> Option<NodeId> {
@@ -1082,13 +1113,7 @@ fn eligible_node_id<T: VectorType>(
     {
         return None;
     }
-    match filter {
-        None => mt.contains(id).then_some(id),
-        Some(filter) => mt
-            .get_payload(id)
-            .filter(|payload| filter.matches(payload))
-            .map(|_| id),
-    }
+    Some(id)
 }
 
 /// L9: DPP 多样性采样
@@ -1134,10 +1159,7 @@ fn apply_dpp<T: VectorType>(
 #[cfg(test)]
 fn execute_pipeline<T: VectorType>(
     memtable: &Arc<RwLock<MemTable<T>>>,
-    quiver_builds: &Arc<(
-        std::sync::Mutex<std::collections::HashSet<u64>>,
-        std::sync::Condvar,
-    )>,
+    quiver_builds: &super::QuiverBuilds,
     hook: &Arc<dyn SearchHook>,
     query_text: Option<&str>,
     query_vector: Option<&[T]>,
@@ -1186,12 +1208,9 @@ mod tests {
         Arc::new(RwLock::new(mt))
     }
 
-    fn builds() -> Arc<(
-        std::sync::Mutex<std::collections::HashSet<u64>>,
-        std::sync::Condvar,
-    )> {
+    fn builds() -> super::super::QuiverBuilds {
         Arc::new((
-            std::sync::Mutex::new(std::collections::HashSet::new()),
+            std::sync::Mutex::new(std::collections::HashMap::new()),
             std::sync::Condvar::new(),
         ))
     }

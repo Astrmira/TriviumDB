@@ -290,10 +290,8 @@ pub(super) fn walk<T: VectorType>(
             Frame::Visit { layer, node } => {
                 let node_pat = &pattern.nodes[layer];
                 if layer > 0
-                    && node_pat
-                        .filter
-                        .as_ref()
-                        .is_some_and(|filter| !matches_filter_with_id(filter, node, mt))
+                    && let Some(filter) = &node_pat.filter
+                    && !matches_filter_with_id(filter, node, mt, memory)?
                 {
                     continue;
                 }
@@ -307,20 +305,23 @@ pub(super) fn walk<T: VectorType>(
                     frames.push(Frame::Restore { slot, previous });
                 }
                 if layer == pattern.edges.len() {
-                    if predicate.is_none_or(|pred| eval_predicate_env(pred, env, var_map, mt)) {
-                        let mut row = HashMap::new();
-                        for var in return_vars {
-                            if let Some(&slot) = var_map.get(var)
-                                && let Some(id) = env[slot]
-                                && let node = memory.snapshot(id, mt)?
-                            {
-                                row.insert(var.clone(), node);
-                            }
+                    if let Some(pred) = predicate
+                        && !eval_predicate_env(pred, env, var_map, mt, memory)?
+                    {
+                        continue;
+                    }
+                    let mut row = HashMap::new();
+                    for var in return_vars {
+                        if let Some(&slot) = var_map.get(var)
+                            && let Some(id) = env[slot]
+                            && let node = memory.snapshot(id, mt)?
+                        {
+                            row.insert(var.clone(), node);
                         }
-                        results.push(row);
-                        if results.len() >= row_limit {
-                            return Ok(false);
-                        }
+                    }
+                    results.push(row);
+                    if results.len() >= row_limit {
+                        return Ok(false);
                     }
                 } else {
                     let edge = &pattern.edges[layer];

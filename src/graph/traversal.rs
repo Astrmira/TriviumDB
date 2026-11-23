@@ -118,6 +118,7 @@ pub(crate) fn expand_graph_with_labels_view<T: crate::VectorType>(
     min_edge_weight: f32,
     edge_direction: EdgeDirection,
 ) -> Vec<SearchHit> {
+    let mut fatigue = FatigueDelta::default();
     match expand_graph_with_labels_checked(
         db,
         seeds,
@@ -131,10 +132,15 @@ pub(crate) fn expand_graph_with_labels_view<T: crate::VectorType>(
         max_edges_per_node,
         min_edge_weight,
         edge_direction,
+        &mut fatigue,
         || Ok::<(), std::convert::Infallible>(()),
         |_| Ok(()),
+        |id| Ok(db.facts().get_payload(id)),
     ) {
-        Ok(scores) => scores,
+        Ok(scores) => {
+            fatigue.apply(db.facts());
+            scores
+        }
         Err(never) => match never {},
     }
 }
@@ -152,8 +158,10 @@ pub(crate) fn expand_graph_with_labels_checked<T: crate::VectorType, E>(
     max_edges_per_node: usize,
     min_edge_weight: f32,
     edge_direction: EdgeDirection,
+    fatigue: &mut FatigueDelta,
     mut check: impl FnMut() -> Result<(), E>,
     admit_hits: impl FnOnce(&[(NodeId, f32)]) -> Result<(), E>,
+    load_payload: impl Fn(NodeId) -> Result<Option<std::sync::Arc<serde_json::Value>>, E>,
 ) -> Result<Vec<SearchHit>, E> {
     if max_depth == 0 || seeds.is_empty() {
         return Ok(seeds);
@@ -171,13 +179,14 @@ pub(crate) fn expand_graph_with_labels_checked<T: crate::VectorType, E>(
         max_edges_per_node,
         min_edge_weight,
         edge_direction,
+        fatigue,
         |_| check(),
     )?;
     admit_hits(&scores)?;
     let mut hits = Vec::with_capacity(scores.len());
     for (id, score) in scores {
         check()?;
-        if let Some(payload) = db.facts().get_payload(id) {
+        if let Some(payload) = load_payload(id)? {
             hits.push(SearchHit {
                 id,
                 score,
@@ -216,6 +225,18 @@ fn activate<E>(
     Ok(())
 }
 
+#[derive(Default)]
+pub(crate) struct FatigueDelta {
+    consumed: Vec<NodeId>,
+    activated: Vec<NodeId>,
+}
+
+impl FatigueDelta {
+    pub(crate) fn apply<T: crate::VectorType>(self, mt: &MemTable<T>) {
+        mt.apply_fatigue_delta(&self.consumed, &self.activated);
+    }
+}
+
 pub(crate) fn expand_graph_checked<T: crate::VectorType, E>(
     db: &impl GraphRead<T>,
     seeds: impl IntoIterator<Item = SearchHit>,
@@ -229,6 +250,7 @@ pub(crate) fn expand_graph_checked<T: crate::VectorType, E>(
     max_edges_per_node: usize,
     min_edge_weight: f32,
     edge_direction: EdgeDirection,
+    fatigue: &mut FatigueDelta,
     mut admit: impl FnMut(TraversalMetrics) -> Result<(), E>,
 ) -> Result<Vec<(NodeId, f32)>, E> {
     let mut metrics = TraversalMetrics::default();
@@ -471,16 +493,14 @@ pub(crate) fn expand_graph_checked<T: crate::VectorType, E>(
     if enable_refractory_fatigue {
         active_fatigue.sort_unstable();
         active_fatigue.dedup();
-        db.facts().consume_fatigue_batch(&active_fatigue);
         let top_ids: Vec<NodeId> = expanded_results
             .iter()
             .take(15)
             .map(|hit| hit.0)
             .filter(|id| !active_fatigue.contains(id))
             .collect();
-        if !top_ids.is_empty() {
-            db.facts().mark_fatigued(&top_ids);
-        }
+        fatigue.consumed = active_fatigue;
+        fatigue.activated = top_ids;
     }
 
     Ok(expanded_results)

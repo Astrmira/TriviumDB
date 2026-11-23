@@ -79,6 +79,29 @@ fn 残差查询区分拟合完成与上游空集() {
     assert_eq!(scalar(&rows[0]["id"]), json!(2));
 }
 
+#[test]
+fn 多样性选择保留尺度与前缀且大投影的主题平分() {
+    use triviumdb::cognitive::{dpp_greedy, nmf_analyze_query};
+    for s in [1.0, 1e-14, 1e30] {
+        assert_eq!(
+            dpp_greedy(&[vec![s, 0.], vec![s, 0.], vec![0., s]], &[1.; 3], 2, 1.),
+            [0, 2]
+        );
+    }
+    for (k, expected) in [(1, vec![1]), (2, vec![1, 0]), (4, vec![1, 0])] {
+        assert_eq!(
+            dpp_greedy(&[vec![1., 0.], vec![0., 1.]], &[0.1, 1.], k, 1.),
+            expected
+        );
+    }
+    let (depth, coverage, novelty, topics) =
+        nmf_analyze_query(&[1e30, 1e30], &[1e15, 0., 0., 1e15], 2, 2);
+    assert_eq!(
+        (depth, coverage, novelty, topics),
+        (0., 2, 1., vec![0.5, 0.5])
+    );
+}
+
 struct HighQualityRecall;
 
 fn scalar(value: &TqlValue<f32>) -> serde_json::Value {

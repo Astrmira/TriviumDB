@@ -389,9 +389,20 @@ pub(crate) fn reject_hook_reentrant_access<T: VectorType>(
 // 3. QuIVer 构建注册表不得在持有 MemTable guard 时等待 Condvar。
 // 禁止反向获取，避免 stateful/MemTable/WAL 之间形成 ABBA 死锁。
 
+pub(crate) type QuiverBuilds = Arc<(
+    Mutex<std::collections::HashMap<u64, Arc<QuiverFlight>>>,
+    Condvar,
+)>;
+
+pub(crate) struct QuiverFlight {
+    config: crate::index::quiver::QuIVerConfig,
+    published: AtomicBool,
+}
+
 pub(crate) struct QuiverBuildGuard {
+    flight: Arc<QuiverFlight>,
     generation: u64,
-    state: Arc<(Mutex<std::collections::HashSet<u64>>, std::sync::Condvar)>,
+    state: QuiverBuilds,
 }
 
 impl Drop for QuiverBuildGuard {
@@ -403,14 +414,21 @@ impl Drop for QuiverBuildGuard {
 }
 
 pub(crate) fn try_start_quiver_build(
-    state: &Arc<(Mutex<std::collections::HashSet<u64>>, std::sync::Condvar)>,
+    state: &QuiverBuilds,
     generation: u64,
-) -> Option<QuiverBuildGuard> {
+    config: &crate::index::quiver::QuIVerConfig,
+) -> std::result::Result<QuiverBuildGuard, Arc<QuiverFlight>> {
     let mut building = lock_or_recover(&state.0);
-    if !building.insert(generation) {
-        return None;
+    if let Some(flight) = building.get(&generation) {
+        return Err(Arc::clone(flight));
     }
-    Some(QuiverBuildGuard {
+    let flight = Arc::new(QuiverFlight {
+        config: *config,
+        published: AtomicBool::new(false),
+    });
+    building.insert(generation, Arc::clone(&flight));
+    Ok(QuiverBuildGuard {
+        flight,
         generation,
         state: Arc::clone(state),
     })
@@ -422,9 +440,9 @@ pub struct PreparedQuiverBuild<T: VectorType> {
     config: crate::index::quiver::QuIVerConfig,
     memtable: Arc<RwLock<MemTable<T>>>,
     wal: Arc<Mutex<Wal>>,
-    _build_guard: QuiverBuildGuard,
-    _operation_guard: OperationGuard,
     _workspace: crate::resources::RequestWorkspace,
+    build_guard: QuiverBuildGuard,
+    _operation_guard: OperationGuard,
     resource_runtime: crate::resources::ResourceRuntime,
     /// 必须晚于存储、操作与工作区析构，防止原 Database 丢弃后提前释放文件锁。
     _file_lock: Arc<Mutex<Option<std::fs::File>>>,
@@ -454,7 +472,12 @@ impl<T: VectorType> PreparedQuiverBuild<T> {
             mt.ensure_readable()?;
             let wal = lock_or_recover(&self.wal);
             wal.ensure_writable()?;
-            Ok(mt.publish_quiver_if_current(source_generation, index))
+            let published = mt.publish_quiver_if_current(source_generation, index);
+            self.build_guard
+                .flight
+                .published
+                .store(published, Ordering::Release);
+            Ok(published)
         })
     }
 }
@@ -465,7 +488,7 @@ pub struct QuiverBuildHandle<T: VectorType> {
     memtable: Arc<RwLock<MemTable<T>>>,
     wal: Arc<Mutex<Wal>>,
     resource_runtime: crate::resources::ResourceRuntime,
-    quiver_builds: Arc<(Mutex<std::collections::HashSet<u64>>, Condvar)>,
+    quiver_builds: QuiverBuilds,
     lifecycle: Arc<(Mutex<LifecycleState>, Condvar)>,
     access_mode: AccessMode,
     /// 与真实存储共同持有租约；显式关闭通过共享槽统一释放。
@@ -502,7 +525,7 @@ impl<T: VectorType> QuiverBuildHandle<T> {
                 }
             };
             let config = crate::index::quiver::QuIVerConfig::default();
-            let (snapshot, workspace) = {
+            let (snapshot, workspace, build_guard) = {
                 let mt = read_or_recover(&self.memtable);
                 mt.ensure_readable()?;
                 lock_or_recover(&self.wal).ensure_writable()?;
@@ -510,18 +533,16 @@ impl<T: VectorType> QuiverBuildHandle<T> {
                 if !mt.auto_quiver_build_needed() {
                     return Ok(None);
                 }
-                let workspace = mt.reserve_request_workspace(
-                    mt.reserved_database_bytes(),
-                    mt.quiver_build_peak_bytes(&config),
-                )?;
-                (mt.quiver_build_snapshot(), workspace)
+                let Ok(build_guard) =
+                    try_start_quiver_build(&self.quiver_builds, mt.vector_generation(), &config)
+                else {
+                    return Ok(None);
+                };
+                let workspace =
+                    mt.reserve_instance_workspace(mt.quiver_build_peak_bytes(&config))?;
+                (mt.quiver_build_snapshot(), workspace, build_guard)
             };
             let Some(snapshot) = snapshot else {
-                return Ok(None);
-            };
-            let Some(build_guard) =
-                try_start_quiver_build(&self.quiver_builds, snapshot.generation)
-            else {
                 return Ok(None);
             };
             Ok(Some(PreparedQuiverBuild {
@@ -529,7 +550,7 @@ impl<T: VectorType> QuiverBuildHandle<T> {
                 config,
                 memtable: Arc::clone(&self.memtable),
                 wal: Arc::clone(&self.wal),
-                _build_guard: build_guard,
+                build_guard,
                 _operation_guard: operation_guard,
                 _workspace: workspace,
                 resource_runtime: self.resource_runtime.clone(),
@@ -658,7 +679,7 @@ pub struct Database<T: VectorType> {
     /// 有状态 fatigue 查询保持数据库级顺序语义。
     stateful_search: Arc<Mutex<()>>,
     /// 正在锁外构建的 QuIVer 向量代际，避免重复构建。
-    quiver_builds: Arc<(Mutex<std::collections::HashSet<u64>>, std::sync::Condvar)>,
+    quiver_builds: QuiverBuilds,
     /// 生命周期和已进入操作计数；Closing 阻止新操作并等待现有操作退出。
     lifecycle: Arc<(Mutex<LifecycleState>, Condvar)>,
     access_mode: AccessMode,
@@ -671,10 +692,9 @@ pub(crate) struct SearchHandle<T: VectorType> {
     db_path: String,
     storage_mode: StorageMode,
     access_mode: AccessMode,
-    memory_limit: usize,
     resource_runtime: crate::resources::ResourceRuntime,
     hook: HookSlot,
-    quiver_builds: Arc<(Mutex<std::collections::HashSet<u64>>, Condvar)>,
+    quiver_builds: QuiverBuilds,
     lifecycle: Arc<(Mutex<LifecycleState>, Condvar)>,
     /// 最后释放租约，覆盖排队任务和已进入的查询。
     _file_lock: Arc<Mutex<Option<std::fs::File>>>,
@@ -688,7 +708,6 @@ impl<T: VectorType> Clone for SearchHandle<T> {
             db_path: self.db_path.clone(),
             storage_mode: self.storage_mode,
             access_mode: self.access_mode,
-            memory_limit: self.memory_limit,
             resource_runtime: self.resource_runtime.clone(),
             hook: Arc::clone(&self.hook),
             quiver_builds: Arc::clone(&self.quiver_builds),
@@ -777,14 +796,17 @@ impl<T: VectorType> SearchHandle<T> {
                 "批量查询 parallelism 不得超过 64".into(),
             ));
         }
-        let dim = read_or_recover(&self.memtable).dim();
+        let (dim, memory_limit) = {
+            let mt = read_or_recover(&self.memtable);
+            (mt.dim(), mt.instance_memory_limit())
+        };
         pipeline::validate_config::<T>(search_config, dim)?;
         for query in query_vectors {
             crate::vector::validate_query_vector(query, dim)?;
         }
 
         let response = read_or_recover(&self.memtable).reserve_request_workspace(
-            self.memory_limit,
+            memory_limit,
             query_vectors.len().saturating_mul(size_of::<Vec<R>>()),
         )?;
         if query_vectors.is_empty() {
@@ -798,7 +820,7 @@ impl<T: VectorType> SearchHandle<T> {
                 &self.db_path,
                 self.storage_mode,
                 self.access_mode,
-                self.memory_limit,
+                memory_limit,
                 false,
             )?;
         }
@@ -813,7 +835,7 @@ impl<T: VectorType> SearchHandle<T> {
             let hits = pipeline::execute_pipeline_with_limit(
                 &self.memtable,
                 &self.quiver_builds,
-                self.memory_limit,
+                memory_limit,
                 &self.hook(),
                 None,
                 Some(query),
@@ -1074,7 +1096,6 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                 got: dim,
             });
         }
-        memtable.set_text_memory_limit(config.memory_limit);
         memtable.pelorus_policy = config.missing_index_policy;
         // 恢复必须从第一条记录开始使用调用方预算，避免先填充默认解析缓存再淘汰。
         memtable.begin_loading(config.memory_limit);
@@ -1240,7 +1261,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
             hook: Arc::new(RwLock::new(Arc::new(NoopHook))),
             stateful_search: Arc::new(Mutex::new(())),
             quiver_builds: Arc::new((
-                Mutex::new(std::collections::HashSet::new()),
+                Mutex::new(std::collections::HashMap::new()),
                 std::sync::Condvar::new(),
             )),
             lifecycle: Arc::new((
@@ -1498,7 +1519,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                 return Err(TriviumError::InvalidInput("u64 使用汉明精确检索，QuIVer 构建支持浮点向量 (u64 uses exact Hamming retrieval; QuIVer construction supports floating-point vectors)".into()));
             }
             let cfg = config.unwrap_or_default();
-            let (_workspace, snapshot) = {
+            let (build_guard, _workspace, snapshot) = {
                 let mt = read_or_recover(&self.memtable);
                 mt.ensure_readable()?;
                 lock_or_recover(&self.wal).ensure_writable()?;
@@ -1509,32 +1530,51 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                         mt.dim()
                     )));
                 }
-                let workspace = mt.reserve_request_workspace(
-                    self.memory_limit,
-                    mt.quiver_build_peak_bytes(&cfg),
-                )?;
-                (workspace, mt.quiver_build_snapshot())
+                let source_generation = mt.vector_generation();
+                #[cfg(feature = "test-hooks")]
+                crate::test_hooks::hit(crate::test_hooks::ConcurrencyPoint::BeforeQuiverBuildClaim);
+                let build_guard = match try_start_quiver_build(
+                    &self.quiver_builds,
+                    source_generation,
+                    &cfg,
+                ) {
+                    Ok(owner) => owner,
+                    Err(flight) => {
+                        drop(mt);
+                        #[cfg(feature = "test-hooks")]
+                        crate::test_hooks::hit(
+                            crate::test_hooks::ConcurrencyPoint::QuiverBuildFollowerWaiting,
+                        );
+                        let (building, changed) = &*self.quiver_builds;
+                        let mut active = lock_or_recover(building);
+                        while active
+                            .get(&source_generation)
+                            .is_some_and(|current| Arc::ptr_eq(current, &flight))
+                        {
+                            active = changed
+                                .wait(active)
+                                .unwrap_or_else(|poison| poison.into_inner());
+                        }
+                        drop(active);
+                        let mt = read_or_recover(&self.memtable);
+                        mt.ensure_readable()?;
+                        if flight.published.load(Ordering::Acquire)
+                            && flight.config == cfg
+                            && mt.vector_generation() == source_generation
+                            && mt
+                                .quiver()
+                                .is_some_and(|index| index.matches_build_config(&cfg))
+                        {
+                            return Ok(());
+                        }
+                        return Err(TriviumError::InvalidInput("等待的 QuIVer 索引未发布，请重试 (Awaited QuIVer index was not published; retry)".into()));
+                    }
+                };
+                let workspace = mt.reserve_instance_workspace(mt.quiver_build_peak_bytes(&cfg))?;
+                (build_guard, workspace, mt.quiver_build_snapshot())
             };
             if let Some(snapshot) = snapshot {
                 let source_generation = snapshot.generation;
-                #[cfg(feature = "test-hooks")]
-                crate::test_hooks::hit(crate::test_hooks::ConcurrencyPoint::BeforeQuiverBuildClaim);
-                let Some(_build_guard) =
-                    try_start_quiver_build(&self.quiver_builds, source_generation)
-                else {
-                    #[cfg(feature = "test-hooks")]
-                    crate::test_hooks::hit(
-                        crate::test_hooks::ConcurrencyPoint::QuiverBuildFollowerWaiting,
-                    );
-                    let (building, changed) = &*self.quiver_builds;
-                    let mut active = lock_or_recover(building);
-                    while active.contains(&source_generation) {
-                        active = changed
-                            .wait(active)
-                            .unwrap_or_else(|poison| poison.into_inner());
-                    }
-                    return Ok(());
-                };
                 let index = self
                     .resource_runtime
                     .pool(self.resource_runtime.parallelism())?
@@ -1545,7 +1585,12 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                 mt.ensure_readable()?;
                 let wal = lock_or_recover(&self.wal);
                 wal.ensure_writable()?;
-                if !mt.publish_quiver_if_current(source_generation, index) {
+                let published = mt.publish_quiver_if_current(source_generation, index);
+                build_guard
+                    .flight
+                    .published
+                    .store(published, Ordering::Release);
+                if !published {
                     return Err(TriviumError::InvalidInput(
                         "QuIVer 构建期间向量数据已变化，请重试".into(),
                     ));
@@ -1673,7 +1718,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                 active.database_memory_limit = bytes;
             }
             self.tql_limits.memory_limit = bytes;
-            mt.set_text_memory_limit(bytes);
+            mt.set_instance_memory_limit(bytes);
             Ok(())
         })
     }
@@ -2838,7 +2883,6 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
             db_path: self.db_path.clone(),
             storage_mode: self.storage_mode,
             access_mode: self.access_mode,
-            memory_limit: self.memory_limit,
             resource_runtime: self.resource_runtime.clone(),
             hook: Arc::clone(&self.hook),
             quiver_builds: Arc::clone(&self.quiver_builds),
@@ -3100,27 +3144,30 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                     reason: "邻域工作区估算溢出 (Neighborhood workspace estimate overflowed)"
                         .into(),
                 })?;
-            let mut workspace = mt.resource_runtime().reserve_workspace(bytes)?;
+            let mut workspace = mt.reserve_instance_workspace(bytes)?;
+            let resident = if self.memory_limit == 0 { 0 } else { mt.resident_memory_bytes() };
             let mut distances = HashMap::new();
             let mut queue = VecDeque::new();
             distances.insert(id, 0usize);
             queue.push_back(id);
             while let Some(current) = queue.pop_front() {
+                crate::request::check_current()?;
                 let current_depth = distances[&current];
                 if current_depth >= depth {
                     continue;
                 }
                 if let Some(edges) = mt.get_edges(current) {
+                    #[cfg(feature="test-hooks")]
+                    crate::test_hooks::hit(crate::test_hooks::ConcurrencyPoint::NeighborhoodEdges);
                     for edge in edges {
+                        crate::request::check_current()?;
                         if labels.is_some_and(|allowed| {
                             !allowed.iter().any(|label| label == &edge.label)
                         }) {
                             continue;
                         }
                         let projected = distances.len().saturating_add(1).max(4);
-                        if let std::collections::hash_map::Entry::Vacant(entry) =
-                            distances.entry(edge.target_id)
-                        {
+                        if !distances.contains_key(&edge.target_id) {
                             let bytes = projected
                                 .checked_mul(192)
                                 .and_then(|bytes| bytes.checked_add(256))
@@ -3128,19 +3175,21 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                                     reason: "邻域工作区估算溢出 (Neighborhood workspace estimate overflowed)"
                                         .into(),
                                 })?;
-                            workspace.resize(bytes)?;
-                            entry.insert(current_depth + 1);
+                            workspace.resize_result(bytes, resident, self.memory_limit)?;
+                            distances.insert(edge.target_id, current_depth + 1);
                             queue.push_back(edge.target_id);
                         }
                     }
                 }
             }
+            crate::request::check_current()?;
             distances.remove(&id);
             let mut result: Vec<(usize, NodeId)> = distances
                 .into_iter()
                 .map(|(node_id, distance)| (distance, node_id))
                 .collect();
             result.sort_unstable();
+            crate::request::check_current()?;
             Ok(result.into_iter().map(|(_, node_id)| node_id).collect())
         })?
     }
@@ -3547,7 +3596,23 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
             .map(|suffix| {
                 (
                     suffix.to_owned(),
-                    std::path::Path::new(&format!("{}{}", self.db_path, suffix)).exists(),
+                    if suffix == ".pld" && self.storage_mode == StorageMode::Mmap {
+                        crate::storage::file_format::read_marker_generation(&format!(
+                            "{}.flush_ok",
+                            self.db_path
+                        ))
+                        .is_some_and(|generation| {
+                            std::path::Path::new(
+                                &crate::storage::file_format::payload_path_for_generation(
+                                    &self.db_path,
+                                    generation,
+                                ),
+                            )
+                            .is_file()
+                        })
+                    } else {
+                        std::path::Path::new(&format!("{}{}", self.db_path, suffix)).exists()
+                    },
                 )
             })
             .collect();
@@ -4220,6 +4285,82 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Database::open(&dir.join("test.tdb").to_string_lossy(), 3).unwrap()
+    }
+
+    #[test]
+    fn 已捕获的批量句柄在执行时读取最新实例额度() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("batch.tdb");
+        let mut db = Database::<f32>::open(path.to_str().unwrap(), 1).unwrap();
+        db.insert_with_id(1, &[1.], json!(1)).unwrap();
+        let handle = db.search_handle();
+        let query = super::SearchConfig {
+            top_k: 1,
+            expand_depth: 0,
+            force_brute_force: true,
+            ..Default::default()
+        };
+        db.set_memory_limit(db.estimated_memory() + 1).unwrap();
+        assert_eq!(
+            handle
+                .search_batch(&[vec![1.]], &query, &Default::default())
+                .unwrap_err()
+                .code(),
+            "TDB_CAPACITY_RESERVATION_REJECTED"
+        );
+        db.set_memory_limit(0).unwrap();
+        let batches = handle
+            .search_batch(&[vec![1.]], &query, &Default::default())
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0]
+                .iter()
+                .map(|hit| (hit.id, &hit.payload))
+                .collect::<Vec<_>>(),
+            [(1, &json!(1))]
+        );
+    }
+
+    #[test]
+    fn 事务失效退化索引并由独立预算准入重建() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("maintenance.tdb");
+        let cfg = super::Config {
+            dim: 1,
+            auto_build_quiver: false,
+            ..Default::default()
+        };
+        let mut db = Database::<f32>::open_with_config(path.to_str().unwrap(), cfg).unwrap();
+        let mut tx = db.begin_tx();
+        for id in 1..=96 {
+            tx.insert_with_id(id, &[1.], json!(id));
+        }
+        tx.commit().unwrap();
+        db.build_quiver_index(None).unwrap();
+        db.set_memory_limit(db.estimated_memory() + 4096).unwrap();
+        assert_eq!(
+            db.build_quiver_index(None).unwrap_err().code(),
+            "TDB_CAPACITY_RESERVATION_REJECTED"
+        );
+        let mut tx = db.begin_tx();
+        for id in 1..=32 {
+            tx.delete(id);
+        }
+        tx.commit().unwrap();
+        assert!(super::read_or_recover(&db.memtable).quiver().is_none());
+        db.set_memory_limit(0).unwrap();
+        db.build_quiver_index(None).unwrap();
+        db.close().unwrap();
+        let db = Database::<f32>::open_with_config(path.to_str().unwrap(), cfg).unwrap();
+        assert_eq!(
+            db.search_exact(&[1.], 96)
+                .unwrap()
+                .iter()
+                .map(|hit| hit.id)
+                .collect::<Vec<_>>(),
+            (33..=96).collect::<Vec<_>>()
+        );
     }
 
     #[test]

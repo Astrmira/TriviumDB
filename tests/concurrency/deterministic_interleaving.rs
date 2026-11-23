@@ -533,6 +533,79 @@ fn 查询写交错_更新向量必须等待完整查询释放读锁() {
 }
 
 #[test]
+fn 邻域扫描中途取消后释放额度并可重试() {
+    let root = tempfile::tempdir().unwrap();
+    let mut db =
+        Database::<f32>::open(root.path().join("neighbors.tdb").to_str().unwrap(), 1).unwrap();
+    for id in 1..=3 {
+        db.insert_with_id(id, &[1.], json!(id)).unwrap();
+    }
+    db.link(1, 2, "next", 1.).unwrap();
+    db.link(2, 3, "next", 1.).unwrap();
+    let request =
+        triviumdb::sdk::RequestContext::new("neighbor-read", Default::default(), false).unwrap();
+    let gate = triviumdb::test_hooks::pause_at_request(
+        ConcurrencyPoint::NeighborhoodEdges,
+        request.request_id(),
+    );
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| request.run(|| db.neighbors(1, 2)));
+        gate.wait_until_arrived();
+        request.cancel();
+        drop(gate);
+        assert_eq!(
+            worker.join().unwrap().unwrap_err().code(),
+            "TDB_QUERY_CANCELLED"
+        );
+    });
+    assert_eq!(db.resource_stats().reserved_workspace_bytes, 0);
+    assert_eq!(db.neighbors(1, 2).unwrap(), [2, 3]);
+    db.close().unwrap();
+}
+
+#[test]
+fn 同代等待者共用预算且丢弃构建不会确认发布() {
+    let _serial = test_serial_guard();
+    let path = tmp_db("quiver-dropped-owner");
+    cleanup(&path);
+    let mut db = Database::<f32>::open(&path, 1).unwrap();
+    let n = triviumdb::storage::memtable::auto_quiver_node_threshold(1);
+    let mut tx = db.begin_tx();
+    for id in 1..=n as u64 {
+        tx.insert_with_id(id, &[1.], json!(null));
+    }
+    tx.commit().unwrap();
+    let first = db.prepare_auto_quiver_build().unwrap().unwrap();
+    let used = db.resource_stats().reserved_workspace_bytes;
+    drop(first);
+    db.set_memory_limit(db.estimated_memory() + used + 128)
+        .unwrap();
+    let owner = db.prepare_auto_quiver_build().unwrap().unwrap();
+    assert!(db.prepare_auto_quiver_build().unwrap().is_none());
+    let gate = pause_at(ConcurrencyPoint::QuiverBuildFollowerWaiting);
+    std::thread::scope(|scope| {
+        let follower = scope.spawn(|| db.build_quiver_index(None));
+        gate.wait_until_arrived();
+        drop(owner);
+        gate.release();
+        assert_eq!(
+            follower.join().unwrap().unwrap_err().code(),
+            "TDB_INVALID_INPUT"
+        );
+    });
+    assert!(
+        db.prepare_auto_quiver_build()
+            .unwrap()
+            .unwrap()
+            .execute()
+            .unwrap()
+    );
+    assert!(db.prepare_auto_quiver_build().unwrap().is_none());
+    db.close().unwrap();
+    cleanup(&path);
+}
+
+#[test]
 fn QuIVer单飞_同代际只有一个构建者() {
     let _serial = test_serial_guard();
     let path = tmp_db("quiver_singleflight");

@@ -12,7 +12,7 @@ pub(super) enum Input<'a, T> {
 }
 
 pub(super) struct Scope<'a, T: VectorType> {
-    pub memory: &'a QueryMemory,
+    pub memory: &'a QueryMemory<'a>,
     pub query: &'a TqlQuery,
     pub mt: &'a MemTable<T>,
     pub limits: &'a ExecutionContext,

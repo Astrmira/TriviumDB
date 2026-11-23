@@ -174,6 +174,19 @@ impl VersionSnapshot {
         format!("\"{}-g{}\"", self.epoch, self.generation)
     }
 
+    pub fn node_representation_etag(&self, node_tag: &str) -> String {
+        format!("{}-g{}\"", node_tag.trim_end_matches('"'), self.generation)
+    }
+
+    fn matches_node_version(&self, expected: &str, node_tag: &str) -> bool {
+        expected == node_tag
+            || expected
+                .strip_prefix(node_tag.trim_end_matches('"'))
+                .and_then(|tail| tail.strip_prefix("-g"))
+                .and_then(|tail| tail.strip_suffix('"'))
+                .and_then(|digits| digits.parse::<u64>().ok())
+                .is_some_and(|generation| generation <= self.generation)
+    }
     pub fn node_etag(&self, id: u64, version: u64) -> String {
         format!(
             "\"{}-f{}-n{}-v{}\"",
@@ -1870,7 +1883,11 @@ fn validate_transaction_preconditions(
     for (id, expected) in &request.expected_nodes {
         let current = versions.node_versions.get(id).copied().unwrap_or(0);
         let current_etag = versions.snapshot().node_etag(*id, current);
-        if expected != &current_etag || !database.contains(*id).map_err(ApiError::from)? {
+        if !versions
+            .snapshot()
+            .matches_node_version(expected, &current_etag)
+            || !database.contains(*id).map_err(ApiError::from)?
+        {
             return Err(ApiError::write_conflict(format!(
                 "节点 {id} 版本不匹配：期望 {expected}，当前 {current_etag} (Node {id} version mismatch: expected {expected}, current {current_etag})"
             )));

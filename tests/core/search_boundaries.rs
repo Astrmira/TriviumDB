@@ -224,6 +224,151 @@ fn Hook向量在f16转换后执行有限性校验且失败后可继续查询() {
     db.close().unwrap();
 }
 
+#[test]
+fn 冷过滤与矩阵在解码或分配前受实例额度约束() {
+    let dir = support::TestDir::new("bounded-filter-matrix");
+    let cfg = Config {
+        dim: 1,
+        auto_build_quiver: false,
+        payload_cache_bytes: 0,
+        ..Default::default()
+    };
+    let path = dir.file("filters.tdb");
+    let mut db = Database::<f32>::open_with_config(&path, cfg).unwrap();
+    db.insert_with_id(1, &[1.], json!({"large":"x".repeat(600_000)}))
+        .unwrap();
+    db.close().unwrap();
+    let mut db = Database::<f32>::open_with_config(&path, cfg).unwrap();
+    db.set_memory_limit(1 << 20).unwrap();
+    let before = db.payload_memory_stats().payload_parsed_bytes;
+    for present in [false, true] {
+        let cfg = SearchConfig {
+            top_k: 1,
+            expand_depth: 0,
+            force_brute_force: true,
+            payload_filter: Some(
+                triviumdb::Filter::from_json(&json!({"large":{"$exists":present}})).unwrap(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            db.search_ids(&[1.], &cfg).unwrap_err().code(),
+            "TDB_CAPACITY_RESERVATION_REJECTED"
+        );
+    }
+    assert_eq!(db.payload_memory_stats().payload_parsed_bytes, before);
+    let mut db = Database::<f32>::open_with_config(&dir.file("matrix.tdb"), cfg).unwrap();
+    let mut tx = db.begin_tx();
+    for id in 1..=512 {
+        tx.insert_with_id(id, &[1.], json!(null));
+    }
+    tx.commit().unwrap();
+    db.set_memory_limit(1 << 20).unwrap();
+    let search = SearchConfig {
+        top_k: 1,
+        recall_k: 512,
+        rerank_k: 1,
+        expand_depth: 0,
+        enable_advanced_pipeline: true,
+        enable_sparse_residual: true,
+        force_brute_force: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        db.search_advanced(&[1.], &search).unwrap_err().code(),
+        "TDB_CAPACITY_RESERVATION_REJECTED"
+    );
+    db.set_memory_limit(0).unwrap();
+    assert_eq!(db.search_ids(&[1.], &search).unwrap(), [1]);
+}
+
+#[test]
+fn 失败的有状态查询保留下一次扩散分数() {
+    let dir = support::TestDir::new("fatigue-retry");
+    let cfg = Config {
+        dim: 2,
+        auto_build_quiver: false,
+        payload_cache_bytes: 0,
+        ..Default::default()
+    };
+    let path = dir.file("db.tdb");
+    let mut db = Database::<f32>::open_with_config(&path, cfg).unwrap();
+    db.insert_with_id(1, &[1., 0.], json!(null)).unwrap();
+    db.insert_with_id(2, &[0., 1.], json!("x".repeat(600_000)))
+        .unwrap();
+    db.link(1, 2, "next", 1.).unwrap();
+    db.close().unwrap();
+    let mut db = Database::<f32>::open_with_config(&path, cfg).unwrap();
+    let search = SearchConfig {
+        top_k: 2,
+        expand_depth: 1,
+        min_score: 0.8,
+        force_brute_force: true,
+        enable_refractory_fatigue: true,
+        ..Default::default()
+    };
+    db.set_memory_limit(1 << 20).unwrap();
+    assert_eq!(
+        db.search_advanced(&[1., 0.], &search).unwrap_err().code(),
+        "TDB_CAPACITY_RESERVATION_REJECTED"
+    );
+    db.set_memory_limit(0).unwrap();
+    let hits = db.search_advanced(&[1., 0.], &search).unwrap();
+    assert_eq!(
+        hits.iter().map(|h| (h.id, h.score)).collect::<Vec<_>>(),
+        [(1, 1.), (2, 1.)]
+    );
+    let hits = db.search_advanced(&[1., 0.], &search).unwrap();
+    assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), [1, 2]);
+    for (hit, expected) in hits.iter().zip([0.15, 0.0225]) {
+        assert!((hit.score - expected).abs() < 1e-6);
+    }
+}
+
+#[test]
+fn Hook按已准入的状态模式执行() {
+    struct EnableFatigue;
+    impl triviumdb::hook::SearchHook for EnableFatigue {
+        fn on_pre_search(
+            &self,
+            _: &mut Vec<f32>,
+            cfg: &mut SearchConfig,
+            _: &mut triviumdb::hook::HookContext,
+        ) {
+            cfg.enable_refractory_fatigue = true;
+        }
+    }
+    let dir = support::TestDir::new("hook-fatigue-mode");
+    let mut db = Database::<f32>::open(&dir.file("db.tdb"), 1).unwrap();
+    db.insert_with_id(1, &[1.], json!(1)).unwrap();
+    db.set_hook(EnableFatigue).unwrap();
+    let cfg = SearchConfig {
+        top_k: 1,
+        expand_depth: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        db.search_advanced(&[1.], &cfg).unwrap_err().code(),
+        "TDB_INVALID_INPUT"
+    );
+    assert_eq!(
+        db.search_batch(&[vec![1.]], &cfg, &Default::default())
+            .unwrap_err()
+            .code(),
+        "TDB_INVALID_INPUT"
+    );
+    let hits = db
+        .search_advanced(
+            &[1.],
+            &SearchConfig {
+                enable_refractory_fatigue: true,
+                ..cfg
+            },
+        )
+        .unwrap();
+    assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), [1]);
+}
+
 struct StageErrorHook {
     stage: &'static str,
     calls: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,

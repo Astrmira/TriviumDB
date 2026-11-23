@@ -8,6 +8,10 @@
 
 本页记录下一批变更。最近的预发布版本见 [0.9.4-beta.1 双语说明](0.9.4-beta.1.md)，最近的正式版本见 [0.9.3 双语说明](0.9.3.md)。
 
+- 同一向量代际的 QuIVer 构建共用一次快照和工作区。手动等待者在目标配置发布后收到成功回执。事务删除造成索引退化时，提交节点变更并失效索引，下一次构建单独申请额度。
+- 过滤解码、认知重排矩阵、标量 TQL 与邻域遍历按实例剩余额度准入。排队的 Node.js 批量检索在开始执行时读取实例限额。疲劳状态在整次检索成功后更新，失败请求可按原状态重试。PROFILE 仅对实际解码计入解析字节。
+- FIND 满足显式 LIMIT 后结束扫描。DPP 保持向量缩放与候选排序前缀一致，Rust NMF 查询分析使用双精度投影。只读属性索引统计按实际条目计数，Mmap 存储诊断报告当前代际的 Payload 文件。
+- Server 查询根据 Accept 权重选择 JSON 或 NDJSON，节点 HTTP ETag 同时覆盖节点版本与全库代际。Windows 迁移工具按目录项原名提取制品后缀，CLI 交互命令报告底层操作错误。
 - HTTP 二进制向量搜索按原始向量分数应用阈值，向量与批量节点 JSON 响应均限制为 16 MiB。Python 和 Node.js 诊断检索默认关闭图扩散。单条与批量检索统一拒绝零 Top-K。
 - 检索在解码命中 Payload 前检查实例与共享额度，批量响应持续占用结果额度。WAL 恢复分别核算帧缓冲和待提交事务。WAL 回放及 Rom、Mmap 检查点加载均按 JSON 结构估算节点 Payload 的解码开销。代际清单在同一检查点持锁生成。
 - 命名图遍历按返回子图计费，文档上下文按修订一次定位全部窗口。FISTA 使用双精度中间值，空候选返回空集，二次扫描按需计费。图扩散跳过零重启能量的种子循环。
@@ -22,6 +26,10 @@
 
 This page tracks upcoming changes. See the [0.9.4-beta.1 prerelease notes](0.9.4-beta.1.md) and the [0.9.3 stable release notes](0.9.3.md).
 
+- QuIVer builds for the same vector generation share one snapshot and workspace. A manual waiter confirms publication of the requested configuration. Transactions invalidate degraded indexes after deletes, and the next build reserves its own workspace.
+- Filter decoding, cognitive reranking matrices, scalar TQL and neighborhood traversal use the remaining instance budget. Queued Node.js batch searches read the instance limit when execution begins. Fatigue updates take effect after successful search completion. PROFILE counts bytes decoded on cache misses.
+- FIND stops scanning once it satisfies an explicit LIMIT. DPP preserves direction under rescaling and produces consistent ranking prefixes. Rust NMF query analysis uses double-precision projection. Read-only index statistics count each posting once, and Mmap diagnostics recognize the active generation's payload file.
+- Server query responses negotiate JSON and NDJSON using Accept weights. Node HTTP ETags cover both node version and database generation. The Windows migration tool extracts artifact suffixes from the actual directory entry, and the CLI reports errors from interactive commands.
 - Corrected QuIVer candidate budgeting in the general search entry points. The default navigation width follows the final Top-K, and an explicit recall pool controls navigation width. Single ANN queries run directly on the request thread. Pure vector queries use the final Top-K and the kernel rerank budget, then load payloads for the returned results.
 - General vector search accepts an optional `ann_rerank_limit` (`annRerankLimit` in Node.js) to set the QuIVer reranking candidate budget independently. Navigation width covers at least the effective rerank budget.
 - Added single and batch ID-only search. Pure vector queries skip result payload reads and object construction. Python single-vector search accepts contiguous one-dimensional buffers of the matching dtype, and batch ID search accepts two-dimensional buffers.

@@ -307,7 +307,7 @@ impl ExecutionContext {
         query: &TqlQuery,
         mt: &MemTable<T>,
         memory: &QueryMemory,
-        workspaces: &[crate::resources::WorkspaceReservation],
+        workspaces: &[crate::resources::RequestWorkspace],
     ) {
         if self.graph.is_some()
             || matches!(
@@ -316,7 +316,7 @@ impl ExecutionContext {
             )
         {
             let bytes = workspaces.iter().fold(
-                mt.estimated_memory_bytes().saturating_add(
+                mt.resident_memory_bytes().saturating_add(
                     self.graph
                         .as_ref()
                         .map_or(0, |graph| graph.reserved_bytes()),
@@ -605,14 +605,19 @@ fn execute_tql_context_inner<T: VectorType>(
             && let QueryEntry::Find { filter } = &query.entry
         {
             let ordered = find_ordered_find_plan(query, memtable);
-            let (row_limit, _) = requested_row_limit(
+            let (row_limit, user_limited) = requested_row_limit(
                 query,
                 requires_full_input(query, ordered.is_some()),
                 &limits,
                 memtable,
             )?;
             Some(ordered.unwrap_or_else(|| {
-                plan_find_filter(query, filter, memtable, row_limit.saturating_add(1))
+                plan_find_filter(
+                    query,
+                    filter,
+                    memtable,
+                    row_limit.saturating_add(usize::from(!user_limited)),
+                )
             }))
         } else {
             None
@@ -736,7 +741,7 @@ fn execute_binding_rows_inner<T: VectorType>(
     let requires_full_input = requires_full_input(query, ordered_find);
     let (row_limit, user_limited) =
         requested_row_limit(query, requires_full_input, limits, memtable)?;
-    let scan_limit = row_limit.saturating_add(1);
+    let scan_limit = row_limit.saturating_add(usize::from(!user_limited));
 
     let mut snapshot_query = query.clone();
     if matches!(
@@ -859,7 +864,7 @@ type PipelineSetResult = (
     String,
     std::collections::BTreeSet<String>,
     Option<PipelineExecutionProfile>,
-    Vec<crate::resources::WorkspaceReservation>,
+    Vec<crate::resources::RequestWorkspace>,
 );
 
 fn uses_pipeline(query: &TqlQuery) -> bool {
@@ -2030,10 +2035,8 @@ fn collect_single_edge_rows_inner<T: VectorType>(
     let mut budget = matching::WorkBudget::new(MAX_BUDGET, limits.query_control.as_ref());
     'anchors: for start in candidates {
         limits.check_cancelled()?;
-        if left
-            .filter
-            .as_ref()
-            .is_some_and(|filter| !matches_filter_with_id(filter, start, mt))
+        if let Some(filter) = &left.filter
+            && !matches_filter_with_id(filter, start, mt, memory)?
         {
             continue;
         }
@@ -2048,10 +2051,8 @@ fn collect_single_edge_rows_inner<T: VectorType>(
             if left.var.is_some() && left.var == right.var && start != end {
                 continue;
             }
-            if right
-                .filter
-                .as_ref()
-                .is_some_and(|filter| !matches_filter_with_id(filter, end, mt))
+            if let Some(filter) = &right.filter
+                && !matches_filter_with_id(filter, end, mt, memory)?
             {
                 continue;
             }
@@ -2443,7 +2444,7 @@ impl<T: VectorType> crate::query::pipeline::PipelineOperator<T> for TqlMatchSour
         let mt = context.memtable;
         let memory = if self.limits.graph.is_some() {
             let memory = QueryMemory::new(context.document_memory_limit()?, mt);
-            memory.include_external(mt.estimated_memory_bytes());
+            memory.include_external(mt.resident_memory_bytes());
             memory
         } else {
             QueryMemory::new(self.limits.memory_limit, mt)
@@ -3045,6 +3046,9 @@ fn execute_find<T: VectorType>(
     control: Option<&QueryControl>,
     memory: &QueryMemory,
 ) -> Result<(TqlResult<T>, bool), TriviumError> {
+    if row_limit == 0 || query.limit == Some(0) {
+        return Ok((Vec::new(), false));
+    }
     let mut results = Vec::new();
     let cursor = find_ordered_field(query).and_then(|(field, desc)| {
         let bound = super::planner::ordered_range(filter)
@@ -3080,9 +3084,6 @@ fn execute_find<T: VectorType>(
         {
             control.check()?;
         }
-        if results.len() >= row_limit {
-            break;
-        }
 
         let _decode = memory.temporary(mt.payload_query_peak(id)?)?;
         let payload = match mt.try_get_payload(id)? {
@@ -3111,6 +3112,9 @@ fn execute_find<T: VectorType>(
         // FIND 的节点身份固定绑定到 _，返回列和聚合分别从同一个输入求值。
         let row = HashMap::from([("_".to_owned(), node)]);
         results.push(row);
+        if results.len() >= row_limit {
+            break;
+        }
     }
 
     Ok((results, ordered_output))
@@ -3229,23 +3233,15 @@ fn execute_match<T: VectorType>(
         MAX_BUDGET
     };
 
-    let bytes = matching::workspace_bytes(planned_pattern, graph.node_count())?;
-    if limits.memory_limit > 0 && bytes > limits.memory_limit {
-        return Err(TriviumError::ResourceBudgetExceeded {
-            resource: "query_memory_bytes",
-            requested: bytes,
-            used: 0,
-            limit: limits.memory_limit,
-        });
-    }
-    let _workspace = mt.resource_runtime().reserve_workspace(bytes)?;
+    let _workspace = memory.temporary(matching::workspace_bytes(
+        planned_pattern,
+        graph.node_count(),
+    )?)?;
     let mut budget = matching::WorkBudget::new(step_budget, limits.query_control.as_ref());
     for start_id in start_candidates {
         limits.check_cancelled()?;
-        if planned_pattern.nodes[0]
-            .filter
-            .as_ref()
-            .is_some_and(|filter| !matches_filter_with_id(filter, start_id, mt))
+        if let Some(filter) = &planned_pattern.nodes[0].filter
+            && !matches_filter_with_id(filter, start_id, mt, memory)?
         {
             continue;
         }
@@ -3350,46 +3346,35 @@ fn eval_predicate_env<T: VectorType>(
     env: &[Option<u64>],
     var_map: &HashMap<String, usize>,
     mt: &MemTable<T>,
-) -> bool {
-    match pred {
+    memory: &QueryMemory,
+) -> crate::Result<bool> {
+    Ok(match pred {
         Predicate::Compare { left, op, right } => {
-            let lval = eval_tql_expr(left, env, var_map, mt);
-            let rval = eval_tql_expr(right, env, var_map, mt);
-            compare_runtime(&lval, op, &rval)
+            let mut values = Vec::new();
+            let lhs = eval_tql_expr(left, env, var_map, mt, memory, &mut values)?;
+            let rhs = eval_tql_expr(right, env, var_map, mt, memory, &mut values)?;
+            compare_runtime(&lhs, op, &rhs)
         }
-
         Predicate::DocFilter { var, filter } => {
             let id = match var {
-                Some(v) => {
-                    if let Some(&idx) = var_map.get(v) {
-                        env[idx]
-                    } else {
-                        None
-                    }
-                }
-                None => {
-                    // 无变量绑定，尝试用第一个非空变量
-                    env.iter().find(|o| o.is_some()).copied().flatten()
-                }
+                Some(name) => var_map.get(name).and_then(|&slot| env[slot]),
+                None => env.iter().copied().flatten().next(),
             };
-
             match id {
-                Some(nid) => match mt.get_payload(nid) {
-                    Some(payload) => filter.matches(&payload),
-                    None => false,
-                },
+                Some(id) => mt.matches_payload_filter(id, filter)?,
                 None => false,
             }
         }
-
         Predicate::And(a, b) => {
-            eval_predicate_env(a, env, var_map, mt) && eval_predicate_env(b, env, var_map, mt)
+            eval_predicate_env(a, env, var_map, mt, memory)?
+                && eval_predicate_env(b, env, var_map, mt, memory)?
         }
         Predicate::Or(a, b) => {
-            eval_predicate_env(a, env, var_map, mt) || eval_predicate_env(b, env, var_map, mt)
+            eval_predicate_env(a, env, var_map, mt, memory)?
+                || eval_predicate_env(b, env, var_map, mt, memory)?
         }
-        Predicate::Not(inner) => !eval_predicate_env(inner, env, var_map, mt),
-    }
+        Predicate::Not(inner) => !eval_predicate_env(inner, env, var_map, mt, memory)?,
+    })
 }
 
 /// 在单节点上下文中评估谓词（FIND / SEARCH 场景）
@@ -3461,13 +3446,15 @@ fn runtime_property<T: VectorType>(
     }
 }
 
-fn eval_tql_expr<T: VectorType>(
+fn eval_tql_expr<'a, T: VectorType>(
     expr: &TqlExpr,
     env: &[Option<u64>],
     var_map: &HashMap<String, usize>,
     mt: &MemTable<T>,
-) -> RuntimeValue {
-    match expr {
+    memory: &'a QueryMemory<'a>,
+    retained: &mut Vec<memory::Temporary<'a>>,
+) -> crate::Result<RuntimeValue> {
+    Ok(match expr {
         TqlExpr::Variable(var) => var_map
             .get(var)
             .and_then(|index| env.get(*index))
@@ -3476,17 +3463,24 @@ fn eval_tql_expr<T: VectorType>(
             .map_or(RuntimeValue::Null, RuntimeValue::Node),
         TqlExpr::Parameter(_) => RuntimeValue::Null,
         TqlExpr::Binary { left, op, right } => eval_binary(
-            eval_tql_expr(left, env, var_map, mt),
+            eval_tql_expr(left, env, var_map, mt, memory, retained)?,
             *op,
-            eval_tql_expr(right, env, var_map, mt),
+            eval_tql_expr(right, env, var_map, mt, memory, retained)?,
         ),
-        TqlExpr::Coalesce(values) => values
-            .iter()
-            .map(|value| eval_tql_expr(value, env, var_map, mt))
-            .find(|value| !matches!(value, RuntimeValue::Null))
-            .unwrap_or(RuntimeValue::Null),
+        TqlExpr::Coalesce(values) => {
+            for expr in values {
+                let value = eval_tql_expr(expr, env, var_map, mt, memory, retained)?;
+                if !matches!(value, RuntimeValue::Null) {
+                    return Ok(value);
+                }
+            }
+            RuntimeValue::Null
+        }
         TqlExpr::IsNull { expr, negated } => RuntimeValue::Bool(
-            matches!(eval_tql_expr(expr, env, var_map, mt), RuntimeValue::Null) != *negated,
+            matches!(
+                eval_tql_expr(expr, env, var_map, mt, memory, retained)?,
+                RuntimeValue::Null
+            ) != *negated,
         ),
         TqlExpr::Path { .. }
         | TqlExpr::PathLength { .. }
@@ -3510,16 +3504,21 @@ fn eval_tql_expr<T: VectorType>(
                 && let Some(id) = env[idx]
             {
                 if field == "id" {
-                    return runtime_u64(id);
+                    return Ok(runtime_u64(id));
                 }
-                if let Some(payload) = mt.get_payload(id) {
-                    return json_to_runtime(&payload[field]);
+                let decoding = memory.temporary(mt.payload_query_peak(id)?)?;
+                if let Some(payload) = mt.try_get_payload(id)? {
+                    let value = json_to_runtime(&payload[field]);
+                    if matches!(value, RuntimeValue::Json(_) | RuntimeValue::Str(_)) {
+                        retained.push(decoding);
+                    }
+                    return Ok(value);
                 }
             }
             RuntimeValue::Null
         }
         TqlExpr::Literal(lit) => lit_to_runtime(lit),
-    }
+    })
 }
 
 fn eval_tql_expr_single(expr: &TqlExpr, id: NodeId, payload: &serde_json::Value) -> RuntimeValue {
@@ -3760,23 +3759,28 @@ fn matches_filter_with_id<T: VectorType>(
     filter: &Filter,
     node_id: NodeId,
     mt: &MemTable<T>,
-) -> bool {
+    memory: &QueryMemory,
+) -> crate::Result<bool> {
     if filter.field_name() == Some("id") {
-        return filter.matches(&serde_json::json!({"id":node_id}));
+        return Ok(filter.matches(&serde_json::json!({"id":node_id})));
     }
     match filter {
-        // 逻辑组合：递归处理
-        Filter::And(filters) => filters
-            .iter()
-            .all(|f| matches_filter_with_id(f, node_id, mt)),
-        Filter::Or(filters) => filters
-            .iter()
-            .any(|f| matches_filter_with_id(f, node_id, mt)),
-        // 其他操作符：回退到标准 payload 匹配
-        _ => match mt.get_payload(node_id) {
-            Some(payload) => filter.matches(&payload),
-            None => false,
-        },
+        Filter::And(filters) | Filter::Or(filters) => {
+            let conjunction = matches!(filter, Filter::And(_));
+            for child in filters {
+                let matched = matches_filter_with_id(child, node_id, mt, memory)?;
+                if matched != conjunction {
+                    return Ok(matched);
+                }
+            }
+            Ok(conjunction)
+        }
+        _ => {
+            let _decode = memory.temporary(mt.payload_query_peak(node_id)?)?;
+            Ok(mt
+                .try_get_payload(node_id)?
+                .is_some_and(|payload| filter.matches(&payload)))
+        }
     }
 }
 

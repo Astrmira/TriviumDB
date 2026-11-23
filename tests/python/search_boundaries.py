@@ -9,6 +9,21 @@ import triviumdb
 
 
 def verify_search_entries(root):
+    path = str(Path(root) / "cold-filter.tdb")
+    with triviumdb.TriviumDB(path, dim=1, payload_cache_mb=0) as db:
+        db.insert_with_id(1, [1], {"large": "x" * 600_000})
+    with triviumdb.TriviumDB(path, dim=1, payload_cache_mb=0) as db:
+        db.set_memory_limit(1)
+        for present in (True, False):
+            try:
+                db.search_ids([1], payload_filter={"large": {"$exists": present}}, exact=True)
+            except triviumdb.CapacityError as error:
+                assert error.code == "TDB_CAPACITY_RESERVATION_REJECTED"
+            else:
+                raise AssertionError("冷过滤必须先取得解码额度")
+        db.set_memory_limit(0)
+        assert db.search_ids([1], payload_filter={"large": {"$exists": True}}, exact=True) == [1]
+
     half_path = str(Path(root) / "half-rounding.tdb")
     with triviumdb.TriviumDB(half_path, dim=2, dtype="f16") as half:
         half.insert_with_id(1, [1 + 2**-11 + 2**-28, 65519.9999], {})

@@ -523,7 +523,7 @@ fn flush_ok_path_from_db(db_path: &str) -> String {
     format!("{}.flush_ok", db_path)
 }
 
-fn payload_path_for_generation(db_path: &str, generation: u64) -> String {
+pub(crate) fn payload_path_for_generation(db_path: &str, generation: u64) -> String {
     format!("{db_path}.pld.{generation}")
 }
 

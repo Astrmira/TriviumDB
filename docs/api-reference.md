@@ -201,7 +201,7 @@ Immutable 会在加载前验证 manifest 版本、完成状态、dtype、维度�
 | `BuildInMemory` | 允许当前进程在内存中惰性构建 QuIVer，磁盘 sidecar 保持原样 |
 | `Error` | 严格模式；立即返回 `ImmutableArtifactInvalid`，不修改任何文件 |
 
-Python 使用 `missing_index_policy="fallback|build_in_memory|error"`；Node.js 使用 `missingIndexPolicy: "fallback" | "buildInMemory" | "error"`。ReadOnly/Immutable Reader 禁止启用 `enable_refractory_fatigue`，避免不同 Worker 因进程本地疲劳状态产生不一致结果。
+Python 使用 `missing_index_policy="fallback|build_in_memory|error"`；Node.js 使用 `missingIndexPolicy: "fallback" | "buildInMemory" | "error"`。有状态检索由调用方在单次读写实例搜索的配置中显式启用 `enable_refractory_fatigue`。状态在检索成功后更新。Reader、批量搜索以及试图在回调中开启该选项的 Hook 均返回结构化错误。
 
 ### Rust 类型化门面
 

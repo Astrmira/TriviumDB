@@ -2704,6 +2704,7 @@ dependencies = [
  "clap",
  "futures-util",
  "http-body-util",
+ "mime",
  "serde",
  "serde_json",
  "sha2",

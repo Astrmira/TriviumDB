@@ -553,6 +553,7 @@ pub struct MemTable<T: VectorType> {
     pub(crate) document_index_bytes: std::sync::atomic::AtomicUsize,
     resource_runtime: crate::resources::ResourceRuntime,
     request_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    instance_memory_limit: usize,
     resource_reservation: Option<crate::resources::DatabaseReservation>,
     // 未加载的 sidecar 与待合并操作分开保存，避免把“未加载”解释为“空索引”。
     deferred_text_path: Option<String>,
@@ -563,7 +564,6 @@ pub struct MemTable<T: VectorType> {
     text_replay_checkpoint_seen: bool,
     pending_text_mutations: Vec<PendingTextMutation>,
     pending_text_bytes: usize,
-    text_memory_limit: usize,
 
     // 2. 元数据映射（文档型负载）—— 原始 JSON 紧凑存储，按访问惰性解析
     payloads: PayloadStore,
@@ -678,7 +678,7 @@ impl<T: VectorType> MemTable<T> {
             text_replay_checkpoint_seen: false,
             pending_text_mutations: Vec::new(),
             pending_text_bytes: 0,
-            text_memory_limit: 0,
+            instance_memory_limit: 0,
             payloads: PayloadStore::default(),
             edges: HashMap::new(),
             edge_heap_bytes: 0,
@@ -752,7 +752,7 @@ impl<T: VectorType> MemTable<T> {
             text_replay_checkpoint_seen: false,
             pending_text_mutations: Vec::new(),
             pending_text_bytes: 0,
-            text_memory_limit: 0,
+            instance_memory_limit: 0,
             payloads: PayloadStore::default(),
             edges: HashMap::new(),
             edge_heap_bytes: 0,
@@ -1649,7 +1649,20 @@ impl<T: VectorType> MemTable<T> {
         }
     }
 
-    /// 批量消耗疲劳（由扩散引擎在每轮迭代末调用）
+    /// 在查询完成点一次更新消耗与新激活的节点。
+    pub(crate) fn apply_fatigue_delta(&self, consumed: &[NodeId], activated: &[NodeId]) {
+        if consumed.is_empty() && activated.is_empty() {
+            return;
+        }
+        let mut map = self.fatigue_map.write().unwrap_or_else(|e| e.into_inner());
+        for id in consumed {
+            map.remove(id);
+        }
+        for &id in activated {
+            map.insert(id, 1);
+        }
+    }
+
     pub fn consume_fatigue_batch(&self, ids: &[NodeId]) {
         if let Ok(mut map) = self.fatigue_map.write() {
             for &id in ids {
@@ -2087,8 +2100,6 @@ impl<T: VectorType> MemTable<T> {
     pub fn quiver_sync_tx_entries(&mut self, entries: &[crate::storage::wal::WalEntry<T>]) {
         use crate::storage::wal::WalEntry;
 
-        let had_quiver = self.quiver_index.is_some();
-
         for entry in entries {
             match entry {
                 WalEntry::Insert { id, vector, .. } => {
@@ -2128,13 +2139,13 @@ impl<T: VectorType> MemTable<T> {
             }
         }
 
-        if had_quiver
-            && self
-                .quiver_index
-                .as_ref()
-                .is_none_or(|quiver| quiver.needs_rebuild())
+        // 事务提交后仅失效派生索引；后续建图入口负责准入和快照。
+        if self
+            .quiver_index
+            .as_ref()
+            .is_some_and(|index| index.needs_rebuild())
         {
-            self.build_quiver(&QuIVerConfig::default());
+            self.quiver_index = None;
         }
     }
 
@@ -2165,6 +2176,20 @@ impl<T: VectorType> MemTable<T> {
         id: NodeId,
     ) -> Result<Option<std::sync::Arc<serde_json::Value>>> {
         self.payloads.try_get_value(id)
+    }
+
+    pub(crate) fn matches_payload_filter(
+        &self,
+        id: NodeId,
+        filter: &crate::Filter,
+    ) -> Result<bool> {
+        if !self.contains(id) {
+            return Ok(false);
+        }
+        let _decode = self.reserve_instance_workspace(self.payload_query_peak(id)?)?;
+        Ok(self
+            .try_get_payload(id)?
+            .is_some_and(|payload| filter.matches(&payload)))
     }
 
     pub(crate) fn payload_fingerprint(&self) -> (u64, u32) {
@@ -2915,8 +2940,7 @@ impl<T: VectorType> MemTable<T> {
                 .property_index_stats()
                 .iter()
                 .map(|stats| stats.entry_count as u64)
-                .sum::<u64>()
-                .saturating_add(self.property_indexes.mapped_posting_entries() as u64),
+                .sum::<u64>(),
         }
     }
 
@@ -3524,7 +3548,7 @@ impl<T: VectorType> MemTable<T> {
         &self,
         bytes: usize,
     ) -> Result<crate::resources::RequestWorkspace> {
-        self.reserve_request_workspace(self.text_memory_limit, bytes)
+        self.reserve_request_workspace(self.instance_memory_limit, bytes)
     }
 
     pub(crate) fn resident_memory_bytes(&self) -> usize {
@@ -3590,7 +3614,7 @@ impl<T: VectorType> MemTable<T> {
 
     pub(crate) fn begin_loading(&mut self, limit: usize) {
         self.load_memory_limit = limit;
-        self.text_memory_limit = limit;
+        self.instance_memory_limit = limit;
         self.auto_build_quiver = false;
         self.configure_payload_cache(0, 0);
     }
@@ -3920,20 +3944,24 @@ impl<T: VectorType> MemTable<T> {
         self.quiver_index = None;
     }
 
-    pub(crate) fn set_text_memory_limit(&mut self, limit: usize) {
-        self.text_memory_limit = limit;
+    pub(crate) fn instance_memory_limit(&self) -> usize {
+        self.instance_memory_limit
+    }
+
+    pub(crate) fn set_instance_memory_limit(&mut self, limit: usize) {
+        self.instance_memory_limit = limit;
     }
 
     fn check_text_memory_budget(&self, estimated_bytes: usize) -> Result<()> {
         let current_bytes = self.estimated_memory_bytes();
-        if self.text_memory_limit > 0
-            && current_bytes.saturating_add(estimated_bytes) > self.text_memory_limit
+        if self.instance_memory_limit > 0
+            && current_bytes.saturating_add(estimated_bytes) > self.instance_memory_limit
         {
             return Err(TriviumError::CapacityReservationRejected {
                 requested_nodes: 0,
                 estimated_bytes,
                 current_bytes,
-                memory_limit: self.text_memory_limit,
+                memory_limit: self.instance_memory_limit,
             });
         }
         Ok(())

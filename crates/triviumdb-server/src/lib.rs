@@ -705,6 +705,7 @@ async fn execute_prepared(
     request: Result<Json<ExecutePreparedRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let Json(request) = decode_json(request)?;
+    let wants_ndjson = prefers_ndjson(&headers)?;
     let started = std::time::Instant::now();
     let result = state
         .engine
@@ -714,7 +715,7 @@ async fn execute_prepared(
             request_deadline(started, state.request_timeout)?,
         )
         .await?;
-    query_response(result, &headers, request.profile, true, started, None)
+    query_response(result, wants_ndjson, request.profile, true, started, None)
 }
 
 async fn search_vector(
@@ -852,10 +853,11 @@ async fn tql(
         Ok(response)
     } else {
         let started = std::time::Instant::now();
+        let wants_ndjson = prefers_ndjson(&headers)?;
         let result = state.engine.query(query.to_owned(), deadline).await?;
         query_response(
             result,
-            &headers,
+            wants_ndjson,
             request.profile,
             false,
             started,
@@ -989,9 +991,89 @@ fn request_profile(started: Instant, prepared_cache_hit: bool) -> serde_json::Va
     })
 }
 
+// 按具体媒体范围优先确定各表示的权重；权重相同则优先客户端指定的类型。
+fn prefers_ndjson(headers: &HeaderMap) -> Result<bool, ApiError> {
+    if !headers.contains_key(header::ACCEPT) {
+        return Ok(false);
+    }
+    let mut preferences = [None; 2];
+    for value in headers.get_all(header::ACCEPT) {
+        let value = value
+            .to_str()
+            .map_err(|_| ApiError::invalid_request("Accept 编码无效 (Invalid Accept header)"))?;
+        for range in value.split(',') {
+            let Ok(media) = range.trim().parse::<mime::Mime>() else {
+                continue;
+            };
+            let mut weight = 1000;
+            let mut parameters = 0;
+            let mut compatible = true;
+            for (name, value) in media.params() {
+                if name == "q" {
+                    let raw = value.as_str();
+                    let (whole, fraction) = raw.split_once('.').unwrap_or((raw, ""));
+                    if fraction.len() > 3
+                        || !fraction.bytes().all(|b| b.is_ascii_digit())
+                        || !matches!(whole, "0" | "1")
+                        || (whole == "1" && fraction.bytes().any(|b| b != b'0'))
+                    {
+                        compatible = false;
+                        break;
+                    }
+                    weight = if whole == "1" {
+                        1000
+                    } else {
+                        fraction
+                            .bytes()
+                            .zip([100, 10, 1])
+                            .map(|(b, p)| u16::from(b - b'0') * p)
+                            .sum()
+                    };
+                } else if name == mime::CHARSET && value == mime::UTF_8 {
+                    parameters += 1;
+                } else {
+                    compatible = false;
+                    break;
+                }
+            }
+            if !compatible || media.suffix().is_some() {
+                continue;
+            }
+            for (slot, subtype) in preferences.iter_mut().zip(["json", "x-ndjson"]) {
+                let specificity =
+                    if media.type_() == mime::APPLICATION && media.subtype() == subtype {
+                        2
+                    } else if media.type_() == mime::APPLICATION && media.subtype() == mime::STAR {
+                        1
+                    } else if media.type_() == mime::STAR && media.subtype() == mime::STAR {
+                        0
+                    } else {
+                        continue;
+                    };
+                let priority = (specificity, parameters, weight);
+                if slot.is_none_or(|old| priority > old) {
+                    *slot = Some(priority);
+                }
+            }
+        }
+    }
+    let [json, ndjson] =
+        preferences.map(|choice| choice.map_or((0, 0, 0), |(spec, params, q)| (q, spec, params)));
+    if json.0 == 0 && ndjson.0 == 0 {
+        return Err(ApiError::new(
+            StatusCode::NOT_ACCEPTABLE,
+            "TDB_HTTP_NOT_ACCEPTABLE",
+            "无法协商响应格式 (No acceptable representation)",
+            "支持 JSON 和 NDJSON (Supported representations are JSON and NDJSON)",
+            false,
+        ));
+    }
+    Ok(ndjson > json)
+}
+
 fn query_response(
     result: engine::QueryResult,
-    headers: &HeaderMap,
+    wants_ndjson: bool,
     profile: bool,
     prepared_cache_hit: bool,
     started: std::time::Instant,
@@ -1004,14 +1086,6 @@ fn query_response(
     let row_count = rows.len();
     let columns = projection_columns(&rows, result.columns);
     let etag = result.version.global_etag();
-    let wants_ndjson = headers
-        .get(header::ACCEPT)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(',')
-                .any(|item| item.trim() == "application/x-ndjson")
-        });
     if wants_ndjson {
         let stream_etag = etag.clone();
         let stream = async_stream::stream! {
@@ -1047,6 +1121,9 @@ fn query_response(
             HeaderValue::from_static("application/x-ndjson; charset=utf-8"),
         );
         insert_etag(response.headers_mut(), &etag)?;
+        response
+            .headers_mut()
+            .append(header::VARY, HeaderValue::from_static("accept"));
         return Ok(response);
     }
 
@@ -1073,7 +1150,11 @@ fn query_response(
         },
         MAX_RESPONSE_BYTES,
     )?;
-    json_bytes_response(encoded_bytes, &etag)
+    let mut response = json_bytes_response(encoded_bytes, &etag)?;
+    response
+        .headers_mut()
+        .append(header::VARY, HeaderValue::from_static("accept"));
+    Ok(response)
 }
 
 fn index_advice(query: &str, indexed_fields: &[String]) -> Vec<serde_json::Value> {
@@ -1150,7 +1231,10 @@ async fn get_node(
         "edgeVersions": edge_versions,
     }))
     .into_response();
-    insert_etag(response.headers_mut(), &node_etag)?;
+    insert_etag(
+        response.headers_mut(),
+        &result.version.node_representation_etag(&node_etag),
+    )?;
     Ok(response)
 }
 

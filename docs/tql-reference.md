@@ -266,7 +266,7 @@ Rust 直接构造 `TqlQuery` 时需提供 `graph_scope`，直接构造 `EdgeView
 
 `FIND` 入口对全库节点的 JSON Payload 进行条件过滤，功能完全覆盖旧的 `db.filter()` 和 `db.filter_where()` API。无可用属性索引时，Planner 在 `EXPLAIN` 中标记 `cold_payload_scan`；执行器按 Payload 目录顺序访问冷数据，并受 lookup/parse 工作预算约束。高频字段应建立 Hash、Ordered ART、Composite ART、Bitmap 或 N-gram 索引，先缩小 NodeId 候选再执行必要的 residual predicate。
 
-管线的 Payload lookup 和实际解析字节按本次查询执行计量，工作线程继承所属查询的账本。PROFILE 中的 Payload 用量记录当前查询的累计值，实例统计维护独立的累计口径。复用执行上下文时重新建立本次账本和阶段统计。
+管线的 Payload lookup 和实际解析字节按本次查询执行计量，工作线程继承所属查询的账本。缓存命中计一次查找，冷读另计实际解码的 JSON 字节。PROFILE 中的 Payload 用量记录当前查询的累计值，实例统计维护独立的累计口径。复用执行上下文时重新建立本次账本和阶段统计。
 
 ### 基础语法
 
@@ -1057,7 +1057,7 @@ TQL 和 `search_advanced()` 共用底层数据、QuIVer、图与预算设施，�
 | 向量访问 | QuIVer / exact fallback | Cascades 选择向量源与重排 |
 | 图能力 | SA-PPR 扩散，组件可开关、顺序固定 | EXPAND、路径、PageRank/WCC/Leiden、参数化 SA-PPR 等自由编排 |
 | 文本/认知 | AC+BM25、FISTA、DPP、Hook 与疲劳不应期，均由 `SearchConfig` 控制 | `TEXT`、`RESIDUAL`、`DIVERSIFY`、`TOPICS`、`SA_PPR_CONFIG` 及一等分数表达式 |
-| 状态性 | 疲劳不应期会更新进程内检索状态 | 普通 TQL 认知算子无状态、可重复；不开放疲劳不应期 |
+| 状态性 | 成功完成的有状态检索更新进程内疲劳状态 | 普通 TQL 认知算子无状态、可重复；不开放疲劳不应期 |
 | 结果 | SearchHit | Node/标量/Path/List/Null 绑定行 |
 
 两者长期共存并共享 BM25、AC、FISTA、DPP、NMF 和图扩散底层实现：固定低开销 RAG 流程优先使用 `search_advanced()`；需要改变算子顺序、保留中间 NodeSet、聚合、路径或图算法组合时使用 TQL。
