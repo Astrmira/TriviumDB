@@ -251,6 +251,16 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
         scope: &NamedGraphScope,
         limits: &NamedGraphLimits,
     ) -> Result<ScopedGraphSnapshot> {
+        self.read_graph_scope(scope, limits, true, None)
+    }
+
+    fn read_graph_scope(
+        &self,
+        scope: &NamedGraphScope,
+        limits: &NamedGraphLimits,
+        returning_scope: bool,
+        only_start: Option<NodeId>,
+    ) -> Result<ScopedGraphSnapshot> {
         self.read_operation(|| {
             reject_hook_reentrant_access(&self.memtable)?;
             crate::request::check_current()?;
@@ -298,6 +308,32 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
             // 先核对计数，再访问边、标签与元数据。
             bound("named_graph_nodes", nodes, limits.max_nodes)?;
             bound("named_graph_edges", edges, limits.max_edges)?;
+            if let Some(start) = only_start {
+                if !(scope.include_default && mt.contains(start))
+                    && !selected.iter().any(|id| {
+                        mt.named_graphs.graphs[*id]
+                            .graph
+                            .members
+                            .binary_search(&start)
+                            .is_ok()
+                    })
+                {
+                    return Err(invalid(
+                        "start",
+                        "起点必须属于所选图 (Start node must belong to the selected graph)",
+                    ));
+                }
+                let snapshot = ScopedGraphSnapshot {
+                    revisions: selected
+                        .iter()
+                        .map(|&id| (id.to_owned(), mt.named_graphs.graphs[id].revision.clone()))
+                        .collect(),
+                    members: vec![start],
+                    edges: Vec::new(),
+                };
+                check_result(&snapshot, limits)?;
+                return Ok(snapshot);
+            }
             for id in &selected {
                 crate::request::check_current()?;
                 let graph = &mt.named_graphs.graphs[*id].graph;
@@ -354,6 +390,9 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
                     crate::request::check_current()?;
                     members.insert(member);
                 }
+                if !returning_scope {
+                    continue;
+                }
                 for edge in &record.graph.edges {
                     crate::request::check_current()?;
                     encoded_edges = encoded_edges.saturating_add(edge_bytes(
@@ -370,6 +409,9 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
                 for id in mt.active_node_ids() {
                     crate::request::check_current()?;
                     members.insert(id);
+                    if !returning_scope {
+                        continue;
+                    }
                     for edge in mt.get_edges(id).unwrap_or(&[]) {
                         crate::request::check_current()?;
                         encoded_edges = encoded_edges.saturating_add(edge_bytes(
@@ -383,23 +425,25 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
                     }
                 }
             }
-            let encoded_members = members
-                .iter()
-                .try_fold(0usize, |bytes, id| -> Result<usize> {
-                    crate::request::check_current()?;
-                    Ok(bytes.saturating_add(id.to_string().len() + 2))
-                })?
-                .saturating_add(members.len().saturating_sub(1));
-            // 两个空数组已计入外层编码，只补元素内容与分隔符。
-            let response_bytes = crate::storage::payload_store::serialized_json_len(&result)?
-                .saturating_add(encoded_members)
-                .saturating_add(encoded_edges)
-                .saturating_add(edges.saturating_sub(1));
-            bound(
-                "named_graph_return_bytes",
-                response_bytes,
-                limits.max_return_bytes,
-            )?;
+            if returning_scope {
+                let encoded_members = members
+                    .iter()
+                    .try_fold(0usize, |bytes, id| -> Result<usize> {
+                        crate::request::check_current()?;
+                        Ok(bytes.saturating_add(id.to_string().len() + 2))
+                    })?
+                    .saturating_add(members.len().saturating_sub(1));
+                // 两个空数组已计入外层编码，只补元素内容与分隔符。
+                let response_bytes = crate::storage::payload_store::serialized_json_len(&result)?
+                    .saturating_add(encoded_members)
+                    .saturating_add(encoded_edges)
+                    .saturating_add(edges.saturating_sub(1));
+                bound(
+                    "named_graph_return_bytes",
+                    response_bytes,
+                    limits.max_return_bytes,
+                )?;
+            }
             result.members = members.into_iter().collect();
             for id in selected {
                 for edge in &mt.named_graphs.graphs[id].graph.edges {
@@ -434,7 +478,6 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
                     .cmp(&b.edge.key())
                     .then_with(|| a.graph_id.cmp(&b.graph_id))
             });
-            check_result(&result, limits)?;
             Ok(result)
         })?
     }
@@ -449,7 +492,10 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
     ) -> Result<ScopedGraphSnapshot> {
         self.read_operation(|| {
             bound("named_graph_depth", max_depth, 1000)?;
-            let mut snapshot = self.named_graph_scope(scope, limits)?;
+            if max_depth == 0 {
+                return self.read_graph_scope(scope, limits, false, Some(start));
+            }
+            let mut snapshot = self.read_graph_scope(scope, limits, false, None)?;
             if snapshot.members.binary_search(&start).is_err() {
                 return Err(invalid(
                     "start",

@@ -115,7 +115,8 @@ pub fn search<T: VectorType>(
     if top_k == 0 {
         return Err(TriviumError::InvalidInput(
             "search_exact 的 top_k 必须大于 0 (search_exact requires positive top_k)".into(),
-        ));
+        )
+        .at_field("top_k"));
     }
 
     let top_k = top_k.min(db.internal_slot_count());

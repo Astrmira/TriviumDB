@@ -21,7 +21,7 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// L2 范数
 #[inline]
 pub fn l2_norm(v: &[f32]) -> f32 {
-    v.iter().map(|&x| x * x).sum::<f32>().sqrt()
+    v.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>().sqrt() as f32
 }
 
 /// 向量减法: a - b
@@ -87,84 +87,91 @@ pub fn fista_solve(
     lambda: f32,
     max_iter: usize,
 ) -> (Vec<f32>, Vec<f32>, f32) {
-    let m = entities.len();
-    let d = query.len();
+    let (weights, residual) = fista_wide(query, entities, lambda, max_iter);
+    let norm = residual.iter().map(|v| v * v).sum::<f64>().sqrt();
+    (
+        weights.into_iter().map(|v| v as f32).collect(),
+        residual.into_iter().map(|v| v as f32).collect(),
+        norm as f32,
+    )
+}
 
+/// 余弦召回只需要残差方向。先用宽精度比较绝对阈值，再缩放到可表示的方向。
+pub(crate) fn fista_recall_direction(
+    query: &[f32],
+    entities: &[Vec<f32>],
+    lambda: f32,
+    iterations: usize,
+    threshold: f32,
+) -> Option<Vec<f32>> {
+    let (_, residual) = fista_wide(query, entities, lambda, iterations);
+    let norm = residual.iter().map(|v| v * v).sum::<f64>().sqrt();
+    (norm > f64::from(threshold)).then(|| residual.into_iter().map(|v| (v / norm) as f32).collect())
+}
+
+fn fista_wide(
+    query: &[f32],
+    entities: &[Vec<f32>],
+    lambda: f32,
+    max_iter: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let m = entities.len();
+    let mut residual_wide: Vec<_> = query.iter().copied().map(f64::from).collect();
     if m == 0 {
-        return (vec![], query.to_vec(), l2_norm(query));
+        return (Vec::new(), residual_wide);
     }
 
-    // 预计算 Gram 矩阵 EtE (m×m) — 密集矩阵, SIMD 友好
-    let mut ete = vec![0.0f32; m * m];
+    // 先扩宽分量再相乘，使极大和极小的有限输入共用同一个求解过程。
+    let wide_dot = |left: &[f32], right: &[f32]| -> f64 {
+        left.iter()
+            .zip(right)
+            .map(|(&x, &y)| f64::from(x) * f64::from(y))
+            .sum()
+    };
+    let mut gram = vec![0.0; m * m];
     for i in 0..m {
         for j in i..m {
-            let val = dot(&entities[i], &entities[j]);
-            ete[i * m + j] = val;
-            ete[j * m + i] = val; // 对称
+            let value = wide_dot(&entities[i], &entities[j]);
+            gram[i * m + j] = value;
+            gram[j * m + i] = value;
         }
     }
-
-    // 预计算 Etq (m,) = E @ q
-    let etq: Vec<f32> = entities.iter().map(|e| dot(e, query)).collect();
-
-    // Lipschitz 常数 = ‖EᵀE‖₂ (谱范数上界)
-    // 快速近似: Gershgorin 圆盘定理上界 = max_i Σ_j |EtE[i,j]|
-    let mut lip = 0.0f32;
-    for i in 0..m {
-        let row_sum: f32 = (0..m).map(|j| ete[i * m + j].abs()).sum();
-        if row_sum > lip {
-            lip = row_sum;
-        }
+    let lip = gram
+        .chunks_exact(m)
+        .map(|row| row.iter().map(|value| value.abs()).sum::<f64>())
+        .fold(0.0, f64::max);
+    if lip == 0.0 {
+        return (vec![0.0; m], residual_wide);
     }
-    if lip < 1e-10 {
-        return (vec![0.0; m], query.to_vec(), l2_norm(query));
-    }
-
-    let step = 1.0 / lip;
-
-    // FISTA 主循环
-    let mut alpha = vec![0.0f32; m];
-    let mut y = vec![0.0f32; m];
-    let mut t = 1.0f32;
-
+    let target: Vec<_> = entities
+        .iter()
+        .map(|entity| wide_dot(entity, query))
+        .collect();
+    let threshold = f64::from(lambda) / lip;
+    let mut alpha = vec![0.0; m];
+    let mut next = vec![0.0; m];
+    let mut y = vec![0.0; m];
+    let mut t = 1.0_f64;
     for _ in 0..max_iter {
-        // grad = EtE @ y - Etq
-        let ete_y = mat_vec_mul(&ete, m, m, &y);
-        let grad = vec_sub(&ete_y, &etq);
-
-        // 近端步: soft_threshold(y - step * grad, lambda * step)
-        let step_grad = vec_scale(&grad, step);
-        let y_minus_sg = vec_sub(&y, &step_grad);
-        let alpha_new = soft_threshold(&y_minus_sg, lambda * step);
-
-        // FISTA 动量更新加速
-        let t_new = (1.0 + (1.0 + 4.0 * t * t).sqrt()) / 2.0;
-        let momentum = (t - 1.0) / t_new;
-
-        // y = alpha_new + momentum * (alpha_new - alpha)
-        let diff = vec_sub(&alpha_new, &alpha);
-        let scaled_diff = vec_scale(&diff, momentum);
-        y = vec_add(&alpha_new, &scaled_diff);
-
-        alpha = alpha_new;
-        t = t_new;
+        for (i, row) in gram.chunks_exact(m).enumerate() {
+            let projected: f64 = row.iter().zip(&y).map(|(g, v)| g * v).sum();
+            let step = y[i] + (target[i] - projected) / lip;
+            next[i] = (step.abs() - threshold).max(0.0).copysign(step);
+        }
+        let next_t = (1.0 + (1.0 + 4.0 * t * t).sqrt()) / 2.0;
+        for i in 0..m {
+            y[i] = next[i] + (t - 1.0) / next_t * (next[i] - alpha[i]);
+        }
+        std::mem::swap(&mut alpha, &mut next);
+        t = next_t;
     }
 
-    // 残差: r = q - Eᵀ @ α
-    // Eᵀ @ α = Σ_i α_i * e_i
-    let mut reconstruction = vec![0.0f32; d];
-    for (i, &a) in alpha.iter().enumerate() {
-        if a.abs() > 1e-10 {
-            for (j, &e_val) in entities[i].iter().enumerate() {
-                reconstruction[j] += a * e_val;
-            }
+    for (&weight, entity) in alpha.iter().zip(entities) {
+        for (value, &component) in residual_wide.iter_mut().zip(entity) {
+            *value -= weight * f64::from(component);
         }
     }
-
-    let residual = vec_sub(query, &reconstruction);
-    let residual_norm = l2_norm(&residual);
-
-    (alpha, residual, residual_norm)
+    (alpha, residual_wide)
 }
 
 // ============================================================================

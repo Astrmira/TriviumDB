@@ -1171,7 +1171,7 @@ db.clear_hook();
 
 ### search_with_context — 带管线上下文的检索
 
-与 `search` 相同的检索能力，但额外返回 `HookContext` 对象，包含管线各阶段的计时统计和 Hook 注入的自定义数据。
+Python 的 `search`、`search_with_context` 和 Node.js 的 `search`、`searchWithContext` 均默认使用零层图扩散。相同的查询参数产生相同的命中与分数，诊断入口额外返回各阶段的计时统计和 Hook 写入的上下文。单条和批量向量检索均要求 `top_k` 大于零。
 
 **Python：**
 ```python

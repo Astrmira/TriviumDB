@@ -122,6 +122,23 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
                     )?;
                     keys.push(key.clone());
                 }
+                // 合并后的窗口依起点有序，一次扫描即可取得本修订的全部行列位置。
+                let base = base.saturating_add(expanded.ranges.len().saturating_mul(256));
+                reserve(
+                    &mt,
+                    self.memory_limit,
+                    &mut workspace,
+                    base.saturating_add(returned.saturating_mul(4)),
+                )?;
+                let boundaries: Vec<_> = expanded
+                    .ranges
+                    .iter()
+                    .flat_map(|&(start, end)| [start, end])
+                    .collect();
+                let locations = crate::error::QuerySpan::at_many(&snapshot.content, &boundaries)?
+                    .into_iter()
+                    .map(|span| (span.start_byte, span))
+                    .collect::<BTreeMap<_, _>>();
                 let mut windows = Vec::new();
                 for (start, end) in expanded.ranges {
                     returned = returned.saturating_add(evidence_charge(&snapshot, start, end)?);
@@ -136,7 +153,7 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
                         &mut workspace,
                         base.saturating_add(returned.saturating_mul(4)),
                     )?;
-                    windows.push(evidence(&snapshot, start, end)?);
+                    windows.push(evidence_at(&snapshot, start, end, Some(&locations))?);
                 }
                 result.push(DocumentContext {
                     document_id: id,

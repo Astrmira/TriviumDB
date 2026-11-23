@@ -730,20 +730,36 @@ impl EngineHandle {
         &self,
         ids: Vec<u64>,
         deadline: Instant,
-    ) -> Result<(Vec<NodeView<f32>>, VersionSnapshot), ApiError> {
+    ) -> Result<(Vec<u8>, VersionSnapshot), ApiError> {
         let versions = self.inner.versions.clone();
         let control = QueryControl::with_deadline(deadline);
         self.run_read(deadline, control.clone(), move |database| {
-            let mut nodes = Vec::with_capacity(ids.len());
+            // 逐节点编码，重复请求同一大节点时也只保留一个解码副本。
+            let mut body = crate::BoundedBody::new(crate::MAX_RESPONSE_BYTES);
+            body.append(br#"{"nodes":["#)?;
+            let mut first = true;
+            let mut missing = Vec::new();
             for (index, id) in ids.into_iter().enumerate() {
                 if index & 0xff == 0 {
                     control.check().map_err(ApiError::from)?;
                 }
                 if let Some(node) = database.get(id).map_err(ApiError::from)? {
-                    nodes.push(node);
+                    if !first {
+                        body.append(b",")?;
+                    }
+                    body.json(&crate::protocol::WireNode(&node))?;
+                    first = false;
+                } else {
+                    missing.push(id.to_string());
                 }
             }
-            Ok((nodes, lock_or_recover(&versions).snapshot()))
+            let version = lock_or_recover(&versions).snapshot();
+            body.append(br#"],"missingIds":"#)?;
+            body.json(&missing)?;
+            body.append(br#","generation":"#)?;
+            body.json(&version.global_etag())?;
+            body.append(b"}")?;
+            Ok((body.bytes, version))
         })
         .await
     }

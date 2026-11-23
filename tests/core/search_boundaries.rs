@@ -765,6 +765,52 @@ fn 精确余弦在大分量抵消后保留小分量排名() {
 }
 
 #[test]
+fn 召回钩子替换节点后先检查新正文的解码预算() {
+    struct ReplaceSeed;
+    impl triviumdb::hook::SearchHook for ReplaceSeed {
+        fn on_post_recall(
+            &self,
+            hits: &mut Vec<triviumdb::SearchHit>,
+            _: &mut triviumdb::hook::HookContext,
+        ) {
+            assert_eq!(hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), [1]);
+            hits[0].id = 2;
+        }
+    }
+    let dir = support::TestDir::new("hook_replaced_payload");
+    let mut db = Database::<f32>::open_with_config(
+        &dir.file("db.tdb"),
+        Config {
+            dim: 2,
+            payload_cache_bytes: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let large = "x".repeat(65536);
+    db.insert_with_id(1, &[1., 0.], json!(null)).unwrap();
+    db.insert_with_id(2, &[0., 1.], json!(&large)).unwrap();
+    db.set_hook(ReplaceSeed).unwrap();
+    let search = SearchConfig {
+        top_k: 1,
+        expand_depth: 0,
+        min_score: 0.9,
+        force_brute_force: true,
+        ..Default::default()
+    };
+    let base = db.instance_stats().memory.unwrap().estimated_memory_bytes;
+    db.set_memory_limit(base + 8192).unwrap();
+    let before = db.payload_memory_stats().payload_parsed_bytes;
+    let error = db.search_advanced(&[1., 0.], &search).unwrap_err();
+    assert_eq!(error.code(), "TDB_CAPACITY_RESERVATION_REJECTED");
+    assert!(db.payload_memory_stats().payload_parsed_bytes - before < large.len() as u64);
+    db.set_memory_limit(0).unwrap();
+    let hits = db.search_advanced(&[1., 0.], &search).unwrap();
+    assert_eq!(hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), [2]);
+    assert_eq!(hits[0].payload.as_str(), Some(large.as_str()));
+}
+
+#[test]
 fn 实例预算在检索解码和解析身份复制前生效() {
     use triviumdb::document::parsing::{DocumentFormat, DocumentParseInput};
     use triviumdb::index::pelorus::PelorusSearchOptions;
@@ -786,6 +832,23 @@ fn 实例预算在检索解码和解析身份复制前生效() {
     let before = db.payload_memory_stats().payload_parsed_bytes;
     assert_eq!(
         db.search_exact(&[0.25, 0.], 1).unwrap_err().code(),
+        "TDB_CAPACITY_RESERVATION_REJECTED"
+    );
+    let search = SearchConfig {
+        top_k: 1,
+        expand_depth: 0,
+        force_brute_force: true,
+        ..Default::default()
+    };
+    assert_eq!(db.search_ids(&[0.25, 0.], &search).unwrap(), [1]);
+    assert_eq!(
+        db.search_advanced(&[0.25, 0.], &search).unwrap_err().code(),
+        "TDB_CAPACITY_RESERVATION_REJECTED"
+    );
+    assert_eq!(
+        db.search_batch(&[vec![0.25, 0.]], &search, &Default::default())
+            .unwrap_err()
+            .code(),
         "TDB_CAPACITY_RESERVATION_REJECTED"
     );
     for filter in [None, Some(triviumdb::Filter::eq("missing", true.into()))] {

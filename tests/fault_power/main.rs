@@ -48,6 +48,65 @@ fn child_command() -> Command {
 }
 
 #[test]
+fn 同一实例限额下恢复已确认的大字符串() {
+    use triviumdb::database::StorageMode;
+    let config = triviumdb::database::Config {
+        dim: 2,
+        memory_limit: 4 << 20,
+        payload_cache_bytes: 0,
+        sync_mode: triviumdb::storage::wal::SyncMode::Full,
+        ..Default::default()
+    };
+    let payload = serde_json::json!("甲".repeat(87_000));
+    if let Some(path) = std::env::var_os("TRIVIUM_STRING_RECOVERY_PATH") {
+        let storage_mode = match std::env::var("TRIVIUM_STRING_RECOVERY_MODE")
+            .unwrap()
+            .as_str()
+        {
+            "Rom" => StorageMode::Rom,
+            "Mmap" => StorageMode::Mmap,
+            mode => panic!("未知存储模式：{mode}"),
+        };
+        let mut db = Database::<f32>::open_with_config(
+            path.to_str().unwrap(),
+            triviumdb::database::Config {
+                storage_mode,
+                ..config
+            },
+        )
+        .unwrap();
+        db.insert_with_id(4, &[1., 0.], payload).unwrap();
+        std::process::exit(0);
+    }
+    let directory = tempfile::tempdir().unwrap();
+    for storage_mode in [StorageMode::Rom, StorageMode::Mmap] {
+        let mode = format!("{storage_mode:?}");
+        let path = directory.path().join(format!("large-string-{mode}.tdb"));
+        let child = child_command()
+            .args(["--exact", "同一实例限额下恢复已确认的大字符串"])
+            .env("TRIVIUM_STRING_RECOVERY_PATH", &path)
+            .env("TRIVIUM_STRING_RECOVERY_MODE", &mode)
+            .output()
+            .unwrap();
+        assert!(child.status.success(), "{mode}: {child:?}");
+        for phase in ["WAL", "checkpoint"] {
+            let mut db = Database::<f32>::open_with_config(
+                path.to_str().unwrap(),
+                triviumdb::database::Config {
+                    storage_mode,
+                    ..config
+                },
+            )
+            .unwrap_or_else(|error| panic!("{mode} {phase}: {error}"));
+            let node = db.get(4).unwrap().unwrap();
+            assert_eq!(node.vector, [1., 0.]);
+            assert_eq!(node.payload, payload);
+            db.close().unwrap();
+        }
+    }
+}
+
+#[test]
 fn Pelorus曲率更新可随已确认向量写入恢复() {
     use triviumdb::database::{Config, StorageMode};
     use triviumdb::index::pelorus::{PelorusConfig, PelorusSearchOptions};

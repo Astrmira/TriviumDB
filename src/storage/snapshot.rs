@@ -141,6 +141,11 @@ pub(crate) fn write_manifest_with_write_info(
     write: &mut crate::error::WriteErrorInfo,
 ) -> Result<GenerationManifest> {
     validate_generation_id(generation_id)?;
+    #[cfg(feature = "test-hooks")]
+    crate::test_hooks::hit_for_path(
+        crate::test_hooks::ConcurrencyPoint::GenerationManifestHashing,
+        db_path,
+    );
     let files = generation_suffixes(db_path)
         .into_iter()
         .map(|suffix| checksum_file(Path::new(&format!("{db_path}{suffix}")), suffix))

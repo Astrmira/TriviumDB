@@ -17,6 +17,9 @@ function verifyHybridWeights(root, TriviumDB) {
     assert.deepEqual(hybrid(1), db.searchExact([1, 0], 2))
     assert.deepEqual(hybrid(0).map(hit => hit.id), [2])
     assert.deepEqual(hybrid(0.2).map(hit => hit.id), [2, 1])
+    db.link(1, 2, 'edge', 1)
+    const diagnosed = db.searchWithContext([1, 0], { topK: 2, minScore: 0.9, exact: true }).hits
+    assert.deepEqual(diagnosed.map(hit => [hit.id, hit.score, hit.payload]), [[1, 1, { name: 'z' }]])
     for (const alpha of [-1, 2, 1.00000001, NaN, Infinity]) {
       assert.throws(() => hybrid(alpha), error => error.code === 'TDB_INVALID_INPUT')
     }

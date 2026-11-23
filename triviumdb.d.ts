@@ -227,7 +227,7 @@ export interface JsSearchConfig {
   rerankK?: number;
   /** QuIVer 内部精排候选数。导航宽度至少覆盖此预算。 */
   annRerankLimit?: number;
-  /** 图谱扩散跳数 (默认 2) */
+  /** 图谱扩散跳数。searchWithContext 默认 0，searchAdvanced 默认 2。 */
   expandDepth?: number;
   /** 余弦相似度下限 (默认 0.0) */
   minScore?: number;

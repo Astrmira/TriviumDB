@@ -132,6 +132,7 @@ pub(crate) fn expand_graph_with_labels_view<T: crate::VectorType>(
         min_edge_weight,
         edge_direction,
         || Ok::<(), std::convert::Infallible>(()),
+        |_| Ok(()),
     ) {
         Ok(scores) => scores,
         Err(never) => match never {},
@@ -152,6 +153,7 @@ pub(crate) fn expand_graph_with_labels_checked<T: crate::VectorType, E>(
     min_edge_weight: f32,
     edge_direction: EdgeDirection,
     mut check: impl FnMut() -> Result<(), E>,
+    admit_hits: impl FnOnce(&[(NodeId, f32)]) -> Result<(), E>,
 ) -> Result<Vec<SearchHit>, E> {
     if max_depth == 0 || seeds.is_empty() {
         return Ok(seeds);
@@ -171,6 +173,7 @@ pub(crate) fn expand_graph_with_labels_checked<T: crate::VectorType, E>(
         edge_direction,
         |_| check(),
     )?;
+    admit_hits(&scores)?;
     let mut hits = Vec::with_capacity(scores.len());
     for (id, score) in scores {
         check()?;
@@ -290,18 +293,19 @@ pub(crate) fn expand_graph_checked<T: crate::VectorType, E>(
             }
 
             let restart_energy = curr_energy * alpha;
-            for (&seed_id, &share) in &seed_distribution {
-                let injected = restart_energy * share as f32;
-                activate(
-                    seed_id,
-                    injected,
-                    &mut total_activation,
-                    &mut next_tier,
-                    &mut metrics,
-                    &mut admit,
-                )?;
+            if restart_energy > 0.0 {
+                for (&seed_id, &share) in &seed_distribution {
+                    let injected = restart_energy * share as f32;
+                    activate(
+                        seed_id,
+                        injected,
+                        &mut total_activation,
+                        &mut next_tier,
+                        &mut metrics,
+                        &mut admit,
+                    )?;
+                }
             }
-
             let spread_budget = curr_energy * (1.0 - alpha);
             if spread_budget <= 0.0 {
                 continue;

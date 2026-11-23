@@ -16,6 +16,21 @@ def verify_search_entries(root):
         assert half.get(1).vector == [1.0009765625, 65504.0]
         assert [h.id for h in half.search_exact([1.0009765625, 65519.9999], 1)] == [1]
 
+    with triviumdb.TriviumDB(str(Path(root) / "context-default.tdb"), dim=2) as db:
+        db.insert_with_id(1, [1, 0], {"node": 1})
+        db.insert_with_id(2, [0, 1], {"node": 2})
+        db.link(1, 2, "edge", 1.0)
+        for hits in (db.search([1, 0], top_k=2, min_score=0.9, exact=True),
+                     db.search_with_context([1, 0], top_k=2, min_score=0.9, exact=True)[0]):
+            assert [(h.id, h.score, h.payload) for h in hits] == [(1, 1.0, {"node": 1})]
+        for method, argument in ((db.search_ids, [1, 0]), (db.search_ids_batch, [[1, 0]])):
+            try:
+                method(argument, top_k=0)
+            except triviumdb.InvalidInputError as error:
+                assert error.code == "TDB_INVALID_INPUT"
+            else:
+                raise AssertionError("零 top_k 必须拒绝")
+
     fixture = json.loads((Path(__file__).parents[1] / "contracts/search_entry_cases.json").read_text(encoding="utf-8"))
     records = {record["id"]: record for record in fixture["records"]}
     query = fixture["query"]

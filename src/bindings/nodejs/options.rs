@@ -87,7 +87,7 @@ pub(super) fn parse_search_config(
         expand_depth: parse_search_usize(
             env,
             object.get("expandDepth")?,
-            2.0,
+            if advanced { 2.0 } else { 0.0 },
             "expandDepth",
             false,
         )?,

@@ -221,12 +221,12 @@ impl PayloadStore {
 
     #[cfg(test)]
     pub(crate) fn open_sidecar(path: &Path) -> Result<(u64, Mmap, MappedPayloadRecords)> {
-        Self::open_sidecar_limited(path, |_| Ok(()))
+        Self::open_sidecar_limited(path, |_, _| Ok(()))
     }
 
     pub(crate) fn open_sidecar_limited(
         path: &Path,
-        admit: impl Fn(usize) -> Result<()>,
+        admit: impl Fn(usize, Option<&[u8]>) -> Result<()>,
     ) -> Result<(u64, Mmap, MappedPayloadRecords)> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file) }?;
@@ -272,7 +272,8 @@ impl PayloadStore {
         {
             return Err(TriviumError::CorruptedFile("Payload 文件布局无效".into()));
         }
-        admit(count.saturating_mul(std::mem::size_of::<(NodeId, Range<usize>)>()))?;
+        let directory_bytes = count.saturating_mul(std::mem::size_of::<(NodeId, Range<usize>)>());
+        admit(directory_bytes, None)?;
         let mut records = Vec::new();
         records.try_reserve_exact(count).map_err(|error| {
             TriviumError::CapacityAllocationFailed {
@@ -311,11 +312,7 @@ impl PayloadStore {
                     "Payload 记录 CRC 不匹配: node_id={id}"
                 )));
             }
-            admit(
-                count
-                    .saturating_mul(24)
-                    .saturating_add(raw.len().saturating_mul(64)),
-            )?;
+            admit(directory_bytes, Some(raw))?;
             validate_json(raw)?;
             records.push((id, offset..end));
             previous_id = id;

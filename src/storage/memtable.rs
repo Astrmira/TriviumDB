@@ -1065,7 +1065,7 @@ impl<T: VectorType> MemTable<T> {
             ));
         }
         // 包含 JSON 校验临时 DOM、容器倍增和新记录原始字节。
-        self.check_load_allocation(payload_raw.len().saturating_mul(64).saturating_add(1024))?;
+        self.check_load_payload_allocation(1024, Some(payload_raw))?;
         let idx = self.indices_to_ids.len();
         self.payloads.insert_raw(id, payload_raw)?;
         self.active_ids.insert(id);
@@ -2382,14 +2382,17 @@ impl<T: VectorType> MemTable<T> {
             return Ok(());
         }
         // 一次仅解析一条冷记录，读原始字节不会填充实例的 Payload 缓存。
-        let parse_peak = self
-            .payloads
-            .ids()
-            .filter_map(|id| self.payloads.raw(id))
-            .map(|raw| raw.len().saturating_mul(64))
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1024);
+        let parse_peak = if limit == 0 {
+            0
+        } else {
+            self.payloads
+                .ids()
+                .filter_map(|id| self.payloads.raw(id))
+                .try_fold(0, |peak: usize, raw| {
+                    super::payload_store::query_decode_peak(raw).map(|bytes| peak.max(bytes))
+                })?
+                .saturating_add(1024)
+        };
         self.ensure_additional_memory(limit, parse_peak)?;
         let mut build_peak = fields
             .iter()
@@ -2521,7 +2524,7 @@ impl<T: VectorType> MemTable<T> {
             let raw = self.payloads.raw(id).ok_or_else(|| {
                 TriviumError::CorruptedFile("索引缺少 Payload (Index payload is missing)".into())
             })?;
-            let parse_peak = raw.len().saturating_mul(64);
+            let parse_peak = super::payload_store::query_decode_peak(raw)?;
             self.check_load_allocation(peak.saturating_add(parse_peak))?;
             let payload = serde_json::from_slice(raw).map_err(|e| {
                 TriviumError::CorruptedFile(format!(
@@ -3594,6 +3597,21 @@ impl<T: VectorType> MemTable<T> {
 
     pub(crate) fn check_load_allocation(&self, additional: usize) -> Result<()> {
         self.ensure_additional_memory(self.load_memory_limit, additional)
+    }
+
+    pub(crate) fn check_load_payload_allocation(
+        &self,
+        additional: usize,
+        raw: Option<&[u8]>,
+    ) -> Result<()> {
+        if self.load_memory_limit == 0 {
+            return Ok(());
+        }
+        let decoded = raw
+            .map(super::payload_store::query_decode_peak)
+            .transpose()?
+            .unwrap_or(0);
+        self.check_load_allocation(additional.saturating_add(decoded))
     }
 
     pub(crate) fn finish_loading(

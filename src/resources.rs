@@ -763,10 +763,34 @@ impl RequestWorkspace {
 
     /// 先取得增量额度，再转入同一凭证。任一准入失败时原凭证原样保留。
     pub(crate) fn grow_by(&mut self, resident: usize, limit: usize, bytes: usize) -> Result<()> {
-        let mut added = Self::reserve(&self.shared.runtime, &self.ledger, resident, limit, bytes)?;
+        let added = Self::reserve(&self.shared.runtime, &self.ledger, resident, limit, bytes)?;
+        self.absorb(added);
+        Ok(())
+    }
+
+    /// 解码结束后仅保留结果常驻所需的额度。
+    pub(crate) fn resize_result(
+        &mut self,
+        retained: usize,
+        resident: usize,
+        limit: usize,
+    ) -> Result<()> {
+        if retained > self.shared.bytes {
+            return self.grow_by(resident, limit, retained - self.shared.bytes);
+        }
+        let excess = self.shared.bytes - retained;
+        if excess > 0 {
+            self.shared.resize(retained)?;
+            self.ledger.fetch_sub(excess, Ordering::AcqRel);
+        }
+        Ok(())
+    }
+
+    /// 将同一实例已准入的结果移交给批请求，保持连续记账。
+    pub(crate) fn absorb(&mut self, mut added: Self) {
+        assert!(Arc::ptr_eq(&self.ledger, &added.ledger));
         self.shared.bytes += added.shared.bytes;
         added.shared.bytes = 0;
-        Ok(())
     }
 }
 

@@ -118,6 +118,8 @@ impl IoCounters {
 }
 
 struct Job {
+    #[cfg(feature = "test-hooks")]
+    request_id: Option<String>,
     offset: u64,
     bytes: Vec<u8>,
     complete: mpsc::Sender<io::Result<Vec<u8>>>,
@@ -128,7 +130,10 @@ impl Job {
     fn finish(self, result: io::Result<()>, _notify: bool) {
         #[cfg(feature = "test-hooks")]
         if _notify {
-            crate::test_hooks::hit(crate::test_hooks::ConcurrencyPoint::QuiverColdIoCompleted);
+            crate::test_hooks::hit_for_request(
+                crate::test_hooks::ConcurrencyPoint::QuiverColdIoCompleted,
+                self.request_id.as_deref(),
+            );
         }
         let _ = self.complete.send(result.map(|()| self.bytes));
     }
@@ -454,6 +459,8 @@ impl AsyncReader {
             }
             let (complete, receiver) = mpsc::channel();
             let job = Job {
+                #[cfg(feature = "test-hooks")]
+                request_id: crate::request::current().map(|ctx| ctx.request_id().to_owned()),
                 offset,
                 bytes,
                 complete,

@@ -844,7 +844,7 @@ fn cancelled_waiter_leaves_the_shared_read_available_to_its_owner() {
 #[cfg(all(feature = "test-hooks", any(windows, target_os = "linux")))]
 #[test]
 fn cancellation_after_native_completion_drains_workers_and_releases_files() {
-    use crate::test_hooks::{ConcurrencyPoint, pause_at};
+    use crate::test_hooks::{ConcurrencyPoint, pause_at_request};
     let directory = TestDir::new("ssd_completion_cancel");
     let path = directory.0.join("index.qssd");
     let runtime = runtime();
@@ -866,7 +866,7 @@ fn cancellation_after_native_completion_drains_workers_and_releases_files() {
         .unwrap();
     let baseline = reader.stats().reserved_bytes;
     let reader = Arc::new(reader);
-    let gate = pause_at(ConcurrencyPoint::QuiverColdIoCompleted);
+    let gate = pause_at_request(ConcurrencyPoint::QuiverColdIoCompleted, "ssd-completion");
     let context = crate::sdk::RequestContext::with_timeout(
         "ssd-completion",
         std::time::Duration::ZERO,

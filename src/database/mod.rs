@@ -743,15 +743,7 @@ impl<T: VectorType> SearchHandle<T> {
         batch_config: &BatchSearchConfig,
     ) -> Result<(Vec<Vec<SearchHit>>, crate::resources::RequestWorkspace)> {
         self.search_batch_projected(query_vectors, search_config, batch_config, true, |hits| {
-            let bytes = hits.iter().fold(
-                hits.capacity().saturating_mul(size_of::<SearchHit>()),
-                |total, hit| {
-                    total.saturating_add(crate::storage::payload_store::query_clone_peak(
-                        &hit.payload,
-                    ))
-                },
-            );
-            (hits, bytes)
+            hits
         })
     }
 
@@ -762,9 +754,7 @@ impl<T: VectorType> SearchHandle<T> {
         batch_config: &BatchSearchConfig,
     ) -> Result<(Vec<Vec<NodeId>>, crate::resources::RequestWorkspace)> {
         self.search_batch_projected(query_vectors, search_config, batch_config, false, |hits| {
-            let ids: Vec<_> = hits.into_iter().map(|hit| hit.id).collect();
-            let bytes = ids.capacity().saturating_mul(size_of::<NodeId>());
-            (ids, bytes)
+            hits.iter().map(|hit| hit.id).collect()
         })
     }
 
@@ -774,17 +764,12 @@ impl<T: VectorType> SearchHandle<T> {
         search_config: &SearchConfig,
         batch_config: &BatchSearchConfig,
         include_payload: bool,
-        project: impl Fn(Vec<SearchHit>) -> (Vec<R>, usize) + Sync,
+        project: impl Fn(Vec<SearchHit>) -> Vec<R> + Sync,
     ) -> Result<(Vec<Vec<R>>, crate::resources::RequestWorkspace)> {
         let _operation = self.enter_operation()?;
         if search_config.enable_refractory_fatigue {
             return Err(TriviumError::InvalidInput(
                 "批量并行查询不支持 enable_refractory_fatigue".into(),
-            ));
-        }
-        if search_config.top_k == 0 {
-            return Err(TriviumError::InvalidInput(
-                "批量查询 top_k 必须大于 0".into(),
             ));
         }
         if batch_config.parallelism > 64 {
@@ -836,16 +821,11 @@ impl<T: VectorType> SearchHandle<T> {
                 None,
                 None,
                 include_payload,
-            )?
-            .combined_hits;
-            let (hits, bytes) = project(hits);
-            let resident = if self.memory_limit == 0 {
-                0
-            } else {
-                read_or_recover(&self.memtable).resident_memory_bytes()
-            };
-            lock_or_recover(&response).grow_by(resident, self.memory_limit, bytes)?;
-            Ok(hits)
+            )?;
+            if let Some(ticket) = hits.result_workspace {
+                lock_or_recover(&response).absorb(ticket);
+            }
+            Ok(project(hits.combined_hits))
         };
         let mut results = Vec::with_capacity(query_vectors.len());
         results.push(search_one(&query_vectors[0])?);
@@ -1134,14 +1114,14 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                 path,
                 config.memory_limit,
                 &restored_bytes,
-                |entry| {
+                |entry, held_bytes| {
                     if !base_seen {
                         base_seen = matches!(&entry, WalEntry::Checkpoint { token } if Some(*token) == checkpoint_token);
                         if !base_seen {
                             return Ok(());
                         }
                     }
-                    transaction::replay_entry(&mut memtable, entry)?;
+                    transaction::replay_entry(&mut memtable, entry, held_bytes)?;
                     memtable.check_load_allocation(0)?;
                     restored_bytes.set(memtable.estimated_memory_bytes());
                     entry_count = entry_count.saturating_add(1);
@@ -2493,8 +2473,6 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
     /// db.patch_payload(id, serde_json::json!({"$inc": {"visits": 1}}))?;
     /// // 删除字段
     /// db.patch_payload(id, serde_json::json!({"$unset": {"old_field": true}}))?;
-    /// // 简写模式（等价于 $set）
-    /// db.patch_payload(id, serde_json::json!({"name": "Bob"}))?;
     /// ```
     pub fn patch_payload(&mut self, id: NodeId, patch: serde_json::Value) -> Result<()> {
         Self::write_operation(|write| {
@@ -3978,16 +3956,23 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         WriteErrorInfo::capture_destination(|write| {
             let _operation = self.enter_maintenance_operation()?;
             self.require_write_access("publish_generation_manifest")?;
-            lock_or_recover(&self.wal).ensure_writable()?;
+            reject_hook_reentrant_access(&self.memtable)?;
+            let mut mt = write_or_recover(&self.memtable);
+            mt.ensure_readable()?;
+            let mut wal = lock_or_recover(&self.wal);
+            wal.ensure_writable()?;
             write.phase = WritePhase::Validation;
             crate::storage::snapshot::validate_generation_id(generation_id)?;
-            self.flush()?;
+            file_format::checkpoint(&mut mt, &mut wal, &self.db_path, self.storage_mode, false)?;
+            // 保持事实锁直到摘要、清单与目录同步完成，避免后台检查点跨代。
+            drop(wal);
+            mt.advise_cold_vectors_dontneed();
             crate::storage::snapshot::write_manifest_with_write_info(
                 &self.db_path,
                 generation_id,
                 std::any::type_name::<T>(),
-                self.dim(),
-                self.node_count()?,
+                mt.dim(),
+                mt.node_count(),
                 write,
             )
         })
@@ -4235,6 +4220,95 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Database::open(&dir.join("test.tdb").to_string_lossy(), 3).unwrap()
+    }
+
+    #[test]
+    fn 窄导航在有限共享工作区内返回真实命中() {
+        use crate::{ResourceLimits, ResourceRuntime, SearchConfig};
+        let root = tempfile::tempdir().unwrap();
+        let runtime = ResourceRuntime::new(ResourceLimits {
+            memory_limit: 64 << 20,
+            max_threads: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut db = Database::<f32>::open_with_runtime(
+            root.path().join("beam.tdb").to_str().unwrap(),
+            super::Config {
+                dim: 2,
+                memory_limit: 16 << 20,
+                auto_build_quiver: false,
+                ..Default::default()
+            },
+            runtime.clone(),
+        )
+        .unwrap();
+        let mut tx = super::TxBuilder::new();
+        for id in 1..=1024 {
+            tx.insert_with_id(id, &[1., 0.], json!(id));
+        }
+        db.commit_tx(tx).unwrap();
+        db.build_quiver_index(None).unwrap();
+        let config = SearchConfig {
+            top_k: 1,
+            expand_depth: 0,
+            min_score: 0.99,
+            ..Default::default()
+        };
+        let held = runtime
+            .reserve_workspace(runtime.stats().available_foreground_bytes.unwrap() - 32 * 1024)
+            .unwrap();
+        let hits = db.search_ids(&[1., 0.], &config).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!((1..=1024).contains(&hits[0]));
+        drop(held);
+        let node = db.get(hits[0]).unwrap().unwrap();
+        assert_eq!(node.vector, [1., 0.]);
+        assert_eq!(node.payload, json!(hits[0]));
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn 代际摘要期间阻止已捕获索引的并发发布() {
+        let mut db = open_db(&format!("manifest-build-{}", std::process::id()));
+        let path = db.db_path.clone();
+        let count = crate::storage::memtable::auto_quiver_node_threshold(3);
+        let mut tx = super::TxBuilder::new();
+        for id in 1..=count as u64 {
+            tx.insert_with_id(id, &[1., 2., 3.], json!(id));
+        }
+        db.commit_tx(tx).unwrap();
+        let build = db.prepare_auto_quiver_build().unwrap().unwrap();
+        let facts = db.memtable.clone();
+        let gate = crate::test_hooks::pause_at_path(
+            crate::test_hooks::ConcurrencyPoint::GenerationManifestHashing,
+            &path,
+        );
+        let publish = std::thread::spawn(move || {
+            let manifest = db.publish_generation_manifest("stable").unwrap();
+            (db, manifest)
+        });
+        gate.wait_until_arrived();
+        // 屏障位于摘要读取之前，构建和压实都必须取得同一把写锁。
+        assert!(matches!(
+            facts.try_write(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        let build = std::thread::spawn(move || build.execute());
+        gate.release();
+        let (mut db, manifest) = publish.join().unwrap();
+        assert!(build.join().unwrap().unwrap());
+        let verified = crate::storage::snapshot::validate_manifest(&path, "f32", 3).unwrap();
+        assert_eq!(
+            (verified.node_count, verified.generation_id.as_str()),
+            (count, "stable")
+        );
+        assert_eq!(
+            serde_json::to_value(verified.files).unwrap(),
+            serde_json::to_value(manifest.files).unwrap()
+        );
+        assert_eq!(db.get_payload(count as u64).unwrap(), Some(json!(count)));
+        db.close().unwrap();
     }
 
     #[cfg(feature = "test-hooks")]

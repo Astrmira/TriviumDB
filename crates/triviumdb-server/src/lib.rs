@@ -20,7 +20,7 @@ use protocol::{
     ApiError, BatchGetRequest, BulkEdgeRecord, BulkNodeRecord, ConditionalMutationRequest,
     DeleteManyRequest, ExecutePreparedRequest, HealthDetailsResponse, HealthResponse, IndexRequest,
     IndexedLookupRequest, PrepareRequest, SubstringLookupRequest, TqlRequest, TransactionOperation,
-    TransactionRequest, TransactionResponse, encode_node, projection_columns,
+    TransactionRequest, TransactionResponse, projection_columns,
 };
 use serde::Deserialize;
 use std::{
@@ -773,6 +773,7 @@ async fn search_vector(
         ann_rerank_limit: query.ann_rerank_limit,
         min_score: query.min_score,
         force_brute_force: query.force_brute_force,
+        expand_depth: 0,
         ..Default::default()
     };
     let (hits, version) = state
@@ -784,17 +785,29 @@ async fn search_vector(
         )
         .await?;
     let etag = version.global_etag();
-    let mut response = Json(serde_json::json!({
-        "hits": hits.into_iter().map(|hit| serde_json::json!({
-            "id": hit.id.to_string(),
-            "score": hit.score,
-            "payload": protocol::SafeJson(&hit.payload),
-        })).collect::<Vec<_>>(),
-        "generation": etag,
-    }))
-    .into_response();
-    insert_etag(response.headers_mut(), &etag)?;
-    Ok(response)
+    #[derive(serde::Serialize)]
+    struct Hit<'a> {
+        id: String,
+        score: f32,
+        payload: protocol::SafeJson<'a>,
+    }
+    #[derive(serde::Serialize)]
+    struct VectorResponse<'a> {
+        hits: Vec<Hit<'a>>,
+        generation: &'a str,
+    }
+    let body = VectorResponse {
+        hits: hits
+            .iter()
+            .map(|hit| Hit {
+                id: hit.id.to_string(),
+                score: hit.score,
+                payload: protocol::SafeJson(&hit.payload),
+            })
+            .collect(),
+        generation: &etag,
+    };
+    json_bytes_response(encode_bounded_json(&body, MAX_RESPONSE_BYTES)?, &etag)
 }
 
 async fn tql(
@@ -853,59 +866,83 @@ async fn tql(
 
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
+struct BoundedBody {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    exceeded: bool,
+}
+
+impl std::io::Write for BoundedBody {
+    fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+        if input.len() > self.max_bytes - self.bytes.len() {
+            self.exceeded = true;
+            return Err(std::io::Error::other(
+                "响应体超过上限 (Response exceeds limit)",
+            ));
+        }
+        let required = self.bytes.len() + input.len();
+        if required > self.bytes.capacity() {
+            let capacity = required
+                .max(self.bytes.capacity().saturating_mul(2))
+                .min(self.max_bytes);
+            self.bytes
+                .try_reserve_exact(capacity - self.bytes.len())
+                .map_err(std::io::Error::other)?;
+        }
+        self.bytes.extend_from_slice(input);
+        Ok(input.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl BoundedBody {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            max_bytes,
+            exceeded: false,
+        }
+    }
+    fn error(&self, error: impl std::fmt::Display) -> ApiError {
+        if self.exceeded {
+            ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "RESPONSE_TOO_LARGE",
+                "响应体超过上限 (Response too large)",
+                "请缩小结果集或请求投影 (Reduce the result set or project fewer fields)",
+                false,
+            )
+        } else {
+            ApiError::internal(error.to_string())
+        }
+    }
+    fn append(&mut self, bytes: &[u8]) -> Result<(), ApiError> {
+        std::io::Write::write_all(self, bytes).map_err(|err| self.error(err))
+    }
+    fn json(&mut self, value: &impl serde::Serialize) -> Result<(), ApiError> {
+        serde_json::to_writer(&mut *self, value).map_err(|err| self.error(err))
+    }
+}
+
 fn encode_bounded_json(
     value: &impl serde::Serialize,
     max_bytes: usize,
 ) -> Result<Vec<u8>, ApiError> {
-    struct BoundedBody {
-        bytes: Vec<u8>,
-        max_bytes: usize,
-        exceeded: bool,
-    }
-    impl std::io::Write for BoundedBody {
-        fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
-            if input.len() > self.max_bytes - self.bytes.len() {
-                self.exceeded = true;
-                return Err(std::io::Error::other(
-                    "响应体超过上限 (Response body exceeds limit)",
-                ));
-            }
-            let required = self.bytes.len() + input.len();
-            if required > self.bytes.capacity() {
-                let capacity = required
-                    .max(self.bytes.capacity().saturating_mul(2))
-                    .min(self.max_bytes);
-                self.bytes
-                    .try_reserve_exact(capacity - self.bytes.len())
-                    .map_err(std::io::Error::other)?;
-            }
-            self.bytes.extend_from_slice(input);
-            Ok(input.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    let mut writer = BoundedBody {
-        bytes: Vec::new(),
-        max_bytes,
-        exceeded: false,
-    };
-    if let Err(error) = serde_json::to_writer(&mut writer, value) {
-        if writer.exceeded {
-            return Err(ApiError::new(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "RESPONSE_TOO_LARGE",
-                "响应体超过上限 (Response too large)",
-                "请使用属性投影、LIMIT 或 NDJSON 流式响应 (Use property projection, LIMIT, or NDJSON streaming)",
-                false,
-            ));
-        }
-        return Err(ApiError::internal(error.to_string()));
-    }
+    let mut writer = BoundedBody::new(max_bytes);
+    writer.json(value)?;
     Ok(writer.bytes)
+}
+
+fn json_bytes_response(bytes: Vec<u8>, etag: &str) -> Result<Response, ApiError> {
+    let mut response = Response::new(Body::from(bytes));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    insert_etag(response.headers_mut(), etag)?;
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -1036,13 +1073,7 @@ fn query_response(
         },
         MAX_RESPONSE_BYTES,
     )?;
-    let mut response = Response::new(Body::from(encoded_bytes));
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    insert_etag(response.headers_mut(), &etag)?;
-    Ok(response)
+    json_bytes_response(encoded_bytes, &etag)
 }
 
 fn index_advice(query: &str, indexed_fields: &[String]) -> Vec<serde_json::Value> {
@@ -1113,7 +1144,7 @@ async fn get_node(
         })
         .collect::<Vec<_>>();
     let mut response = Json(serde_json::json!({
-        "node": encode_node(result.node),
+        "node": protocol::WireNode(&result.node),
         "generation": result.version.global_etag(),
         "version": node_etag,
         "edgeVersions": edge_versions,
@@ -1257,28 +1288,14 @@ async fn batch_get_nodes(
             "ids 数量必须为 1..=10000 (ids count must be 1..=10000)",
         ));
     }
-    let requested = request.ids.clone();
-    let (nodes, version) = state
+    let (bytes, version) = state
         .engine
         .batch_get_nodes(
             request.ids,
             request_deadline(Instant::now(), state.request_timeout)?,
         )
         .await?;
-    let found = nodes
-        .iter()
-        .map(|node| node.id)
-        .collect::<std::collections::HashSet<_>>();
-    let missing_ids = requested
-        .into_iter()
-        .filter(|id| !found.contains(id))
-        .map(|id| id.to_string())
-        .collect::<Vec<_>>();
-    Ok(Json(serde_json::json!({
-        "nodes": nodes.into_iter().map(encode_node).collect::<Vec<_>>(),
-        "missingIds": missing_ids,
-        "generation": version.global_etag(),
-    })))
+    json_bytes_response(bytes, &version.global_etag())
 }
 
 async fn get_paths(
@@ -1747,7 +1764,12 @@ async fn map_body_limit_error(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let response = next.run(request).await;
-    if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
+    if response.status() == StatusCode::PAYLOAD_TOO_LARGE
+        && response
+            .extensions()
+            .get::<protocol::StructuredErrorResponse>()
+            .is_none()
+    {
         ApiError::payload_too_large().into_response()
     } else {
         response

@@ -1644,8 +1644,8 @@ fn install_payload_sidecar_if_present<T: VectorType>(
         ));
     }
     let (generation, mmap, records) =
-        PayloadStore::open_sidecar_limited(Path::new(&path), |extra| {
-            memtable.check_load_allocation(extra)
+        PayloadStore::open_sidecar_limited(Path::new(&path), |extra, raw| {
+            memtable.check_load_payload_allocation(extra, raw)
         })?;
     memtable.check_load_allocation(records.len().saturating_mul(192))?;
     if generation != expected_generation {

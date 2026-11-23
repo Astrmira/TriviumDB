@@ -1184,8 +1184,7 @@ impl<T: VectorType> PipelineOperator<T> for FistaResidualRecall<T> {
         crate::vector::validate_query_vector(&self.query, context.memtable.dim())?;
         const MAX_CANDIDATES: usize = 512;
         const MAX_ITERATIONS: usize = 256;
-        if input.is_empty()
-            || input.len() > MAX_CANDIDATES
+        if input.len() > MAX_CANDIDATES
             || self.top_k == 0
             || self.iterations == 0
             || self.iterations > MAX_ITERATIONS
@@ -1198,12 +1197,15 @@ impl<T: VectorType> PipelineOperator<T> for FistaResidualRecall<T> {
                 "FISTA 参数或候选预算无效".into(),
             ));
         }
+        if input.is_empty() {
+            return Ok(NodeSet::empty());
+        }
         let gram_cells = input
             .len()
             .checked_mul(input.len())
             .ok_or_else(|| TriviumError::QueryExecution("FISTA Gram 矩阵预算溢出".into()))?;
         let gram_bytes = gram_cells
-            .checked_mul(std::mem::size_of::<f32>())
+            .checked_mul(std::mem::size_of::<f64>())
             .ok_or_else(|| TriviumError::QueryExecution("FISTA Gram 矩阵字节预算溢出".into()))?;
         if gram_bytes > context.budget.max_node_set_bytes {
             return Err(TriviumError::QueryExecution(
@@ -1214,7 +1216,7 @@ impl<T: VectorType> PipelineOperator<T> for FistaResidualRecall<T> {
             .memtable
             .resource_runtime()
             .reserve_workspace(gram_bytes)?;
-        context.charge_vectors(input.len().saturating_add(context.memtable.node_count()))?;
+        context.charge_vectors(input.len())?;
         let entities = input
             .rows()
             .iter()
@@ -1232,11 +1234,16 @@ impl<T: VectorType> PipelineOperator<T> for FistaResidualRecall<T> {
             .iter()
             .map(|value| value.to_f32())
             .collect::<Vec<_>>();
-        let (_, residual, norm) =
-            crate::cognitive::fista_solve(&query, &entities, self.lambda, self.iterations);
-        if norm <= self.threshold {
+        let Some(residual) = crate::cognitive::fista_recall_direction(
+            &query,
+            &entities,
+            self.lambda,
+            self.iterations,
+            self.threshold,
+        ) else {
             return Ok(NodeSet::empty());
-        }
+        };
+        context.charge_vectors(context.memtable.node_count())?;
         let mut inherited = input
             .into_rows()
             .into_iter()

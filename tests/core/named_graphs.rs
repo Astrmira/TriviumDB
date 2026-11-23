@@ -40,6 +40,29 @@ fn seed<T: VectorType + Serialize + DeserializeOwned>(db: &mut Database<T>) {
 }
 
 #[test]
+fn 遍历按返回子图收费并保留修订() {
+    let dir = TestDir::new("bounded-return-graph");
+    let mut db = Database::<f32>::open(&dir.file("data.tdb"), 2).unwrap();
+    seed(&mut db);
+    let graph = db.put_named_graph(graph(0), None).unwrap();
+    let scope = scope(&["词级图"]);
+    // 从终点出发时，无论允许几跳，响应均只有该成员及修订。
+    let expected =
+        json!({"revisions":{"词级图": graph.revision}, "members":[B.to_string()], "edges":[]});
+    let bytes = serde_json::to_vec(&expected).unwrap().len();
+    for depth in [0, 2] {
+        let mut limits = NamedGraphLimits {
+            max_return_bytes: bytes,
+            ..Default::default()
+        };
+        let result = db.traverse_named_graph(&scope, B, depth, &limits).unwrap();
+        assert_eq!(serde_json::to_value(result).unwrap(), expected);
+        limits.max_return_bytes -= 1;
+        assert!(db.traverse_named_graph(&scope, B, depth, &limits).is_err());
+    }
+}
+
+#[test]
 fn 命名图向量扩展与结构ID筛选使用同一图作用域() {
     use triviumdb::query::tql_executor::TqlValue;
     let dir = TestDir::new("named_graph_shorthand_scope");

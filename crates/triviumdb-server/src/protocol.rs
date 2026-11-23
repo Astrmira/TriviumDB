@@ -652,6 +652,9 @@ impl std::fmt::Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
+#[derive(Clone, Copy)]
+pub(crate) struct StructuredErrorResponse;
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let metric = self.metric();
@@ -674,6 +677,7 @@ impl IntoResponse for ApiError {
             retryable: self.retryable,
         };
         let mut response = (self.status, Json(body)).into_response();
+        response.extensions_mut().insert(StructuredErrorResponse);
         if let Some(metric) = metric {
             response.extensions_mut().insert(metric);
         }
@@ -719,19 +723,19 @@ pub fn projection_columns(
         .collect()
 }
 
-pub fn encode_node(node: triviumdb::node::NodeView<f32>) -> serde_json::Value {
-    serde_json::json!({
-        "type": "node",
-        "id": node.id.to_string(),
-        "vector": node.vector,
-        "payload": SafeJson(&node.payload),
-        "edges": node.edges.into_iter().map(|edge| serde_json::json!({
-            "targetId": edge.target_id.to_string(),
-            "label": edge.label,
-            "weight": edge.weight,
-            "metadata": SafeJson(&edge.metadata),
-        })).collect::<Vec<_>>(),
-    })
+pub(crate) struct WireNode<'a>(pub(crate) &'a triviumdb::node::NodeView<f32>);
+
+impl Serialize for WireNode<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let node = self.0;
+        let mut value = serializer.serialize_struct("Node", 5)?;
+        value.serialize_field("type", "node")?;
+        value.serialize_field("id", &DecimalId(node.id))?;
+        value.serialize_field("vector", &node.vector)?;
+        value.serialize_field("payload", &SafeJson(&node.payload))?;
+        value.serialize_field("edges", &EdgeList(&node.edges))?;
+        value.end()
+    }
 }
 
 const JS_MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
@@ -814,15 +818,7 @@ impl Serialize for QueryValue<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use TqlValue::*;
         match self.0 {
-            Node(node) => {
-                let mut value = serializer.serialize_struct("Node", 5)?;
-                value.serialize_field("type", "node")?;
-                value.serialize_field("id", &DecimalId(node.id))?;
-                value.serialize_field("vector", &node.vector)?;
-                value.serialize_field("payload", &SafeJson(&node.payload))?;
-                value.serialize_field("edges", &EdgeList(&node.edges))?;
-                value.end()
-            }
+            Node(node) => WireNode(node).serialize(serializer),
             Edge(edge) => {
                 let mut value = serializer
                     .serialize_struct("Edge", 6 + usize::from(edge.graph_id.is_some()))?;

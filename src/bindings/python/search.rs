@@ -111,7 +111,7 @@ impl PyTriviumDB {
     /// print(ctx.timings)   # {'hook_pre_search': 0.1, 'graph_expand': 2.3, ...}
     /// print(ctx.custom_data)  # Hook 注入的自定义数据
     /// ```
-    #[pyo3(signature = (query_vector, top_k=integer_argument(5), recall_k=integer_argument(0), rerank_k=integer_argument(0), expand_depth=integer_argument(2), min_score=float_argument(0.0), payload_filter=None, *, exact=boolean_argument(false), ann_rerank_limit=None), text_signature="($self, query_vector, top_k=5, recall_k=0, rerank_k=0, expand_depth=2, min_score=0.0, payload_filter=None, *, exact=False, ann_rerank_limit=None)")]
+    #[pyo3(signature = (query_vector, top_k=integer_argument(5), recall_k=integer_argument(0), rerank_k=integer_argument(0), expand_depth=integer_argument(0), min_score=float_argument(0.0), payload_filter=None, *, exact=boolean_argument(false), ann_rerank_limit=None), text_signature="($self, query_vector, top_k=5, recall_k=0, rerank_k=0, expand_depth=0, min_score=0.0, payload_filter=None, *, exact=False, ann_rerank_limit=None)")]
     fn search_with_context(
         slf: &Bound<'_, Self>,
         py: Python<'_>,

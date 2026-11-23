@@ -6,6 +6,79 @@ use triviumdb::database::{Config, StorageMode};
 use triviumdb::query::tql_executor::TqlValue;
 use triviumdb::{Database, HookContext, SearchConfig, SearchHit, SearchHook};
 
+#[test]
+fn 残差按输入尺度拟合并按执行阶段计费() {
+    use triviumdb::query::pipeline::{
+        FistaResidualRecall, NodeSet, PipelineBudget, PipelineContext, PipelineOperator,
+    };
+    use triviumdb::storage::memtable::MemTable;
+    for (scale, lambda, expected_weight) in [(1e20_f32, 0.1, 1.0), (1e-6, 2.5e-13, 0.75)] {
+        let (weights, _, norm) =
+            triviumdb::cognitive::fista_solve(&[scale], &[vec![scale]], lambda, 30);
+        assert!((weights[0] - expected_weight).abs() < 1e-5);
+        assert!((norm / scale - (1.0 - expected_weight)).abs() < 1e-5);
+    }
+    let mut mt = MemTable::<f32>::new(2);
+    mt.insert_with_id(1, &[1., 0.], json!({})).unwrap();
+    mt.insert_with_id(2, &[0., 1.], json!({})).unwrap();
+    let mut op = FistaResidualRecall {
+        query: vec![1., 0.],
+        top_k: 1,
+        lambda: 0.1,
+        threshold: 0.3,
+        iterations: 30,
+    };
+    let budget = || PipelineBudget {
+        max_vector_read_bytes: 8,
+        ..Default::default()
+    };
+    assert!(
+        op.apply(
+            NodeSet::from_ids([1]),
+            &mut PipelineContext::new(&mt, budget())
+        )
+        .unwrap()
+        .is_empty()
+    );
+    op.threshold = 0.;
+    assert!(
+        op.apply(
+            NodeSet::from_ids([1]),
+            &mut PipelineContext::new(&mt, budget())
+        )
+        .is_err()
+    );
+    assert!(
+        op.apply(NodeSet::empty(), &mut PipelineContext::new(&mt, budget()))
+            .unwrap()
+            .is_empty()
+    );
+    op.iterations = 0;
+    assert_eq!(
+        op.apply(NodeSet::empty(), &mut PipelineContext::new(&mt, budget()))
+            .unwrap_err()
+            .code(),
+        "TDB_INVALID_INPUT"
+    );
+}
+
+#[test]
+fn 残差查询区分拟合完成与上游空集() {
+    let root = TestDir::new("residual-query");
+    let mut db = Database::<f32>::open(&root.file("data.tdb"), 2).unwrap();
+    db.insert_with_id(1, &[1e20, 0.], json!({})).unwrap();
+    db.insert_with_id(2, &[0., 1e20], json!({})).unwrap();
+    for input in ["SEARCH VECTOR [1e20,0] TOP 1 AS s", "MATCH (s {id:999})"] {
+        let query = format!(
+            "{input} WITH s RESIDUAL s BY VECTOR [1e20,0] TOP 1 LAMBDA 0.1 THRESHOLD 1 ITERATIONS 30 AS r WITH r RETURN id(r) AS id"
+        );
+        assert!(db.tql(&query).unwrap().is_empty());
+    }
+    let rows = db.tql("MATCH (s {id:1}) WITH s RESIDUAL s BY VECTOR [0,1e20] TOP 1 LAMBDA 0.1 THRESHOLD 1 ITERATIONS 30 AS r WITH r RETURN id(r) AS id").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(scalar(&rows[0]["id"]), json!(2));
+}
+
 struct HighQualityRecall;
 
 fn scalar(value: &TqlValue<f32>) -> serde_json::Value {

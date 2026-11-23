@@ -89,7 +89,12 @@ fn 同节点身份向量更新保留单一活跃行并拒绝双活跃记录() {
     index.insert(&[1.], 1, 0, &mut seed);
     index.insert(&[-1.], 2, 1, &mut seed);
     assert!(index.soft_delete(1));
+    assert!(index.soft_delete(1));
+    assert_eq!(index.active_count(), 1);
+    assert_eq!(index.stats().tombstone_count, 1);
     index.insert(&[2.], 1, 0, &mut seed);
+    index.dirty_count_inc();
+    assert_eq!(index.active_count(), 2);
     let root = support::TestDir::new("quiver_updated_id");
     let path = root.file("index.quiver");
     index.save_to_file(Path::new(&path)).unwrap();
@@ -104,6 +109,8 @@ fn 同节点身份向量更新保留单一活跃行并拒绝双活跃记录() {
     {
         let mut bytes = persisted.clone();
         let mut loaded = QuIVer::load_from_bytes(&bytes).unwrap();
+        assert_eq!(loaded.active_count(), 2);
+        assert_eq!(loaded.stats().tombstone_count, 1);
         assert!(loaded.default_sm_l2_enabled());
         assert_eq!(
             loaded.search_flat(
@@ -131,6 +138,11 @@ fn 同节点身份向量更新保留单一活跃行并拒绝双活跃记录() {
             ),
             [(2, -1.)]
         );
+        assert!(loaded.soft_delete(2));
+        assert_eq!(loaded.active_count(), 0);
+        loaded.batch_build(&[1.], &[3], &[0]);
+        assert_eq!(loaded.active_count(), 1);
+        assert_eq!(loaded.stats().tombstone_count, 0);
         bytes[tombstone_offset] = 0;
         let error = QuIVer::load_from_bytes(&bytes)
             .err()

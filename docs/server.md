@@ -198,7 +198,7 @@ curl -X POST http://127.0.0.1:8080/v1/tql \
 
 Server 不为认知算子维护另一套 HTTP API；`TEXT`、`RESIDUAL`、`DIVERSIFY`、`TOPICS` 和 `SA_PPR_CONFIG` 均通过 `/v1/tql` 使用 Core 的相同 Parser、Cascades、预算和确定性语义。Refractory Fatigue 未开放为普通 TQL 算子，因为它会修改进程内检索状态。
 
-普通 JSON 查询响应在编码过程中实施 16 MiB 硬上限。超限返回 `413 TDB_HTTP_RESPONSE_TOO_LARGE`，旧类别保存在 legacyCode。可使用属性投影、`LIMIT` 或 NDJSON 响应控制返回量。
+TQL 普通 JSON、`/v1/search/vector` 和 `/v1/nodes/batch-get` 在编码过程中执行 16 MiB 响应上限。超限返回 `413 TDB_HTTP_RESPONSE_TOO_LARGE`。TQL 可缩小投影、设置 `LIMIT` 或使用 NDJSON，向量检索可降低 `top_k`，批量读取可拆分 ID 列表。
 
 请求头设置 `Accept: application/x-ndjson` 时，响应按 `meta → row... → summary` 输出；`meta.columns` 明确声明每个投影列的 `node`、`edge`、`path` 或标量类型。同一列含多种非空类型时标记为 `mixed`，只有空值或零行时标记为 `null`。普通 JSON 响应也在顶层 `columns` 返回相同元数据。HTTP 输出逐行生成，但排序、聚合和 Top-K 等 Core 算子仍可能先物化结果。
 
@@ -241,7 +241,7 @@ Content-Type: application/vnd.triviumdb.vector+f32
 | `recall_k` | `0`（Core 自动） | 不超过 `100000` |
 | `rerank_k` | `0`（Core 自动） | 不超过 `100000` |
 | `min_score` | `-1.0` | 必须为有限值 |
-| `force_brute_force` | `false` | true 时请求精确暴力搜索 |
+| `force_brute_force` | `false` | `true` 时精确扫描存储向量。此端点按向量相似度应用 `min_score`，扩散查询使用 TQL。 |
 
 查询向量中的 NaN/Infinity 会被拒绝。
 
@@ -317,7 +317,7 @@ Writer Actor 由 supervisor 监管。异常退出会设置失败状态、关闭�
 - TQL mutation 当前保守失效此前签发的全部细粒度节点/边 ETag；
 - 幂等缓存与 Server generation 不持久化；
 - 启动预热和手工构建共享一个 QuIVer 任务。已有任务运行时，重复构建请求返回 `published: false`。等待请求超时后，可通过 `GET /v1/indexes/quiver` 查看任务的实际结果。数据量不足、索引已就绪或配置禁用时也返回 `published: false`；
-- JSON 响应受 16 MiB 上限约束；NDJSON 只流式编码 HTTP 输出，Core 算子仍受自己的内存与查询预算约束；
+- TQL 的 NDJSON 响应流式编码 HTTP 输出，Core 算子仍按各自的内存与查询预算执行。
 - 安装方式和跨平台二进制以 GitHub Release 的 nightly 说明为准。
 
 ---

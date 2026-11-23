@@ -143,6 +143,8 @@ Hot 驻留保存压缩记录与共享均值，评分按组解包。SSD 驻留使
 
 `use_for_ann=true` 接入普通混合检索中的 QuIVer 召回与 TQL QuIVer 向量来源。文档 ANN 和混合检索通过 `DocumentVectorOptions.rerank="compressed"` 独立选择压缩 Reader，复用已配置的编码、查询精度、Hot／SSD 与缓存预算。文档默认 `rerank="original"`，结果通过 `retrieval.compression` 返回实际压缩配置。详见[文档向量与混合召回](documents.md#文档向量与混合召回)。TQL 的压缩重排分数标记为 Approximate。原始向量精确扫描通过现有精确入口选择。默认配置为 codec 1、INT8 查询、SSD 驻留、零 Ready 缓存以及 `use_for_ann=false`。
 
+配置一次后，普通 Python ANN 可以直接传入查询向量。只取 ID 时使用 `db.search_ids(query_vector, top_k=10, recall_k=88, ann_rerank_limit=64)`，需要分数及 Payload 时使用 `db.search`。Node.js 对应 `db.searchIds(queryVector, { topK: 10, recallK: 88, annRerankLimit: 64 })`。这些入口使用当前压缩重排配置，查询向量无需逐条转成 JSON。需要逐请求 I/O 统计时使用下文的 `quiver_request` 或 `quiverRequest`。
+
 普通查询按实际使用的来源准备压缩索引。精确扫描、纯文本及图文档查询、仅输出计划的 `EXPLAIN` 直接使用各自的数据来源。向量写入后的压缩代际刷新由后续压缩 ANN 或显式维护操作触发。
 
 > **精度提醒**　中心化 INT4 与中心化 INT8 的召回代价随数据分布和工作点变化。查询精度、编码与实际驻留方式均由统计返回，应用应在自身数据上选择配置。当前可用查询精度为 FP32、INT8 和 INT4。

@@ -2000,6 +2000,58 @@ async fn ndjson导入失败保持事务原子性() {
 }
 
 #[tokio::test]
+async fn 向量和批量节点响应按编码后字节数拒绝超限结果() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("response-limit.tdb");
+    let config = Config {
+        dim: 2,
+        auto_build_quiver: false,
+        ..Default::default()
+    };
+    {
+        let mut db =
+            triviumdb::Database::<f32>::open_with_config(path.to_str().unwrap(), config).unwrap();
+        // 三个节点的 JSON 字符串转义后各占 6 MiB，任一节点均符合单条写入上限。
+        let payload = serde_json::json!("\n".repeat(3 * 1024 * 1024));
+        for id in 1..=3 {
+            db.insert_with_id(id, &[1., 0.], payload.clone()).unwrap();
+        }
+        db.close().unwrap();
+    }
+    let (app, shutdown) = triviumdb_server::build_app_with_shutdown(ServerConfig {
+        database_path: path,
+        database: config,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let vector = [1.0f32.to_le_bytes(), 0.0f32.to_le_bytes()].concat();
+    for response in [
+        raw_request(
+            app.clone(),
+            "POST",
+            "/v1/search/vector?top_k=3&force_brute_force=true",
+            vector,
+            &[("content-type", "application/vnd.triviumdb.vector+f32")],
+        )
+        .await,
+        request(
+            app.clone(),
+            "POST",
+            "/v1/nodes/batch-get",
+            Some(serde_json::json!({"ids":["1","1","1"]})),
+            &[],
+        )
+        .await,
+    ] {
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let error = json(response).await;
+        assert_eq!(error["code"], "TDB_HTTP_RESPONSE_TOO_LARGE");
+    }
+    shutdown.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn 二进制f32向量检索与边界校验() {
     let (app, _directory) = app("binary_vector").await;
     request(
@@ -2007,7 +2059,11 @@ async fn 二进制f32向量检索与边界校验() {
         "POST",
         "/v1/transactions",
         Some(serde_json::json!({
-            "operations": [{"op": "insert", "id": 1, "vector": [1.0, 0.0], "payload": {"name": "near"}}]
+            "operations": [
+                {"op": "insert", "id": 1, "vector": [1.0, 0.0], "payload": {"name": "near"}},
+                {"op": "insert", "id": 2, "vector": [0.0, 1.0], "payload": {}},
+                {"op": "link", "source": 1, "target": 2, "label": "edge", "weight": 1.0}
+            ]
         })),
         &[],
     )
@@ -2016,13 +2072,16 @@ async fn 二进制f32向量检索与边界校验() {
     let response = raw_request(
         app.clone(),
         "POST",
-        "/v1/search/vector?top_k=1",
+        "/v1/search/vector?top_k=2&min_score=0.9&force_brute_force=true",
         bytes,
         &[("content-type", "application/vnd.triviumdb.vector+f32")],
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(json(response).await["hits"][0]["id"], "1");
+    assert_eq!(
+        json(response).await["hits"],
+        serde_json::json!([{"id":"1", "score":1.0, "payload":{"name":"near"}}])
+    );
 
     let invalid = raw_request(
         app.clone(),
