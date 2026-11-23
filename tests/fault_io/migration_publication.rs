@@ -173,7 +173,8 @@ fn 迁移在公开目标前预留最终实例配额() {
     assert_eq!(error.code(), "QueueFull");
     assert_eq!(
         error.details(),
-        json!({"resource":"memory_bytes","requested":6 * MB,"used":2 * MB,"limit":7 * MB})
+        // 提交屏障处还持有返回给调用方的单个 u64 节点 ID。
+        json!({"resource":"memory_bytes","requested":6 * MB,"used":2 * MB + size_of::<u64>(),"limit":7 * MB})
     );
     assert!(!std::path::Path::new(&blocker).exists());
     pause.release();

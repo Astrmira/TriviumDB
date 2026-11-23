@@ -5,6 +5,28 @@ use triviumdb::database::{BatchSearchConfig, Config, SearchConfig, StorageMode};
 use triviumdb::{Database, TriviumError, VectorType};
 
 #[test]
+fn 精确前缀将收窄后的两种零分按节点身份排序() {
+    let root = TestDir::new("zero-score-ties");
+    let mut db = Database::<f32>::open(&root.file("db.tdb"), 2).unwrap();
+    let query = [1., 0.];
+    for (id, sign) in [(2, 1.), (1, -1.)] {
+        db.insert_with_id(id, &[sign * f32::MIN_POSITIVE, f32::MAX], json!({}))
+            .unwrap();
+    }
+    for k in [1, 2] {
+        for hits in [
+            db.search_exact(&query, k).unwrap(),
+            db.search_graph_first(&query, &[2, 1], k, 2).unwrap(),
+        ] {
+            assert_eq!(
+                hits.iter().map(|h| (h.id, h.score)).collect::<Vec<_>>(),
+                [(1, 0.), (2, 0.)][..k]
+            );
+        }
+    }
+}
+
+#[test]
 fn 纯向量请求加载返回项的_payload_且诊断采用独立的_ann_预算() {
     let root = TestDir::new("vector_search_budget");
     let mut db = Database::<f32>::open_with_config(
@@ -63,6 +85,8 @@ fn 纯向量请求加载返回项的_payload_且诊断采用独立的_ann_预算
         check(hits);
         for (key, value) in [
             ("vector_route_quiver", 1),
+            ("vector_route_exact", 0),
+            ("quiver_fallback_filtered", 0),
             ("quiver_ef_search", expected_ef),
             ("quiver_top_k", 10),
             ("quiver_rerank_limit", expected_budget),
@@ -119,6 +143,27 @@ fn 纯向量请求加载返回项的_payload_且诊断采用独立的_ann_预算
         db.payload_memory_stats().payload_lookups,
         before.payload_lookups
     );
+    for (force_brute_force, quiver) in [(false, 1), (true, 0)] {
+        let filtered = SearchConfig {
+            payload_filter: Some(triviumdb::Filter::Eq("编号".into(), json!(1))),
+            force_brute_force,
+            ..config.clone()
+        };
+        let (hits, context) = db
+            .search_hybrid_with_context(None, Some(&query), &filtered)
+            .unwrap();
+        assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), [1]);
+        for (key, value) in [
+            ("vector_route_quiver", quiver),
+            ("vector_route_exact", 1),
+            ("quiver_fallback_filtered", quiver),
+        ] {
+            assert!(
+                context.observations.contains(&(key.into(), value)),
+                "{key}={value}"
+            );
+        }
+    }
     let error = db
         .search_advanced(
             &query,

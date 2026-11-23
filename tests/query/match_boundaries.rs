@@ -16,6 +16,32 @@ fn number(value: &TqlValue<f32>) -> u64 {
 }
 
 #[test]
+fn 去重代表行与分页独立于索引访问顺序() {
+    let root = TestDir::new("distinct-representative");
+    let path = root.file("data.tdb");
+    let mut db = Database::<f32>::open(&path, 1).unwrap();
+    for (id, group, v) in [(3, "a", 10), (2, "b", 5), (1, "a", 0)] {
+        db.insert_with_id(id, &[1.], json!({"flag":true,"g":group,"v":v}))
+            .unwrap();
+    }
+    let pages = |db: &Database<f32>| {
+        for (offset, expected) in [(0, "b"), (1, "a")] {
+            let query = format!(
+                "FIND {{flag:true}} RETURN DISTINCT _.g AS g ORDER BY _.v DESC LIMIT 1 OFFSET {offset}"
+            );
+            let rows = db.tql(&query).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert!(matches!(&rows[0]["g"], TqlValue::String(s) if s == expected));
+        }
+    };
+    pages(&db);
+    db.create_ordered_index("v").unwrap();
+    pages(&db);
+    db.close().unwrap();
+    pages(&Database::<f32>::open(&path, 1).unwrap());
+}
+
+#[test]
 fn 属性索引与反转计划保持平行边的完整行重数() {
     let contract: serde_json::Value =
         serde_json::from_str(include_str!("../contracts/graph_query_boundaries.json")).unwrap();
@@ -182,11 +208,16 @@ fn 预算仅覆盖返回页与实际节点投影() {
     for error in [
         db.edge_page(3, Default::default(), None, 0, 1).unwrap_err(),
         db.reachable_detailed(3, &Default::default()).unwrap_err(),
-        db.search_graph_first(&[1.], &vec![1; 16384], 1, 1)
-            .unwrap_err(),
     ] {
         assert_eq!(error.code(), "TDB_CAPACITY_RESERVATION_REJECTED");
     }
+    let hits = db.search_graph_first(&[1.], &vec![1; 16384], 1, 1).unwrap();
+    assert_eq!(
+        hits.iter()
+            .map(|hit| (hit.id, hit.score))
+            .collect::<Vec<_>>(),
+        [(1, 1.)]
+    );
     assert_eq!(
         db.edge_page(3, Default::default(), None, 1, 1)
             .unwrap()

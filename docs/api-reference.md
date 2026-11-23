@@ -869,7 +869,9 @@ const detailed = db.searchAdvanced(queryVector, {
 
 Python `search`、`search_batch`、`search_grouped`、`search_with_context`、`search_advanced` 与 `search_hybrid` 均接受关键字参数 `exact`。Node 的 `search`、`searchBatch`、`searchGrouped`、`searchHybrid` 在既有位置参数之后追加可选 `exact`，`searchAdvanced` 和 `searchWithContext` 使用配置字段 `exact`。高级入口保留 `force_brute_force`／`forceBruteForce`，两个开关任一为真时选择精确召回。Rust `with_exact(bool)` 设置同一 `force_brute_force` 字段。
 
-> **资源提醒**　精确召回扫描全部符合条件的存储向量，查询成本随数据量和维度增长。取消、只读和资源预算继续由内核执行。`search_with_context`／`searchWithContext` 的 `observations.vector_route_quiver` 为 `0` 时表示实际向量召回走精确路径，为 `1` 时表示 QuIVer 路径。
+> **资源提醒**　精确召回扫描全部符合条件的存储向量，查询成本随数据量和维度增长。取消、只读和资源预算继续由内核执行。
+
+诊断检索的 `observations` 分别记录主向量召回实际执行的路径。`vector_route_quiver=1` 表示执行过 QuIVer，`vector_route_exact=1` 表示执行过精确扫描。QuIVer 过滤后命中不足而回退时，两项均为 `1`，并记录 `quiver_fallback_filtered=1`。
 
 **返回值 `SearchHit`：**
 
@@ -1708,7 +1710,7 @@ Rust 内存参数单位为字节，Python/Node 参数单位为 MiB。有共享�
 
 `InstanceStats.memory` 包含 `reserved_database_bytes`、`estimated_memory_bytes`、`node_count`。MemTable 写锁繁忙时返回 `None` / `null`，表示本次采样暂不可用。共享余额由 `available_foreground_bytes`、`available_maintenance_bytes`、`available_task_slots` 提供，未设置对应上限时为 `None` / `null`。
 
-运行时资源拒绝在 Rust 中返回 `ResourceBudgetExceeded { resource, requested, used, limit }`；Python 抛出 `ResourceBudgetError`，Node 错误码为 `QueueFull`，两端均携带上述四个字段。Node `searchBatch()` 的 Promise 拒绝采用相同字段。
+运行时资源拒绝在 Rust 中返回 `ResourceBudgetExceeded { resource, requested, used, limit }`。Python 抛出 `ResourceBudgetError`，Node 错误码为 `QueueFull`，两端均携带上述四个字段。Node 的 `searchBatch()` 和 `searchIdsBatch()` 通过 Promise 拒绝交付相同字段。
 
 ```python
 from triviumdb import ResourceBudgetError
@@ -1867,6 +1869,8 @@ Mmap 只读打开在采用 `.gidx` 前校验所有边块、派生目录与主文
 ### migrate — 迁移到新维度
 
 将当前数据库的所有节点 Payload、图谱边复制到一个全新的数据库文件中，向量以零向量占位（因为维度变了，旧向量无法直接复用）。
+
+启用 Pelorus 的源库会将曲率与建图、精排配置带入目标库。目标库从首次回填起按同一曲率校验向量。派生图按新维度重建，重建前按目标实例的缺失索引策略处理查询。
 
 目标须避开源库制品名称和文件路径。冲突返回 `TDB_INVALID_INPUT`。独立目标已有主文件或制品时返回 `TDB_IO`，`details.io_kind` 为 `AlreadyExists`。这些检查在创建目标租约、暂存库或发布日志前执行，覆盖 Windows 的 Unicode 大小写别名。
 

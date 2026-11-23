@@ -34,6 +34,7 @@ module.exports = async function requestContexts(root, api = require('../../index
     const child = new RequestContext('child')
     assert.throws(() => context.run(() => child.run(() => db.get(fixture.id))), error => error.code === fixture.cancelCode)
     await assert.rejects(context.run(() => db.searchBatch([fixture.vector])), error => error.code === fixture.cancelCode)
+    await assert.rejects(context.run(() => db.searchIdsBatch([fixture.vector])), error => error.code === fixture.cancelCode)
     const cause = new Error('宿主原异常')
     assert.throws(() => child.run(() => { throw cause }), error => error === cause)
     const nested = (depth, operation) => depth === 0 ? operation() : child.run(() => nested(depth - 1, operation))

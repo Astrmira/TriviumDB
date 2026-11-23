@@ -39,7 +39,7 @@ async function verifySearchEntries(root, TriviumDB) {
     Object.defineProperty(tooWide, 0, { get() { throw new Error('超额行不应开始读取元素') } })
     for (const search of [q => budgeted.searchIdsBatch(q), q => budgeted.searchBatch(q)]) {
       for (const input of [[tooWide], new Float32Array(512 * 1024)]) {
-        assert.throws(() => search(input), error => error.code === 'TDB_CAPACITY_RESERVATION_REJECTED')
+        await assert.rejects(search(input), error => error.code === 'TDB_CAPACITY_RESERVATION_REJECTED')
       }
     }
     assert.deepEqual(await budgeted.searchIdsBatch([[1, 0]], { exact: true }), [[7]])

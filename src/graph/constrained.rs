@@ -23,22 +23,28 @@ pub fn rank_within<T: VectorType>(
             "GraphFirst top_k 和 max_anchor_nodes 必须大于 0".into(),
         ));
     }
-    let bytes = anchor_ids
-        .len()
-        .checked_mul(std::mem::size_of::<NodeId>() * 2)
-        .ok_or_else(|| TriviumError::CapacityAllocationFailed {
-            reason: "GraphFirst anchor 工作区溢出 (GraphFirst anchor workspace overflowed)".into(),
-        })?;
-    let _workspace = db.reserve_instance_workspace(bytes)?;
-    let mut anchors = anchor_ids.to_vec();
-    anchors.sort_unstable();
-    anchors.dedup();
-    if anchors.len() > max_anchor_nodes {
-        return Err(TriviumError::QueryExecution(format!(
-            "GraphFirst anchor 数量 {} 超过预算 {}",
-            anchors.len(),
-            max_anchor_nodes
-        )));
+    let mut workspace = db.reserve_instance_workspace(0)?;
+    let mut anchors = std::collections::BTreeSet::new();
+    let mut admitted = 0usize;
+    for &id in anchor_ids {
+        crate::request::check_current()?;
+        if anchors.contains(&id) {
+            continue;
+        }
+        if anchors.len() == max_anchor_nodes {
+            return Err(TriviumError::QueryExecution(format!(
+                "GraphFirst 唯一候选超过预算 {max_anchor_nodes} (GraphFirst unique anchor limit exceeded)"
+            )));
+        }
+        if anchors.len() == admitted {
+            admitted = admitted.saturating_mul(2).max(1).min(max_anchor_nodes);
+            // 首个树节点及后续分裂的空间随唯一候选数增长。
+            db.resize_instance_workspace(
+                &mut workspace,
+                128usize.saturating_add(admitted.saturating_mul(32)),
+            )?;
+        }
+        anchors.insert(id);
     }
-    crate::index::exact::rank_unique_ids(db, query, &anchors, top_k)
+    crate::index::exact::rank_unique_ids(db, query, anchors.iter().copied(), top_k)
 }

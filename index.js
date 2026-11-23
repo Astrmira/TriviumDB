@@ -174,6 +174,9 @@ if (binding.TriviumDB) {
 
   // 同步回调期间重复进入同一实例会形成原生借用或锁等待环，在 N-API 前拒绝。
   const activeNativeCalls = new WeakMap()
+  // 参数转换在调用线程完成；两个异步批入口均通过 Promise 交付运行时准入失败。
+  const batchAdmissionErrors = new Set(['QueueFull', 'TDB_CAPACITY_RESERVATION_REJECTED',
+    'TDB_DATABASE_CLOSED', 'TDB_QUERY_CANCELLED', 'TDB_QUERY_DEADLINE_EXCEEDED'])
   const prototype = binding.TriviumDB.prototype
   const invoke = (database, original, arguments_, method, required) => {
     const depth = activeNativeCalls.get(database) || 0
@@ -209,7 +212,9 @@ if (binding.TriviumDB) {
       if (method === 'prepareTql') preparedQueries.add(result)
       return result
     } catch (error) {
-      if (method === 'searchBatch' && ['TDB_QUERY_CANCELLED', 'TDB_QUERY_DEADLINE_EXCEEDED'].includes(error?.code)) return Promise.reject(error)
+      if ((method === 'searchBatch' || method === 'searchIdsBatch') && batchAdmissionErrors.has(error?.code)) {
+        return Promise.reject(error)
+      }
       throw error
     } finally {
       if (depth === 0) activeNativeCalls.delete(database)

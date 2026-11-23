@@ -20,7 +20,7 @@ struct Candidate {
 
 impl PartialEq for Candidate {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id && self.score.to_bits() == other.score.to_bits()
+        self.cmp(other).is_eq()
     }
 }
 
@@ -34,10 +34,11 @@ impl PartialOrd for Candidate {
 
 impl Ord for Candidate {
     fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .score
-            .total_cmp(&self.score)
-            .then_with(|| self.id.cmp(&other.id))
+        if self.score == other.score {
+            self.id.cmp(&other.id)
+        } else {
+            other.score.total_cmp(&self.score)
+        }
     }
 }
 
@@ -46,12 +47,7 @@ fn insert_candidate(heap: &mut BinaryHeap<Candidate>, candidate: Candidate, top_
         heap.push(candidate);
         return;
     }
-    let should_replace = heap.peek().is_some_and(|worst| {
-        candidate.score.total_cmp(&worst.score) == Ordering::Greater
-            || (candidate.score.total_cmp(&worst.score) == Ordering::Equal
-                && candidate.id < worst.id)
-    });
-    if should_replace {
+    if heap.peek().is_some_and(|worst| candidate < *worst) {
         heap.pop();
         heap.push(candidate);
     }
@@ -183,7 +179,7 @@ fn search_inner<T: VectorType>(
 pub(crate) fn rank_unique_ids<T: VectorType>(
     db: &MemTable<T>,
     query: &[T],
-    ids: &[NodeId],
+    ids: impl ExactSizeIterator<Item = NodeId>,
     top_k: usize,
 ) -> Result<Vec<SearchHit>> {
     let k = top_k.min(ids.len());
@@ -200,7 +196,7 @@ pub(crate) fn rank_unique_ids<T: VectorType>(
     let scorer = QueryScorer::new(query);
     let mut heap = BinaryHeap::with_capacity(k);
     let control = crate::request::control().unwrap_or_default();
-    for &id in ids {
+    for id in ids {
         #[cfg(feature = "test-hooks")]
         crate::test_hooks::hit(crate::test_hooks::ConcurrencyPoint::ExactScanStep);
         control.check()?;
@@ -223,12 +219,7 @@ fn hydrate_candidates<T: VectorType>(
 ) -> Result<Vec<SearchHit>> {
     control.check()?;
     let mut candidates = candidates.into_vec();
-    candidates.sort_by(|left, right| {
-        right
-            .score
-            .total_cmp(&left.score)
-            .then_with(|| left.id.cmp(&right.id))
-    });
+    candidates.sort_unstable();
     let bytes = candidates.iter().try_fold(
         candidates
             .len()

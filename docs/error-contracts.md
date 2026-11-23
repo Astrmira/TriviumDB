@@ -136,7 +136,7 @@ Node 的本批文本、标签、字段和重建记录字符串严格解码 UTF-1
 
 检索配置的有限性、扩散偏置维度和 min_edge_weight 约束由存储内核验证，错误提供对应字段。批量查询在返回空集合前验证同一配置。混合入口的 hybrid_alpha／hybridAlpha 由共享 SDK 换算，非有限输入或换算溢出提供该字段。Rust 通过 underlying() 匹配原错误类别，并从 info() 读取字段。
 
-Node 的 searchAdvanced／searchWithContext 配置和三个可达性入口的 options 使用非数组对象。省略或 null 使用默认配置，已登记属性沿原型链读取，未知配置属性保留原处理规则。配置成员中的 null 按相应成员类型拒绝。可选位置参数的 null 继续使用既有默认值，必需位置参数沿各自类型规则拒绝。searchBatch 的数组／类型拒绝发生在任务创建前，u64 数值范围与内核执行错误通过 Promise 返回，范围错误保留批次和分量位置。
+Node 的 searchAdvanced／searchWithContext 配置和三个可达性入口的 options 使用非数组对象。省略或 null 使用默认配置，已登记属性沿原型链读取，未知配置属性保留原处理规则。配置成员中的 null 按相应成员类型拒绝。可选位置参数的 null 继续使用既有默认值，必需位置参数沿各自类型规则拒绝。searchBatch 和 searchIdsBatch 在任务创建前同步校验数组和参数类型。资源准入、请求取消、截止期限及执行阶段的错误通过返回的 Promise 交付。u64 范围错误保留批次和分量位置。
 
 文本维护覆盖 index_text／index_keyword、完整重建和构建入口。已知值转换拒绝提供 validation/not_committed，重入或借用争用提供 admission/not_committed，消费字段省略。完整重建记录包含 id、text 和可选 keywords，缺参、未知字段、类型和成员拒绝定位到 `/documents/0/id` 等路径。Python 记录接受声明中的 Mapping，先固定本批记录对象，再在写请求借用内物化映射和提取字段。Node 固定数组下标范围，校验自有可枚举记录键，声明字段沿既有属性读取路径提取。宿主异常和失败的整批转换保留原文本及索引事实。
 

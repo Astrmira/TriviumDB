@@ -8,6 +8,10 @@
 
 本页记录下一批变更。最近的预发布版本见 [0.9.4-beta.1 双语说明](0.9.4-beta.1.md)，最近的正式版本见 [0.9.3 双语说明](0.9.3.md)。
 
+- 普通 TQL 绑定按稳定身份选择 DISTINCT 代表行；普通 MATCH 完成语义校验后跳过空页扫描。控制台 MATCH CREATE 按新增节点与边收取写操作额度。
+- 条件更新及属性索引复核在解码旧 Payload 前预留空间。并发图快照、全量 ID 枚举和 GraphFirst 去重计入实例与共享额度。Node 两个批量检索入口通过 Promise 返回资源准入和取消错误。
+- 精确余弦 Top-K 对舍入为零的分数按 ID 决胜。检索诊断分别记录 QuIVer、精确扫描和过滤回退。维度迁移保留 Pelorus 的曲率与构建配置，回填向量沿用源库的球内约束。
+
 - Rom 与 Mmap 按检查点内的字节边界读取属性索引定义，空库可保留完整目录。Rust `MemTable::rebuild_property_indexes_from_definitions` 返回 `Result<()>`，重建保留唯一约束，构建出错或取消时保持原目录。`index_memory_stats().persisted_bytes` 报告已发布的完整 `.idx` 文件长度，包含对齐填充。
 - TQL 聚合同分时按有类型的分组值分页，跨类型比较返回 false。Node Prepared 支持完整 64 位整数域的 `bigint`。复合索引规划仅对实际使用的字段对收集统计，同次规划共享一次扫描。
 - Payload 读取按 JSON 原始长度扣除请求预算，PROFILE 保留实际解码量。节点、Payload、出边、归档文档、Pelorus 查询和关键词自动机的临时内存均接受实例与共享额度检查。Rust `MemTable::build_text_index` 返回 `Result<()>`；额度不足时可调整限额后重试。图管线同时计入路径和来源占用的内存。
@@ -31,6 +35,10 @@
 ## English
 
 This page tracks upcoming changes. See the [0.9.4-beta.1 prerelease notes](0.9.4-beta.1.md) and the [0.9.3 stable release notes](0.9.3.md).
+
+- TQL selects DISTINCT representatives by stable binding identity for ordinary unranked matches and finds. Plain MATCH skips empty pages after semantic validation. Console MATCH CREATE charges the operation budget for new nodes and edges.
+- Conditional updates and property index verification reserve memory before decoding stored payloads. Concurrent graph snapshots, full ID enumeration, and GraphFirst deduplication account for both instance and shared memory. Both Node batch search methods deliver resource admission failures and cancellation through their returned promises.
+- Exact cosine Top-K breaks ties by ID when scores round to zero. Search diagnostics distinguish QuIVer, exact scans, and filtered fallback. Dimension migration preserves the Pelorus curvature and build settings so vector backfills follow the source database’s Poincaré ball constraint.
 
 - Rom and Mmap validate property index definitions against the checkpoint length, including catalogs on empty databases. Rust `MemTable::rebuild_property_indexes_from_definitions` returns `Result<()>`, preserves uniqueness, and retains the previous catalog on failure or cancellation. `index_memory_stats().persisted_bytes` measures the published `.idx` file including alignment padding.
 - TQL breaks aggregate ties using typed group values before pagination. Cross-type comparisons return false. Node Prepared accepts `bigint` across the full 64-bit integer domain. Composite-index planning collects statistics for the field pairs the query uses in a single pass.

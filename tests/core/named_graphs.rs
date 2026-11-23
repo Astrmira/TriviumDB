@@ -535,6 +535,43 @@ fn 只读查询保持完整文件组字节且关闭后拥有结果不占用映�
 
 #[cfg(feature = "test-hooks")]
 #[test]
+fn 两个并发图快照共享同一实例额度() {
+    use triviumdb::test_hooks::{ConcurrencyPoint, pause_at_request};
+    let dir = TestDir::new("concurrent-scope-quota");
+    let mut db = Database::<f32>::open(&dir.file("db.tdb"), 1).unwrap();
+    for id in 1..=128 {
+        db.insert_with_id(id, &[1.], json!({})).unwrap();
+    }
+    let baseline = db.estimated_memory();
+    db.set_memory_limit(baseline + 24_000).unwrap();
+    let scope = NamedGraphScope {
+        include_default: true,
+        ..Default::default()
+    };
+    let read = || db.named_graph_scope(&scope, &Default::default());
+    let context =
+        triviumdb::sdk::RequestContext::new("held-graph", Default::default(), false).unwrap();
+    let gate = pause_at_request(ConcurrencyPoint::NamedGraphRead, context.request_id());
+    std::thread::scope(|threads| {
+        let first = threads.spawn(|| context.run(read));
+        gate.wait_until_arrived();
+        let second = read();
+        drop(gate);
+        assert_eq!(
+            first.join().unwrap().unwrap().members,
+            (1..=128).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            second.unwrap_err().code(),
+            "TDB_CAPACITY_RESERVATION_REJECTED"
+        );
+    });
+    assert_eq!(db.estimated_memory(), baseline);
+    assert_eq!(read().unwrap().members, (1..=128).collect::<Vec<_>>());
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
 fn 图读视图取消释放工作区并保留后续完整查询() {
     let dir = TestDir::new("named_graph_cancel");
     let path = dir.file("db.tdb");

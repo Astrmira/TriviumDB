@@ -243,7 +243,8 @@ pub(crate) fn execute_pipeline_with_limit<T: VectorType>(
         && context.is_none()
         && let Some(query) = query_vector.filter(|_| alpha != Some(0.0))
     {
-        let mut combined_hits = vector_recall_hits(&mt, &safe_cfg, query, safe_cfg.top_k, true)?;
+        let mut combined_hits =
+            vector_recall_hits(&mt, &safe_cfg, query, safe_cfg.top_k, true, None)?;
         crate::request::check_current()?;
         let bytes = if include_payload {
             hit_payload_bytes(
@@ -410,20 +411,18 @@ pub(crate) fn execute_pipeline_with_limit<T: VectorType>(
             effective_recall_k(config)
         };
         if let Some(query) = query_vector {
-            dense_ranking = vector_recall_hits(&mt, config, query, vector_limit, pure_vector)?
-                .into_iter()
-                .map(|hit| (hit.id, hit.score))
-                .collect();
+            dense_ranking =
+                vector_recall_hits(&mt, config, query, vector_limit, pure_vector, Some(ctx))?
+                    .into_iter()
+                    .map(|hit| (hit.id, hit.score))
+                    .collect();
+        } else {
+            ctx.record_observation("vector_route_quiver", 0);
+            ctx.record_observation("vector_route_exact", 0);
+            ctx.record_observation("quiver_fallback_filtered", 0);
         }
         ctx.record_timing("vector_recall", vector_recall_started.elapsed());
-        let ann = query_vector.and_then(|_| ann_search_config(&mt, config, vector_limit));
-        ctx.record_observation("vector_route_quiver", u64::from(ann.is_some()));
         ctx.record_observation("vector_recall_candidates", dense_ranking.len() as u64);
-        if let Some(ann) = ann {
-            ctx.record_observation("quiver_ef_search", ann.ef_search as u64);
-            ctx.record_observation("quiver_top_k", ann.top_k as u64);
-            ctx.record_observation("quiver_rerank_limit", ann.rerank_limit.unwrap_or(0) as u64);
-        }
         // FISTA 基于稠密召回候选，融合后再追加影子排名。
         if let Some(alpha) = alpha.filter(|alpha| *alpha < 1.0 && !sparse_ranking.is_empty()) {
             add_rrf(&mut seed_map, &dense_ranking, alpha as f32);
@@ -776,7 +775,7 @@ fn recall_vector_ranked<T: VectorType>(
     ranking: &mut Vec<(NodeId, f32)>,
 ) -> Result<()> {
     if let Some(query) = query_vector {
-        let hits = vector_recall_hits(mt, config, query, effective_recall_k(config), true)?;
+        let hits = vector_recall_hits(mt, config, query, effective_recall_k(config), true, None)?;
         ranking.extend(hits.into_iter().map(|hit| (hit.id, hit.score)));
     }
     Ok(())
@@ -788,14 +787,31 @@ fn vector_recall_hits<T: VectorType>(
     query_vector: &[T],
     limit: usize,
     admit_route: bool,
+    mut observations: Option<&mut HookContext>,
 ) -> Result<Vec<SearchHit>> {
-    if let Some(search_cfg) = ann_search_config(mt, config, limit) {
+    let ann = ann_search_config(mt, config, limit);
+    if let Some(ctx) = observations.as_deref_mut() {
+        ctx.record_observation("vector_route_quiver", u64::from(ann.is_some()));
+    }
+    if let Some(search_cfg) = &ann {
+        if let Some(ctx) = observations.as_deref_mut() {
+            ctx.record_observation("quiver_ef_search", search_cfg.ef_search as u64);
+            ctx.record_observation("quiver_top_k", search_cfg.top_k as u64);
+            ctx.record_observation(
+                "quiver_rerank_limit",
+                search_cfg.rerank_limit.unwrap_or(0) as u64,
+            );
+        }
         let _workspace = admit_route
-            .then(|| reserve_candidate_workspace(mt, Some(&search_cfg)))
+            .then(|| reserve_candidate_workspace(mt, Some(search_cfg)))
             .transpose()?;
         // 单条 ANN 查询在当前请求线程执行，保留线程局部搜索工作区。
-        let approximate_hits = quiver_pipeline(mt, config, query_vector, &search_cfg)?;
+        let approximate_hits = quiver_pipeline(mt, config, query_vector, search_cfg)?;
         if config.payload_filter.is_none() || approximate_hits.len() >= config.top_k.min(limit) {
+            if let Some(ctx) = observations {
+                ctx.record_observation("vector_route_exact", 0);
+                ctx.record_observation("quiver_fallback_filtered", 0);
+            }
             return Ok(approximate_hits);
         }
         tracing::debug!(
@@ -805,6 +821,10 @@ fn vector_recall_hits<T: VectorType>(
         );
     }
     // 分段精确扫描继续使用受限线程池并保持全局 slot 顺序。
+    if let Some(ctx) = observations {
+        ctx.record_observation("vector_route_exact", 1);
+        ctx.record_observation("quiver_fallback_filtered", u64::from(ann.is_some()));
+    }
     let _workspace = admit_route
         .then(|| reserve_candidate_workspace(mt, None))
         .transpose()?;

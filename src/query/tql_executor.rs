@@ -406,6 +406,9 @@ fn requested_row_limit<T: VectorType>(
     limits: &ExecutionContext,
     mt: &MemTable<T>,
 ) -> Result<(usize, bool), TriviumError> {
+    if query.limit == Some(0) {
+        return Ok((0, true));
+    }
     let configured_cap = match limits.max_query_rows {
         Some(0) => usize::MAX,
         Some(value) => value,
@@ -3287,6 +3290,9 @@ fn execute_match<T: VectorType>(
     limits: &ExecutionContext,
     memory: &QueryMemory,
 ) -> Result<TqlResult<T>, TriviumError> {
+    if query.limit == Some(0) || row_limit == 0 {
+        return Ok(Vec::new());
+    }
     // 建立变量映射
     let mut var_map: HashMap<String, usize> = HashMap::new();
     for node_pat in &pattern.nodes {
@@ -4848,20 +4854,21 @@ pub(crate) fn execute_tql_mutation_with_source<T: VectorType>(
     max_operations: Option<usize>,
     source: Option<Arc<TqlSource>>,
 ) -> Result<Vec<MutationOp<T>>, TriviumError> {
-    let context = ExecutionContext {
+    let mut context = ExecutionContext {
         graph: None,
         limits: limits.with_request(),
         source,
         focus: None,
     };
-    let mut context = context;
     context.row_overflow = crate::database::RowOverflowPolicy::Throw;
-    context.max_query_rows = Some(0);
     let result = match max_operations {
         Some(budget) => {
             execute_tql_mutation_with_operation_budget(mutation, mt, context.clone(), budget)
         }
-        None => execute_tql_mutation_planned(mutation, mt, context.clone()),
+        None => {
+            context.max_query_rows = Some(0);
+            execute_tql_mutation_planned(mutation, mt, context.clone())
+        }
     };
     result.map_err(|error| context.error(error, QueryErrorStage::Plan, SourceSelector::Action))
 }
@@ -4874,7 +4881,20 @@ fn execute_tql_mutation_with_operation_budget<T: VectorType>(
     max_operations: usize,
 ) -> Result<Vec<MutationOp<T>>, TriviumError> {
     let per_match = match &mutation.action {
-        MutationAction::Create(create) => create.nodes.len().saturating_add(create.edges.len()),
+        MutationAction::Create(create) => {
+            let bound = mutation
+                .source
+                .iter()
+                .flat_map(|source| &source.pattern.nodes)
+                .filter_map(|node| node.var.as_deref())
+                .collect::<HashSet<_>>();
+            create
+                .nodes
+                .iter()
+                .filter(|node| node.var.as_deref().is_none_or(|var| !bound.contains(var)))
+                .count()
+                .saturating_add(create.edges.len())
+        }
         MutationAction::Set(assignments) => assignments.len(),
         MutationAction::SetVector { .. } => 1,
         MutationAction::Delete { vars, .. } => vars.len(),
@@ -4888,8 +4908,13 @@ fn execute_tql_mutation_with_operation_budget<T: VectorType>(
             limit: max_operations,
         });
     }
-    limits.row_overflow = crate::database::RowOverflowPolicy::Throw;
-    limits.max_query_rows = Some(max_operations / per_match);
+    let write_rows = max_operations / per_match;
+    limits.max_query_rows = Some(
+        limits
+            .max_query_rows
+            .filter(|&rows| rows > 0)
+            .map_or(write_rows, |rows| rows.min(write_rows)),
+    );
     execute_tql_mutation_planned(mutation, mt, limits)
 }
 

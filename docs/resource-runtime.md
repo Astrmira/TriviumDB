@@ -141,7 +141,7 @@ second.close()
 
 Node.js 配额参数单位为 MiB，运行时资源拒绝的 `error.code` 为 `QueueFull`。宿主按错误码和预算字段处理重试。`resourceStats()` / `stats()` 的 JSON 字段与 Rust 统计保持一致，使用下划线命名。
 
-`QueueFull` 错误还包含与 Python 相同的 `resource`、`requested`、`used`、`limit` 字段，TypeScript 对应 `ResourceBudgetError` 接口。同步调用与 `searchBatch()` 的 Promise 拒绝采用同一映射；JS 错误对象在事件循环线程上创建。
+`QueueFull` 错误包含 `resource`、`requested`、`used`、`limit` 字段，TypeScript 对应 `ResourceBudgetError` 接口。同步调用和 `searchBatch()`、`searchIdsBatch()` 的 Promise 拒绝使用相同字段。JS 错误对象在事件循环线程上创建。
 
 ---
 

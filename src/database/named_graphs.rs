@@ -61,8 +61,7 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
             let bytes = graph.memory_bytes().saturating_mul(8).saturating_add(
                 crate::storage::payload_store::serialized_json_len(&graph)?.saturating_mul(4),
             );
-            self.ensure_incremental_memory_budget(bytes)?;
-            let _workspace = self.resource_runtime.reserve_workspace(bytes)?;
+            let _workspace = self.reserve_request_workspace(bytes)?;
             let snapshot = NamedGraphSnapshot::from_write(graph, expected_revision)?;
             self.commit_ops(vec![TxOp::NamedGraph {
                 graph_id: snapshot.graph.graph_id.clone(),
@@ -115,8 +114,7 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
             let bytes = crate::storage::payload_store::serialized_json_len(&edits)?
                 .saturating_mul(64)
                 .saturating_add(snapshot.graph.memory_bytes().saturating_mul(4));
-            self.ensure_incremental_memory_budget(bytes)?;
-            let _workspace = self.resource_runtime.reserve_workspace(bytes)?;
+            let _workspace = self.reserve_request_workspace(bytes)?;
             // 有序映射让批量编辑的边键合并保持确定性，删除成员同时清理该图关联边。
             let mut members = snapshot.graph.members.into_iter().collect::<BTreeSet<_>>();
             let mut edges = snapshot
@@ -205,8 +203,7 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
             )?;
             check_result(record.as_ref(), limits)?;
             let bytes = record.graph.memory_bytes().saturating_add(256);
-            mt.ensure_additional_memory(self.memory_limit, bytes)?;
-            let _workspace = self.resource_runtime.reserve_workspace(bytes)?;
+            let _workspace = mt.reserve_instance_workspace(bytes)?;
             Ok(Some(record.as_ref().clone()))
         })?
     }
@@ -227,8 +224,7 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
                 .keys()
                 .map(|id| id.len().saturating_add(256))
                 .sum::<usize>();
-            mt.ensure_additional_memory(self.memory_limit, bytes)?;
-            let _workspace = self.resource_runtime.reserve_workspace(bytes)?;
+            let _workspace = mt.reserve_instance_workspace(bytes)?;
             let result = mt
                 .named_graphs
                 .graphs
@@ -252,6 +248,7 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
         limits: &NamedGraphLimits,
     ) -> Result<ScopedGraphSnapshot> {
         self.read_graph_scope(scope, limits, true, None)
+            .map(|(snapshot, _)| snapshot)
     }
 
     fn read_graph_scope(
@@ -260,7 +257,7 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
         limits: &NamedGraphLimits,
         returning_scope: bool,
         only_start: Option<NodeId>,
-    ) -> Result<ScopedGraphSnapshot> {
+    ) -> Result<(ScopedGraphSnapshot, crate::resources::RequestWorkspace)> {
         self.read_operation(|| {
             reject_hook_reentrant_access(&self.memtable)?;
             crate::request::check_current()?;
@@ -274,10 +271,9 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
             )?;
             let scope_bytes =
                 crate::storage::payload_store::serialized_json_len(scope)?.saturating_mul(64);
-            self.ensure_incremental_memory_budget(scope_bytes)?;
-            let _scope_workspace = self.resource_runtime.reserve_workspace(scope_bytes)?;
-            let selected = scope.selected(limits)?;
             let mt = read_or_recover(&self.memtable);
+            let scope_workspace = mt.reserve_instance_workspace(scope_bytes)?;
+            let selected = scope.selected(limits)?;
             let mut nodes = if scope.include_default {
                 mt.node_count()
             } else {
@@ -332,7 +328,7 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
                     edges: Vec::new(),
                 };
                 check_result(&snapshot, limits)?;
-                return Ok(snapshot);
+                return Ok((snapshot, scope_workspace));
             }
             for id in &selected {
                 crate::request::check_current()?;
@@ -369,8 +365,7 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
                     }
                 }
             }
-            mt.ensure_additional_memory(self.memory_limit, bytes)?;
-            let _workspace = self.resource_runtime.reserve_workspace(bytes)?;
+            let workspace = mt.reserve_instance_workspace(bytes)?;
             let mut members = BTreeSet::new();
             #[cfg(feature = "test-hooks")]
             crate::test_hooks::hit(crate::test_hooks::ConcurrencyPoint::NamedGraphRead);
@@ -478,7 +473,7 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
                     .cmp(&b.edge.key())
                     .then_with(|| a.graph_id.cmp(&b.graph_id))
             });
-            Ok(result)
+            Ok((result, workspace))
         })?
     }
 
@@ -493,9 +488,12 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
         self.read_operation(|| {
             bound("named_graph_depth", max_depth, 1000)?;
             if max_depth == 0 {
-                return self.read_graph_scope(scope, limits, false, Some(start));
+                return self
+                    .read_graph_scope(scope, limits, false, Some(start))
+                    .map(|(snapshot, _)| snapshot);
             }
-            let mut snapshot = self.read_graph_scope(scope, limits, false, None)?;
+            let (mut snapshot, mut workspace) =
+                self.read_graph_scope(scope, limits, false, None)?;
             if snapshot.members.binary_search(&start).is_err() {
                 return Err(invalid(
                     "start",
@@ -506,8 +504,7 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
                 .saturating_mul(64)
                 .saturating_add(snapshot.members.len().saturating_mul(128))
                 .saturating_add(snapshot.edges.len().saturating_mul(32));
-            self.ensure_incremental_memory_budget(bytes)?;
-            let _workspace = self.resource_runtime.reserve_workspace(bytes)?;
+            read_or_recover(&self.memtable).resize_instance_workspace(&mut workspace, bytes)?;
             let mut adjacency = BTreeMap::<NodeId, Vec<usize>>::new();
             for (index, edge) in snapshot.edges.iter().enumerate() {
                 adjacency

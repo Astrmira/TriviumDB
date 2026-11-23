@@ -639,7 +639,20 @@ fn finish_inner<T: VectorType>(
     } else {
         let distinct = expressions.filter(|items| items.iter().any(|item| item.distinct));
         let mut seen = HashSet::new();
-        for (index, input) in inputs.iter().enumerate() {
+        // 普通绑定按完整身份选取 DISTINCT 代表行；显式排名和管线保留其输入顺序。
+        let canonical = (distinct.is_some()
+            && scope.query.rank.is_none()
+            && scope.pipeline.is_none())
+        .then(|| {
+            let mut order: Vec<_> = (0..inputs.len()).collect();
+            order.sort_unstable_by(|&a, &b| {
+                compare_input_identity(&inputs[a], &inputs[b], &scope.query.entry)
+            });
+            order
+        });
+        for position in 0..inputs.len() {
+            let index = canonical.as_ref().map_or(position, |order| order[position]);
+            let input = &inputs[index];
             scope.limits.check_cancelled()?;
             if let Some(distinct) = distinct {
                 let key = distinct

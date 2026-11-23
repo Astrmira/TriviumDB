@@ -46,6 +46,81 @@ fn limited() -> ResourceRuntime {
     })
     .unwrap()
 }
+
+#[test]
+fn 冷正文的条件更新及两类索引复核在解码前检查配额() {
+    let root = TestDir::new("cold-payload-admission");
+    for mode in [StorageMode::Rom, StorageMode::Mmap] {
+        let path = root.file(&format!("{mode:?}.tdb"));
+        let config = Config {
+            dim: 1,
+            storage_mode: mode,
+            auto_build_quiver: false,
+            ..Default::default()
+        };
+        let mut db = Database::<f32>::open_with_config(&path, config).unwrap();
+        let payload = json!({"flag":true, "name":"boundary", "text":"x".repeat(1280 * 1024)});
+        db.insert_with_id(1, &[1.], payload.clone()).unwrap();
+        db.create_index("flag").unwrap();
+        db.create_ngram_index("name").unwrap();
+        db.close().unwrap();
+        let mut db = Database::<f32>::open_with_config(&path, config).unwrap();
+        let baseline = db.estimated_memory();
+        db.set_memory_limit(baseline + 1024 * 1024).unwrap();
+        for operation in 0..3 {
+            let error = match operation {
+                0 => db
+                    .compare_and_set_payload_field(1, "flag", &json!(true), json!(false))
+                    .unwrap_err(),
+                1 => db
+                    .indexed_lookup(&[("flag".into(), json!(true))], 1)
+                    .unwrap_err(),
+                _ => db.substring_lookup("name", "ound", 1).unwrap_err(),
+            };
+            assert_eq!(error.code(), "TDB_CAPACITY_RESERVATION_REJECTED");
+            assert_eq!(db.estimated_memory(), baseline);
+        }
+        // 此额度足以解码 1.25 MiB 正文，但不足以同时保留缓存、更新副本和序列化缓冲。
+        let wal = std::fs::read(format!("{path}.wal")).unwrap();
+        db.set_memory_limit(baseline + 4 * 1024 * 1024).unwrap();
+        let error = db
+            .compare_and_set_payload_field(1, "flag", &json!(true), json!(false))
+            .unwrap_err();
+        assert_eq!(error.code(), "TDB_CAPACITY_RESERVATION_REJECTED");
+        assert_eq!(std::fs::read(format!("{path}.wal")).unwrap(), wal);
+        db.set_memory_limit(0).unwrap();
+        assert_eq!(db.get_payload(1).unwrap(), Some(payload));
+        assert_eq!(db.substring_lookup("name", "ound", 1).unwrap(), [1]);
+        assert_eq!(
+            db.indexed_lookup(&[("flag".into(), json!(true))], 1)
+                .unwrap(),
+            [1]
+        );
+    }
+}
+
+#[test]
+fn 全量节点枚举在两个入口遵守同一实例额度() {
+    let root = TestDir::new("ids-admission");
+    let mut db = Database::<f32>::open(&root.file("data.tdb"), 1).unwrap();
+    for id in (1..=128).rev() {
+        db.insert_with_id(id, &[1.], json!(null)).unwrap();
+    }
+    db.delete(64).unwrap();
+    let expected: Vec<_> = (1..=128).filter(|&id| id != 64).collect();
+    let baseline = db.estimated_memory();
+    db.set_memory_limit(baseline + 1).unwrap();
+    for result in [db.get_all_ids(), db.all_node_ids()] {
+        assert_eq!(
+            result.unwrap_err().code(),
+            "TDB_CAPACITY_RESERVATION_REJECTED"
+        );
+    }
+    db.set_memory_limit(baseline + expected.len() * size_of::<u64>())
+        .unwrap();
+    assert_eq!(db.get_all_ids().unwrap(), expected);
+    assert_eq!(db.all_node_ids().unwrap(), expected);
+}
 fn budget_error<T: std::fmt::Debug>(result: triviumdb::Result<T>) {
     assert!(
         matches!(result,Err(TriviumError::ResourceBudgetExceeded {resource:"memory_bytes",requested,used,limit}) if requested>0 && used==limit),

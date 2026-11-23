@@ -459,6 +459,47 @@ fn 半精度协议使用数值且不把存储位模式当作浮点值() {
 }
 
 #[test]
+fn 控制台创建反向边仅占一次写操作() {
+    let root = TestDir::new("console-bound-create");
+    let mut db = seed(&root.file("db.tdb"));
+    db.link(1, 2, "forward", 1.).unwrap();
+    let session = ConsoleSession::from_json(r#"{"readOnly":false,"maxOperations":1}"#).unwrap();
+    let result = call(
+        &mut db,
+        &session,
+        json!({"operation":"mutate","query":"MATCH (a)-[:forward]->(b) CREATE (b)-[:back]->(a)"}),
+    );
+    assert_eq!(result, json!({"affected":1,"createdIds":[]}));
+    assert_eq!(db.get_edge(2, 1, "back").unwrap().unwrap().target_id, 1);
+}
+
+#[test]
+fn 控制台写操作余额不会放宽显式匹配行上限() {
+    let root = TestDir::new("console-create-rows");
+    let mut db = Database::<f32>::open_with_config(
+        &root.file("db.tdb"),
+        triviumdb::database::Config {
+            dim: 1,
+            max_query_rows: Some(1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for id in [1, 2] {
+        db.insert_with_id(id, &[1.], json!({})).unwrap();
+    }
+    let session = ConsoleSession::from_json(r#"{"readOnly":false,"maxOperations":8}"#).unwrap();
+    let error = db
+        .console_request(
+            &session,
+            &request(json!({"operation":"mutate","query":"MATCH (a) CREATE (m)"})),
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), "TDB_QUERY_BUDGET");
+    assert_eq!(db.all_node_ids().unwrap(), [1, 2]);
+}
+
+#[test]
 fn 写计划准入在wal前拒绝且请求不能夹带宿主配置() {
     let root = TestDir::new("console_admission");
     let path = root.file("准入.tdb");

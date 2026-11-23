@@ -103,10 +103,7 @@ fn verified_property_matches<T: VectorType>(
     let mut ids = Vec::new();
     for id in candidates {
         crate::request::check_current()?;
-        if mt
-            .try_get_payload(id)?
-            .is_some_and(|payload| matches(&payload))
-        {
+        if mt.payload_matches(id, &matches)? {
             if ids.len() == max_results {
                 return Err(TriviumError::QueryRowBudgetExceeded {
                     budget: max_results,
@@ -2295,16 +2292,18 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
             reject_hook_reentrant_access(&self.memtable)?;
             let mut mt = write_or_recover(&self.memtable);
             mt.validate_update_payload(id)?;
-            let mut payload = mt
-                .get_payload(id)
-                .map(|payload| (*payload).clone())
+            let mut workspace = mt.reserve_instance_workspace(mt.payload_query_peak(id)?)?;
+            let previous = mt
+                .try_get_payload(id)?
                 .ok_or(TriviumError::NodeNotFound(id))?;
-            if !payload
+            if !previous
                 .get(field)
                 .is_some_and(|actual| cas_value_matches(actual, expected))
             {
                 return Err(TriviumError::ConditionalUpdateNotMatched { id });
             }
+            let mut payload = (*previous).clone();
+            drop(previous);
             let object = payload.as_object_mut().ok_or_else(|| {
                 TriviumError::InvalidInput(
                 "条件更新要求 Payload 为 JSON 对象 (Conditional update requires an object payload)"
@@ -2316,7 +2315,10 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
             let additional = encoded.saturating_mul(2).saturating_add(
                 crate::storage::payload_store::estimate_json_memory(&payload),
             );
-            let current_bytes = mt.estimated_memory_bytes();
+            // 解码可能新增常驻缓存。即使写阶段所需凭证更小，也要以当前常驻量重新准入。
+            let current_bytes = mt
+                .estimated_memory_bytes()
+                .saturating_sub(workspace.bytes());
             if self.memory_limit > 0 && current_bytes.saturating_add(additional) > self.memory_limit
             {
                 return Err(TriviumError::CapacityReservationRejected {
@@ -2326,6 +2328,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                     memory_limit: self.memory_limit,
                 });
             }
+            mt.resize_instance_workspace(&mut workspace, additional)?;
             let payload_str = payload.to_string();
             if payload_str.len() > 8 * 1024 * 1024 {
                 return Err(TriviumError::PayloadTooLarge {
@@ -2869,10 +2872,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
     }
 
     pub fn get_all_ids(&self) -> Result<Vec<NodeId>> {
-        self.read_operation(|| {
-            let mt = read_or_recover(&self.memtable);
-            mt.get_all_ids()
-        })
+        self.all_node_ids()
     }
 
     // ════════════════════════════════════════════════════════
@@ -4278,7 +4278,12 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
 
     /// 获取所有活跃节点的 ID 列表
     pub fn all_node_ids(&self) -> Result<Vec<NodeId>> {
-        self.read_operation(|| read_or_recover(&self.memtable).all_node_ids())
+        self.read_operation(|| {
+            let mt = read_or_recover(&self.memtable);
+            let _workspace =
+                mt.reserve_instance_workspace(mt.node_count().saturating_mul(size_of::<NodeId>()))?;
+            Ok(mt.all_node_ids())
+        })?
     }
 
     // ════════════════════════════════════════════════════════

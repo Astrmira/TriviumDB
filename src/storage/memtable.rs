@@ -2186,13 +2186,21 @@ impl<T: VectorType> MemTable<T> {
         id: NodeId,
         filter: &crate::Filter,
     ) -> Result<bool> {
+        self.payload_matches(id, |payload| filter.matches(payload))
+    }
+
+    pub(crate) fn payload_matches(
+        &self,
+        id: NodeId,
+        predicate: impl FnOnce(&serde_json::Value) -> bool,
+    ) -> Result<bool> {
         if !self.contains(id) {
             return Ok(false);
         }
         let _decode = self.reserve_instance_workspace(self.payload_query_peak(id)?)?;
         Ok(self
             .try_get_payload(id)?
-            .is_some_and(|payload| filter.matches(&payload)))
+            .is_some_and(|payload| predicate(&payload)))
     }
 
     pub(crate) fn payload_fingerprint(&self) -> (u64, u32) {
@@ -3579,7 +3587,9 @@ impl<T: VectorType> MemTable<T> {
         #[cfg(any(test, feature = "test-hooks"))]
         self.id_materializations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.active_node_ids().collect()
+        let mut ids = Vec::with_capacity(self.node_count());
+        ids.extend(self.active_node_ids());
+        ids
     }
 
     /// 测试专用：读取全库 NodeId 物化次数。

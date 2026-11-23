@@ -204,8 +204,14 @@ pub(super) fn migrate<T: VectorType + serde::Serialize + serde::de::DeserializeO
     }
 
     mt.ensure_readable()?;
-    let mut ids = mt.all_node_ids();
-    ids.sort_unstable();
+    let _ids_workspace =
+        mt.reserve_instance_workspace(mt.node_count().saturating_mul(size_of::<u64>()))?;
+    let ids = mt.all_node_ids();
+    let pelorus = mt
+        .pelorus
+        .as_ref()
+        .map(|state| crate::index::pelorus::PelorusState::for_new_dimension(state.config, dim))
+        .transpose()?;
     {
         let mut stage = Database::<T>::open_with_runtime(
             &stage_path,
@@ -215,12 +221,12 @@ pub(super) fn migrate<T: VectorType + serde::Serialize + serde::de::DeserializeO
             },
             source.resource_runtime.clone(),
         )?;
-        let _workspace = source
-            .resource_runtime
-            .reserve_workspace(dim.saturating_mul(std::mem::size_of::<T>()))?;
+        let _workspace =
+            mt.reserve_instance_workspace(dim.saturating_mul(std::mem::size_of::<T>()))?;
         let zero = vec![T::zero(); dim];
         for &id in &ids {
-            let payload = mt.get_payload(id).ok_or_else(|| {
+            let _decode = mt.reserve_instance_workspace(mt.payload_query_peak(id)?)?;
+            let payload = mt.try_get_payload(id)?.ok_or_else(|| {
                 TriviumError::CorruptedFile(
                     "迁移源节点缺少 Payload (Migration source node is missing its Payload)".into(),
                 )
@@ -257,6 +263,7 @@ pub(super) fn migrate<T: VectorType + serde::Serialize + serde::de::DeserializeO
             // 暂存目标保留图身份、修订和共享引用，随目标检查点统一发布。
             target.named_graphs = mt.named_graphs.clone();
             target.document_publications = mt.document_publications.clone();
+            target.pelorus = pelorus;
             target.advance_next_id(mt.next_id_value());
             target.mark_changed(false);
         }
