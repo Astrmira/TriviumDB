@@ -682,3 +682,38 @@ fn 查询交错_RwLock允许第二查询进入共享读区() {
     drop(db);
     cleanup(&path);
 }
+
+#[test]
+fn 构建属性索引中取消保留目录且同一实例可重试() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::<f32>::open(dir.path().join("index.tdb").to_str().unwrap(), 1).unwrap();
+    db.insert_with_id(1, &[1.], json!({"key":"a"})).unwrap();
+    let request =
+        triviumdb::sdk::RequestContext::new("cancel-property-index", Default::default(), false)
+            .unwrap();
+    let gate = triviumdb::test_hooks::pause_at_request(
+        ConcurrencyPoint::PropertyIndexBuildRow,
+        request.request_id(),
+    );
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| request.run(|| db.create_index("key")));
+        gate.wait_until_arrived();
+        request.cancel();
+        drop(gate);
+        assert_eq!(
+            worker.join().unwrap().unwrap_err().code(),
+            "TDB_QUERY_CANCELLED"
+        );
+    });
+    assert!(db.index_info().unwrap().is_empty());
+    assert_eq!(db.resource_stats().reserved_workspace_bytes, 0);
+    db.create_index("key").unwrap();
+    let fields = db.index_info().unwrap();
+    assert_eq!(
+        fields
+            .iter()
+            .map(|f| (f.field.as_str(), f.entry_count))
+            .collect::<Vec<_>>(),
+        [("key", 1)]
+    );
+}

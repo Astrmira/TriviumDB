@@ -990,7 +990,7 @@ export class TriviumDB {
   /** 命名图、共享成员、独立边及显式联合查询的Core JSON入口。 */
   graphRequest(requestJson: string): string;
   prepareTql(query: string): PreparedTql;
-  executePreparedTql(prepared: PreparedTql, parameters: Record<string, string | number | boolean | null>): any[];
+  executePreparedTql(prepared: PreparedTql, parameters: Record<string, string | number | bigint | boolean | null>): any[];
 
   /**
    * 执行 TQL 写操作（CREATE / SET / DELETE / DETACH DELETE）

@@ -559,6 +559,7 @@ pub struct MemTable<T: VectorType> {
     deferred_text_path: Option<String>,
     deferred_text_meta: Option<crate::storage::file_format::TextIndexMetadata>,
     pub(crate) checkpoint_token: Option<[u8; 16]>,
+    pub(crate) persisted_index_bytes: std::sync::atomic::AtomicU64,
     pub(crate) published_bytes: Arc<crate::observability::PublishedWriteBytes>,
     text_replay: bool,
     text_replay_checkpoint_seen: bool,
@@ -588,7 +589,7 @@ pub struct MemTable<T: VectorType> {
     graph_stats_state: std::sync::RwLock<GraphStatsState>,
     // 复合字段统计仅随 Payload 或索引定义变化失效。
     column_pair_stats_cache:
-        std::sync::RwLock<Option<(u64, Vec<crate::index::property::ColumnPairStats>)>>,
+        std::sync::RwLock<BTreeMap<(String, String), crate::index::property::ColumnPairStats>>,
     // 跨模统计按“字段 + 类型稳定 JSON 值”缓存；任意写操作后随 generation 失效。
     cross_modal_stats_cache: std::sync::RwLock<BTreeMap<CrossModalCacheKey, CrossModalCacheEntry>>,
 
@@ -673,6 +674,7 @@ impl<T: VectorType> MemTable<T> {
             deferred_text_path: None,
             deferred_text_meta: None,
             checkpoint_token: None,
+            persisted_index_bytes: Default::default(),
             published_bytes: Default::default(),
             text_replay: false,
             text_replay_checkpoint_seen: false,
@@ -689,7 +691,7 @@ impl<T: VectorType> MemTable<T> {
             incoming_edges: HashMap::new(),
             label_index: HashMap::new(),
             graph_stats_state: std::sync::RwLock::new(GraphStatsState::default()),
-            column_pair_stats_cache: std::sync::RwLock::new(None),
+            column_pair_stats_cache: Default::default(),
             cross_modal_stats_cache: std::sync::RwLock::new(BTreeMap::new()),
             property_indexes: PropertyIndexRegistry::default(),
             fatigue_map: std::sync::RwLock::new(HashMap::new()),
@@ -747,6 +749,7 @@ impl<T: VectorType> MemTable<T> {
             deferred_text_path: None,
             deferred_text_meta: None,
             checkpoint_token: None,
+            persisted_index_bytes: Default::default(),
             published_bytes: Default::default(),
             text_replay: false,
             text_replay_checkpoint_seen: false,
@@ -763,7 +766,7 @@ impl<T: VectorType> MemTable<T> {
             incoming_edges: HashMap::new(),
             label_index: HashMap::new(),
             graph_stats_state: std::sync::RwLock::new(GraphStatsState::default()),
-            column_pair_stats_cache: std::sync::RwLock::new(None),
+            column_pair_stats_cache: Default::default(),
             cross_modal_stats_cache: std::sync::RwLock::new(BTreeMap::new()),
             property_indexes: PropertyIndexRegistry::default(),
             fatigue_map: std::sync::RwLock::new(HashMap::new()),
@@ -814,10 +817,10 @@ impl<T: VectorType> MemTable<T> {
     fn mark_property_changed(&mut self) {
         self.checkpoint_dirty = true;
         self.property_generation = self.property_generation.wrapping_add(1);
-        *self
-            .column_pair_stats_cache
+        self.column_pair_stats_cache
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         self.cross_modal_stats_cache
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2300,32 +2303,34 @@ impl<T: VectorType> MemTable<T> {
         id: NodeId,
         label: Option<&str>,
     ) -> Vec<crate::node::IncomingEdge> {
-        let mut result = Vec::new();
-        for &source_id in self.get_incoming_sources(id) {
-            if let Some(edges) = self.get_edges(source_id) {
-                result.extend(
-                    edges
-                        .iter()
-                        .filter(|edge| {
-                            edge.target_id == id
-                                && label.is_none_or(|expected| edge.label == expected)
-                        })
-                        .map(|edge| crate::node::IncomingEdge {
-                            source_id,
-                            target_id: id,
-                            label: edge.label.clone(),
-                            weight: edge.weight,
-                            metadata: edge.metadata.clone(),
-                        }),
-                );
-            }
-        }
-        result.sort_by(|a, b| {
-            a.source_id
-                .cmp(&b.source_id)
-                .then_with(|| a.label.cmp(&b.label))
-        });
-        result
+        self.incoming_edge_refs(id, label)
+            .map(|(source_id, edge)| crate::node::IncomingEdge {
+                source_id,
+                target_id: id,
+                label: edge.label.clone(),
+                weight: edge.weight,
+                metadata: edge.metadata.clone(),
+            })
+            .collect()
+    }
+
+    pub(crate) fn incoming_edge_refs<'a>(
+        &'a self,
+        id: NodeId,
+        label: Option<&'a str>,
+    ) -> impl Iterator<Item = (NodeId, &'a Edge)> {
+        // 来源有序，每个来源内按目标和标签有序。定位目标区间即可按公开顺序返回。
+        self.get_incoming_sources(id)
+            .iter()
+            .flat_map(move |&source| {
+                let edges = self.get_edges(source).unwrap_or_default();
+                let start = edges.partition_point(|edge| edge.target_id < id);
+                edges[start..]
+                    .iter()
+                    .take_while(move |edge| edge.target_id == id)
+                    .filter(move |edge| label.is_none_or(|name| name == edge.label))
+                    .map(move |edge| (source, edge))
+            })
     }
 
     /// 按标签查询所有边 (src, dst) 对，O(1) 查找
@@ -2398,14 +2403,29 @@ impl<T: VectorType> MemTable<T> {
         unique: bool,
         limit: usize,
     ) -> Result<()> {
+        crate::request::check_current()?;
+        if self.property_indexes.has_definition(kind, fields, unique) {
+            return Ok(());
+        }
+        let (candidate, _workspace) = self.property_index_candidate(kind, fields, unique, limit)?;
+        crate::request::check_current()?;
+        self.property_indexes.install_build(candidate);
+        self.mark_property_changed();
+        Ok(())
+    }
+
+    fn property_index_candidate(
+        &self,
+        kind: crate::index::property::PropertyIndexKind,
+        fields: &[String],
+        unique: bool,
+        limit: usize,
+    ) -> Result<(PropertyIndexRegistry, crate::resources::RequestWorkspace)> {
         use crate::index::property::{PropertyIndexKind, PropertyIndexRegistry};
         crate::index::property::validate_index_fields(
             fields,
             kind == PropertyIndexKind::Composite,
         )?;
-        if self.property_indexes.has_definition(kind, fields, unique) {
-            return Ok(());
-        }
         // 一次仅解析一条冷记录，读原始字节不会填充实例的 Payload 缓存。
         let parse_peak = if limit == 0 {
             0
@@ -2414,17 +2434,19 @@ impl<T: VectorType> MemTable<T> {
                 .ids()
                 .filter_map(|id| self.payloads.raw(id))
                 .try_fold(0, |peak: usize, raw| {
+                    crate::request::check_current()?;
                     super::payload_store::query_decode_peak(raw).map(|bytes| peak.max(bytes))
                 })?
                 .saturating_add(1024)
         };
-        self.ensure_additional_memory(limit, parse_peak)?;
+        let mut workspace = self.reserve_request_workspace(limit, parse_peak)?;
         let mut build_peak = fields
             .iter()
             .map(|field| field.len().saturating_mul(4))
             .sum::<usize>()
             .saturating_add(1024);
         for id in self.active_ids.iter() {
+            crate::request::check_current()?;
             let raw = self.payloads.raw(id).ok_or_else(|| {
                 TriviumError::CorruptedFile(
                     "索引构建缺少 Payload (Index build is missing a Payload)".into(),
@@ -2438,11 +2460,19 @@ impl<T: VectorType> MemTable<T> {
             build_peak = build_peak.saturating_add(PropertyIndexRegistry::estimate_build_row(
                 kind, fields, unique, &payload,
             )?);
-            self.ensure_additional_memory(limit, build_peak.saturating_add(parse_peak))?;
+            self.ensure_additional_memory(limit, build_peak)?;
         }
+        workspace.resize_result(
+            build_peak.saturating_add(parse_peak),
+            self.resident_memory_bytes(),
+            limit,
+        )?;
         let mut candidate = PropertyIndexRegistry::empty_build(kind, fields, unique)?;
         // 活跃 ID 目录按升序遍历，使唯一冲突的节点身份在各类型和重开后保持确定。
         for id in self.active_ids.iter() {
+            #[cfg(feature = "test-hooks")]
+            crate::test_hooks::hit(crate::test_hooks::ConcurrencyPoint::PropertyIndexBuildRow);
+            crate::request::check_current()?;
             let raw = self.payloads.raw(id).ok_or_else(|| {
                 TriviumError::CorruptedFile(
                     "索引构建缺少 Payload (Index build is missing a Payload)".into(),
@@ -2456,10 +2486,12 @@ impl<T: VectorType> MemTable<T> {
             candidate.validate_unique_changes([(id, Some(&payload))])?;
             candidate.insert(id, &payload);
         }
-        self.ensure_additional_memory(limit, candidate.estimated_memory_bytes())?;
-        self.property_indexes.install_build(candidate);
-        self.mark_property_changed();
-        Ok(())
+        workspace.resize_result(
+            candidate.estimated_memory_bytes(),
+            self.resident_memory_bytes(),
+            limit,
+        )?;
+        Ok((candidate, workspace))
     }
 
     pub fn register_unique_property_index(&mut self, field: &str) -> Result<()> {
@@ -2769,58 +2801,121 @@ impl<T: VectorType> MemTable<T> {
     }
 
     pub fn column_pair_stats(&self) -> Vec<crate::index::property::ColumnPairStats> {
-        if let Some((generation, stats)) = self
-            .column_pair_stats_cache
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            && *generation == self.property_generation
-        {
-            return stats.clone();
-        }
-        let mut output = Vec::new();
+        let mut order = Vec::new();
         for fields in self.property_indexes.composite_definitions() {
-            for left_index in 0..fields.len() {
-                for right_index in left_index + 1..fields.len() {
-                    let left_field = &fields[left_index];
-                    let right_field = &fields[right_index];
-                    let mut left_values = HashSet::new();
-                    let mut right_values = HashSet::new();
-                    let mut joint_values = HashSet::new();
-                    let mut sampled_rows = 0usize;
-                    for payload in self.payloads.values() {
-                        let (Some(left), Some(right)) =
-                            (payload.get(left_field), payload.get(right_field))
-                        else {
-                            continue;
-                        };
-                        let (Ok(left), Ok(right)) =
-                            (serde_json::to_vec(left), serde_json::to_vec(right))
-                        else {
-                            continue;
-                        };
-                        left_values.insert(left.clone());
-                        right_values.insert(right.clone());
-                        joint_values.insert((left, right));
-                        sampled_rows += 1;
-                    }
-                    output.push(crate::index::property::ColumnPairStats {
-                        left_field: left_field.clone(),
-                        right_field: right_field.clone(),
-                        left_distinct: left_values.len(),
-                        right_distinct: right_values.len(),
-                        joint_distinct: joint_values.len(),
-                        sampled_rows,
-                    });
+            for (index, left) in fields.iter().enumerate() {
+                for right in &fields[index + 1..] {
+                    order.push((
+                        (left.min(right).clone(), left.max(right).clone()),
+                        left > right,
+                    ));
                 }
             }
         }
-        *self
+        let pairs = order.iter().map(|(key, _)| key.clone()).collect();
+        let stats: BTreeMap<_, _> = self
+            .column_pair_stats_for(&pairs)
+            .into_iter()
+            .map(|stats| ((stats.left_field.clone(), stats.right_field.clone()), stats))
+            .collect();
+        // 公共目录沿用索引字段声明顺序；规划缓存可在多个索引之间复用同一对统计。
+        order
+            .into_iter()
+            .filter_map(|(key, reverse)| {
+                let mut item = stats.get(&key)?.clone();
+                if reverse {
+                    std::mem::swap(&mut item.left_field, &mut item.right_field);
+                    std::mem::swap(&mut item.left_distinct, &mut item.right_distinct);
+                }
+                Some(item)
+            })
+            .collect()
+    }
+
+    pub(crate) fn column_pair_stats_for(
+        &self,
+        requested: &std::collections::BTreeSet<(String, String)>,
+    ) -> Vec<crate::index::property::ColumnPairStats> {
+        #[derive(Default)]
+        struct Sample {
+            left: HashMap<Vec<u8>, usize>,
+            right: HashMap<Vec<u8>, usize>,
+            joint: HashSet<(usize, usize)>,
+            rows: usize,
+        }
+
+        {
+            let cached = self
+                .column_pair_stats_cache
+                .read()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(stats) = requested
+                .iter()
+                .map(|pair| cached.get(pair).cloned())
+                .collect::<Option<Vec<_>>>()
+            {
+                return stats;
+            }
+        }
+        let mut cached = self
             .column_pair_stats_cache
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some((self.property_generation, output.clone()));
-        output
+            .unwrap_or_else(|p| p.into_inner());
+        let definitions = self.property_indexes.composite_definitions();
+        let mut missing: BTreeMap<_, Sample> = requested
+            .iter()
+            .filter(|pair| {
+                !cached.contains_key(*pair)
+                    && definitions.iter().any(|fields| {
+                        fields.contains(&pair.0) && fields.contains(&pair.1) && pair.0 != pair.1
+                    })
+            })
+            .cloned()
+            .map(|pair| (pair, Sample::default()))
+            .collect();
+        if !missing.is_empty() {
+            for id in self.payloads.ids() {
+                // 统计属于可选的优化信息。中断时丢弃整批样本，执行入口会传播请求错误。
+                if crate::request::check_current().is_err() {
+                    return Vec::new();
+                }
+                let Ok(Some(payload)) = self.try_get_payload(id) else {
+                    return Vec::new();
+                };
+                for ((a, b), sample) in &mut missing {
+                    let (Some(left), Some(right)) = (payload.get(a), payload.get(b)) else {
+                        continue;
+                    };
+                    let (Ok(left), Ok(right)) =
+                        (serde_json::to_vec(left), serde_json::to_vec(right))
+                    else {
+                        return Vec::new();
+                    };
+                    let (l, r) = (sample.left.len(), sample.right.len());
+                    let l = *sample.left.entry(left).or_insert(l);
+                    let r = *sample.right.entry(right).or_insert(r);
+                    sample.joint.insert((l, r));
+                    sample.rows += 1;
+                }
+            }
+            for ((left_field, right_field), sample) in missing {
+                cached.insert(
+                    (left_field.clone(), right_field.clone()),
+                    crate::index::property::ColumnPairStats {
+                        left_field,
+                        right_field,
+                        left_distinct: sample.left.len(),
+                        right_distinct: sample.right.len(),
+                        joint_distinct: sample.joint.len(),
+                        sampled_rows: sample.rows,
+                    },
+                );
+            }
+        }
+        requested
+            .iter()
+            .filter_map(|pair| cached.get(pair).cloned())
+            .collect()
     }
 
     pub fn cross_modal_stats(
@@ -2932,10 +3027,7 @@ impl<T: VectorType> MemTable<T> {
                 .saturating_add(property_mapped_bytes)
                 .saturating_add(graph_mapped_bytes) as u64,
             hot_bytes: hot_bytes as u64,
-            persisted_bytes: self
-                .mmap_vector_bytes()
-                .saturating_add(property_mapped_bytes)
-                .saturating_add(graph_mapped_bytes) as u64,
+            persisted_bytes: self.persisted_index_bytes.load(Ordering::Acquire),
             posting_entries: self
                 .property_index_stats()
                 .iter()
@@ -2947,37 +3039,34 @@ impl<T: VectorType> MemTable<T> {
     pub fn rebuild_property_indexes_from_definitions(
         &mut self,
         definitions: &[(crate::index::property::PropertyIndexKind, Vec<String>)],
-    ) {
-        let mut indexes = PropertyIndexRegistry::default();
-        for (kind, fields) in definitions {
-            match kind {
-                crate::index::property::PropertyIndexKind::Hash => {
-                    if let Some(field) = fields.first() {
-                        indexes.register(field, self.payloads.iter());
-                    }
-                }
-                crate::index::property::PropertyIndexKind::Ordered => {
-                    if let Some(field) = fields.first() {
-                        indexes.register_ordered(field, self.payloads.iter());
-                    }
-                }
-                crate::index::property::PropertyIndexKind::Composite => {
-                    indexes.register_composite(fields, self.payloads.iter());
-                }
-                crate::index::property::PropertyIndexKind::Bitmap => {
-                    if let Some(field) = fields.first() {
-                        indexes.register_bitmap(field, self.payloads.iter());
-                    }
-                }
-                crate::index::property::PropertyIndexKind::Ngram => {
-                    if let Some(field) = fields.first() {
-                        let _ = indexes.register_ngram(field, self.payloads.iter());
-                    }
-                }
+    ) -> Result<()> {
+        use crate::index::property::PropertyIndexKind;
+        let constraints = self.unique_index_definitions();
+        let mut definitions = definitions.to_vec();
+        for fields in &constraints {
+            let kind = if fields.len() == 1 {
+                PropertyIndexKind::Hash
+            } else {
+                PropertyIndexKind::Composite
+            };
+            if !definitions.iter().any(|(k, f)| *k == kind && f == fields) {
+                definitions.push((kind, fields.clone()));
             }
         }
-        self.property_indexes = indexes;
-        self.mark_property_changed();
+        let mut indexes = PropertyIndexRegistry::default();
+        let mut held = self.reserve_instance_workspace(0)?;
+        for (kind, fields) in definitions {
+            crate::request::check_current()?;
+            let unique = matches!(kind, PropertyIndexKind::Hash | PropertyIndexKind::Composite)
+                && constraints.contains(&fields);
+            let (built, workspace) =
+                self.property_index_candidate(kind, &fields, unique, self.instance_memory_limit)?;
+            held.absorb(workspace);
+            indexes.install_build(built);
+        }
+        crate::request::check_current()?;
+        self.set_property_indexes(indexes);
+        Ok(())
     }
 
     pub fn set_property_indexes(&mut self, indexes: PropertyIndexRegistry) {
@@ -3792,14 +3881,20 @@ impl<T: VectorType> MemTable<T> {
         }
     }
 
-    pub fn build_text_index(&mut self) {
-        self.checkpoint_dirty = true;
-        self.text_index.build();
+    pub fn build_text_index(&mut self) -> Result<()> {
+        self.prepare_text_index()?;
+        self.ensure_keyword_matcher()?;
+        self.text_index.try_build()
     }
 
-    pub(crate) fn try_build_text_index(&mut self) -> Result<()> {
-        self.checkpoint_dirty = true;
-        self.text_index.try_build()
+    pub(crate) fn search_keywords(&self, query: &str) -> Result<HashMap<NodeId, f32>> {
+        self.ensure_keyword_matcher()?;
+        Ok(self.text_index.search_ac(query))
+    }
+
+    fn ensure_keyword_matcher(&self) -> Result<()> {
+        self.text_index
+            .prepare_keywords(|bytes| self.reserve_instance_workspace(bytes))
     }
 
     pub(crate) fn rebuild_text_index(
@@ -3853,16 +3948,25 @@ impl<T: VectorType> MemTable<T> {
                 index.add_keyword(document.id, keyword);
             }
         }
+        let mut retained = estimate;
+        index.prepare_keywords(|bytes| {
+            retained = retained.saturating_add(bytes);
+            self.check_text_memory_budget(retained)?;
+            runtime.reserve_task_workspace(bytes)
+        })?;
         index.try_build()?;
-        self.set_text_index(index);
+        self.install_text_index(index);
         Ok(())
     }
 
-    pub(crate) fn set_text_index(&mut self, text_index: TextIndex) {
+    pub(crate) fn set_text_index(&mut self, mut text_index: TextIndex) {
+        text_index.retain_nodes(|id| self.active_ids.contains(id));
+        self.install_text_index(text_index);
+    }
+
+    fn install_text_index(&mut self, text_index: TextIndex) {
         self.checkpoint_dirty = true;
         self.text_index = text_index;
-        self.text_index
-            .retain_nodes(|id| self.active_ids.contains(id));
         self.deferred_text_path = None;
         self.deferred_text_meta = None;
         self.pending_text_mutations = Vec::new();

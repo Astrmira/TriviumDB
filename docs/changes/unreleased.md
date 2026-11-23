@@ -8,6 +8,9 @@
 
 本页记录下一批变更。最近的预发布版本见 [0.9.4-beta.1 双语说明](0.9.4-beta.1.md)，最近的正式版本见 [0.9.3 双语说明](0.9.3.md)。
 
+- Rom 与 Mmap 按检查点内的字节边界读取属性索引定义，空库可保留完整目录。Rust `MemTable::rebuild_property_indexes_from_definitions` 返回 `Result<()>`，重建保留唯一约束，构建出错或取消时保持原目录。`index_memory_stats().persisted_bytes` 报告已发布的完整 `.idx` 文件长度，包含对齐填充。
+- TQL 聚合同分时按有类型的分组值分页，跨类型比较返回 false。Node Prepared 支持完整 64 位整数域的 `bigint`。复合索引规划仅对实际使用的字段对收集统计，同次规划共享一次扫描。
+- Payload 读取按 JSON 原始长度扣除请求预算，PROFILE 保留实际解码量。节点、Payload、出边、归档文档、Pelorus 查询和关键词自动机的临时内存均接受实例与共享额度检查。Rust `MemTable::build_text_index` 返回 `Result<()>`；额度不足时可调整限额后重试。图管线同时计入路径和来源占用的内存。
 - WAL 组提交保留已写入帧的最高同步强度。离线迁移原子发布暂存归属，支持原命令从空暂存目录重试。CLI 导出遇到受管理文档时提示使用快照并保留目标文件。
 - MATCH 聚合与同分分页按实体身份确定顺序。TQL 字符串按 JSON 规则解码转义。显式具名边分页收齐即停，FIND 返回节点属性时跳过向量和出边的复制。
 - 图边分页、可达性、GraphFirst 锚点和 Python／Node.js 批量向量输入纳入实例与共享内存额度。HTTP 最短路径在找到目标后结束，已有节点到自身返回零跳路径。
@@ -29,6 +32,9 @@
 
 This page tracks upcoming changes. See the [0.9.4-beta.1 prerelease notes](0.9.4-beta.1.md) and the [0.9.3 stable release notes](0.9.3.md).
 
+- Rom and Mmap validate property index definitions against the checkpoint length, including catalogs on empty databases. Rust `MemTable::rebuild_property_indexes_from_definitions` returns `Result<()>`, preserves uniqueness, and retains the previous catalog on failure or cancellation. `index_memory_stats().persisted_bytes` measures the published `.idx` file including alignment padding.
+- TQL breaks aggregate ties using typed group values before pagination. Cross-type comparisons return false. Node Prepared accepts `bigint` across the full 64-bit integer domain. Composite-index planning collects statistics for the field pairs the query uses in a single pass.
+- Payload reads charge the original JSON length on cache hits and misses. PROFILE reports bytes actually decoded. Instance and shared limits cover point reads, outgoing edges, archived documents, Pelorus scratch space, and keyword compilation. Rust `MemTable::build_text_index` returns `Result<()>` and supports retry after increasing the budget. Graph pipeline budgets and profiles include path and provenance storage.
 - Group commit honors the strongest sync mode used by writes in the group. Offline migration publishes staging ownership atomically and can retry an empty legacy stage. CLI export directs managed documents to snapshots and preserves the destination on error.
 - MATCH aggregation and tie-breaking use entity identities. TQL strings decode JSON escapes. Explicit named-edge pages stop at the requested row count, and FIND property projections skip vector and edge snapshots.
 - Edge pages, reachability, GraphFirst anchors and Python/Node.js batch query inputs reserve both instance and shared memory. HTTP shortest-path searches stop upon finding the target and return a zero-hop path for an existing node queried against itself.

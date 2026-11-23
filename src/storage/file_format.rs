@@ -924,7 +924,7 @@ fn save_inner<T: VectorType>(
     crate::storage::graph_blocks::save(memtable, path)?;
 
     let pelorus = crate::index::pelorus::persistence::stage(memtable, path)?;
-    let index_bytes = crate::storage::index_container::publish_checkpoint(
+    let index = crate::storage::index_container::publish_checkpoint(
         path,
         memtable.text_index_is_deferred(),
         pelorus,
@@ -932,7 +932,7 @@ fn save_inner<T: VectorType>(
     memtable
         .published_bytes
         .index
-        .fetch_add(index_bytes, std::sync::atomic::Ordering::Relaxed);
+        .fetch_add(index.written_bytes, std::sync::atomic::Ordering::Relaxed);
 
     #[cfg(feature = "test-hooks")]
     crate::test_hooks::hit_for_path(
@@ -949,6 +949,9 @@ fn save_inner<T: VectorType>(
         crate::request::check_current()?;
         publication::commit_rom(path)?;
     }
+    memtable
+        .persisted_index_bytes
+        .store(index.file_length, std::sync::atomic::Ordering::Release);
     write.outcome = WriteOutcome::Committed;
     #[cfg(feature = "test-hooks")]
     crate::test_hooks::hit_for_path(
@@ -1368,6 +1371,14 @@ pub(crate) fn load_with_memory_limit<T: VectorType>(
     )?;
     // 索引恢复及完整性扫描结束后，向量映射恢复为按需驻留。
     memtable.finish_vector_loading()?;
+    let index_length = match std::fs::metadata(format!("{path}.idx")) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error.into()),
+    };
+    memtable
+        .persisted_index_bytes
+        .store(index_length, std::sync::atomic::Ordering::Release);
     memtable.mark_checkpoint_clean();
     Ok(memtable)
 }

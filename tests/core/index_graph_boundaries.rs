@@ -420,6 +420,7 @@ fn 内存预算占满时无新增容量的删除事务继续完成() {
     tx.delete(1);
     assert_eq!(db.commit_tx(tx).unwrap(), Vec::<u64>::new());
     assert_eq!(db.all_node_ids().unwrap(), [2]);
+    db.set_memory_limit(0).unwrap();
     assert_eq!(db.get_payload(2).unwrap(), Some(json!({"keep":2})));
     db.close().unwrap();
     let mut reopened = Database::<f32>::open_with_config(&path, config(StorageMode::Mmap)).unwrap();

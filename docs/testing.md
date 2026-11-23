@@ -91,7 +91,7 @@ cargo test --locked --manifest-path crates/triviumdb-migrate/Cargo.toml --target
 
 Python／Node 的维护用例补充管理整数与布尔提取、原始类型拒绝、默认参数、实际转换回调中的重入和失败后继续调用。Python 保留宿主协议异常对象与 cause，Node 核对错误类型拒绝过程中强制转换回调次数为零。Prepared 用例验证 Python 的 `MappingProxyType`／`UserDict`、映射回调、容器及具名值诊断，核对 WAL、完整重开内容和类型消费。
 
-管理字符串用例验证同步模式和 generation 标识的类型拒绝、Python 字符串子类与编码异常、manifest 的回调／关闭／只读拒绝。Node Prepared 用例核对原始 NaN、无穷、undefined、BigInt、Symbol、函数及复合参数的具名诊断，保留 NUL／Unicode 键名、有效标量转换和既有属性枚举。循环复合值在标量边界拒绝，getter 和 Proxy 原异常按身份及 cause 验证，随后继续查询并核对 WAL 与重开数据。
+管理字符串用例验证同步模式和 generation 标识的类型拒绝、Python 字符串子类与编码异常、manifest 的回调／关闭／只读拒绝。Node Prepared 用例核对原始 NaN、无穷、undefined、超出 64 位整数域的 BigInt、Symbol、函数及复合参数的具名诊断，保留 NUL／Unicode 键名、有效标量转换和既有属性枚举。循环复合值在标量边界拒绝，getter 和 Proxy 原异常按身份及 cause 验证，随后继续查询并核对 WAL 与重开数据。
 
 `tests/python/query_arguments.py` 和 `tests/node/query_arguments.js` 验证检索整数、TQL 文本及 Filter 映射。整数协议回调和 Mapping 回调使用真实数据库借用，拒绝同库写入后继续验证外层完整结果。浮点相同向量以余弦 1 为预期，两段相同 u64 以 128 个匹配位为预期，普通检索用零深度隔离图扩散。用例核对原宿主异常、默认参数、过滤后的完整命中与排除集合、WAL、有效写入及重开内容。npm 制品入口显式等待异步查询契约完成，任务失败和缺少完成回执均导致验收失败。
 

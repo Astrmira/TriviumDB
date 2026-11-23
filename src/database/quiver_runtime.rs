@@ -402,10 +402,12 @@ fn load_reader<T: VectorType>(
                 Ok(())
             })?;
             if std::path::Path::new(&format!("{db_path}.idx")).exists() {
-                let written = crate::storage::index_container::publish_ssd(db_path)?;
+                let index = crate::storage::index_container::publish_ssd(db_path)?;
+                mt.persisted_index_bytes
+                    .store(index.file_length, std::sync::atomic::Ordering::Release);
                 mt.published_bytes
                     .index
-                    .fetch_add(written, std::sync::atomic::Ordering::Relaxed);
+                    .fetch_add(index.written_bytes, std::sync::atomic::Ordering::Relaxed);
             }
             open()
         }

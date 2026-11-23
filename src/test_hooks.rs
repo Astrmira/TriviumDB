@@ -68,6 +68,7 @@ pub enum ConcurrencyPoint {
     MigrationCommitted,
     TqlPathStep,
     BeforeTqlProjection,
+    PropertyIndexBuildRow,
     ConsoleBeforeCommit,
     BeforeTransactionWal,
     TransactionWalLockAcquired,

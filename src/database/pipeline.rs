@@ -701,7 +701,7 @@ fn recall_text_ranked<T: VectorType>(
     if let Some(txt) = query_text {
         let text_engine = mt.text_engine();
         let mut combined = std::collections::HashMap::<NodeId, f32>::new();
-        for (id, score) in text_engine.search_ac(txt) {
+        for (id, score) in mt.search_keywords(txt)? {
             *combined.entry(id).or_insert(0.0) += score;
         }
         for (id, score) in text_engine.search_bm25(txt, config.bm25_k1, config.bm25_b) {

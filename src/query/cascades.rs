@@ -343,7 +343,13 @@ pub(crate) fn optimize_pipeline_scoped<T: VectorType>(
         BTreeMap::new()
     };
     let pair_stats = if requirements.column_pairs {
-        mt.column_pair_stats()
+        let mut requested = BTreeSet::new();
+        for stage in &query.pipeline {
+            if let PipelineStage::Filter(predicate) = stage {
+                collect_required_pairs(predicate, &mut requested);
+            }
+        }
+        mt.column_pair_stats_for(&requested)
             .into_iter()
             .map(|stats| {
                 let key = ordered_field_pair(&stats.left_field, &stats.right_field);
@@ -1262,6 +1268,23 @@ fn estimate_predicate_selectivity(
         Predicate::Not(inner) => (1.0
             - estimate_predicate_selectivity(inner, node_count, stats, pair_stats))
         .clamp(0.0, 1.0),
+    }
+}
+
+fn collect_required_pairs(predicate: &Predicate, pairs: &mut BTreeSet<(String, String)>) {
+    if let Predicate::And(left, right) = predicate
+        && let Some((a, b)) = predicate_property_field(left).zip(predicate_property_field(right))
+        && a != b
+    {
+        pairs.insert(ordered_field_pair(a, b));
+    }
+    match predicate {
+        Predicate::And(left, right) | Predicate::Or(left, right) => {
+            collect_required_pairs(left, pairs);
+            collect_required_pairs(right, pairs);
+        }
+        Predicate::Not(inner) => collect_required_pairs(inner, pairs),
+        _ => {}
     }
 }
 

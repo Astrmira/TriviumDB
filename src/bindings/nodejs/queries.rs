@@ -125,7 +125,11 @@ fn collect_prepared_parameters(
                 )
         };
         match value.get_type()? {
-            ValueType::Null | ValueType::Boolean | ValueType::Number | ValueType::String => {}
+            ValueType::Null
+            | ValueType::Boolean
+            | ValueType::Number
+            | ValueType::BigInt
+            | ValueType::String => {}
             // 复合值在标量边界拒绝，避免遍历无效参数中的循环或宿主 getter。
             _ => return Err(invalid_value()),
         }

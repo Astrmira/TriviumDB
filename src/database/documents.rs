@@ -93,7 +93,7 @@ pub(super) fn read_snapshot_checked<T: VectorType>(
             None
         } else {
             mt.check_load_allocation(archive_bytes)?;
-            Some(mt.resource_runtime().reserve_workspace(archive_bytes)?)
+            Some(mt.reserve_instance_workspace(archive_bytes)?)
         };
         upload.snapshot()?
     } else {
@@ -373,8 +373,7 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
                 None => return Ok(None),
             };
             let extra = bytes.saturating_mul(32).saturating_add(4096);
-            mt.ensure_additional_memory(self.memory_limit, extra)?;
-            let _workspace = self.resource_runtime.reserve_workspace(extra)?;
+            let _workspace = mt.reserve_instance_workspace(extra)?;
             read_snapshot(&mt, id)
         })?
     }

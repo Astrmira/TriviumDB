@@ -288,12 +288,18 @@ pub(crate) fn validate_bound(
     Ok(())
 }
 
+/// 已发布索引的实际写入量与包含对齐间隙的文件长度。
+pub(crate) struct PublishedIndex {
+    pub written_bytes: u64,
+    pub file_length: u64,
+}
+
 /// 从本次写出的组件和保持不变的旧文本构建候选。调用方持有数据库写租约及发布日志。
 pub(crate) fn publish_checkpoint(
     db_path: &str,
     preserve_text: bool,
     pelorus: [Option<Part>; 2],
-) -> io::Result<u64> {
+) -> io::Result<PublishedIndex> {
     let mut parts = Vec::with_capacity(COMPONENTS);
     for suffix in INDEX_SUFFIXES.into_iter().take(BASE_COMPONENTS) {
         parts.push(if suffix == ".text" && preserve_text || suffix == ".qssd" {
@@ -307,7 +313,7 @@ pub(crate) fn publish_checkpoint(
 }
 
 /// 派生 SSD 更新保持同一事实身份与其他组件，旧 Reader 继续持有旧代文件。
-pub(crate) fn publish_ssd(db_path: &str) -> io::Result<u64> {
+pub(crate) fn publish_ssd(db_path: &str) -> io::Result<PublishedIndex> {
     validate(db_path, true)?;
     let mut parts = Vec::with_capacity(COMPONENTS);
     for suffix in INDEX_SUFFIXES {
@@ -341,7 +347,7 @@ fn identities(db_path: &str) -> io::Result<([u8; 16], [u8; 16])> {
     ))
 }
 
-fn publish(db_path: &str, parts: Vec<Option<Part>>) -> io::Result<u64> {
+fn publish(db_path: &str, parts: Vec<Option<Part>>) -> io::Result<PublishedIndex> {
     #[cfg(feature = "test-hooks")]
     crate::test_hooks::io_result(crate::test_hooks::IoPoint::IndexContainerWrite)?;
     let path = PathBuf::from(format!("{db_path}.idx"));
@@ -406,7 +412,10 @@ fn publish(db_path: &str, parts: Vec<Option<Part>>) -> io::Result<u64> {
     #[cfg(feature = "test-hooks")]
     crate::test_hooks::io_result(crate::test_hooks::IoPoint::IndexContainerPublish)?;
     robust_rename_and_sync(&temporary, &path)?;
-    Ok(written)
+    Ok(PublishedIndex {
+        written_bytes: written,
+        file_length: end,
+    })
 }
 
 /// 只在文件组提交成功之后删除已归入容器的独立组件。

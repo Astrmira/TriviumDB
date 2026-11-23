@@ -1109,6 +1109,18 @@ fn 有限共享工作区可展开单个归档的短证据() {
             "parsed":parsed,"root":{"id":"10","vector":[1,0],"payload":{}}
         }}),
     );
+    db.set_memory_limit(db.estimated_memory() + 16 * 1024)
+        .unwrap();
+    assert_eq!(
+        db.get_document(10).unwrap_err().code(),
+        "TDB_CAPACITY_RESERVATION_REJECTED"
+    );
+    assert_eq!(db.resource_stats().reserved_workspace_bytes, 0);
+    db.set_memory_limit(0).unwrap();
+    assert_eq!(
+        db.get_document(10).unwrap().unwrap().content,
+        format!("alpha{}", "x".repeat(64 * 1024))
+    );
     db.close().unwrap();
     // 为库保留 16 MiB，维护保留 1 MiB，读请求独享其余 1.5 MiB。
     let runtime = triviumdb::ResourceRuntime::new(triviumdb::ResourceLimits {

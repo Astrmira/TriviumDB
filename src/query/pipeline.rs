@@ -232,6 +232,21 @@ impl NodeSet {
             .rows
             .len()
             .saturating_mul(std::mem::size_of::<NodeRow>());
+        let owned = self.rows.iter().fold(0usize, |total, row| {
+            let ids = row
+                .path
+                .as_ref()
+                .map_or(0, Vec::capacity)
+                .saturating_add(row.provenance.source_ids.capacity());
+            total
+                .saturating_add(ids.saturating_mul(std::mem::size_of::<NodeId>()))
+                .saturating_add(row.provenance.property_origin.as_ref().map_or(0, |origin| {
+                    origin.field.capacity().saturating_add(
+                        crate::storage::payload_store::estimate_json_memory(&origin.value)
+                            .saturating_sub(std::mem::size_of::<serde_json::Value>()),
+                    )
+                }))
+        });
         let graph_metrics = self
             .rows
             .iter()
@@ -260,6 +275,7 @@ impl NodeSet {
             })
             .fold(0usize, usize::saturating_add);
         inline
+            .saturating_add(owned)
             .saturating_add(graph_metrics)
             .saturating_add(bindings)
     }
@@ -767,9 +783,12 @@ pub(crate) fn execute_pipeline_with_workspace<T: VectorType>(
             control.check().map_err(locate)?;
         }
         current.normalize(false);
-        context.validate_output(&current).map_err(locate)?;
+        let node_set_bytes = current.estimated_bytes();
         context
-            .reserve_row_workspace(current.estimated_bytes())
+            .validate_output_size(current.len(), node_set_bytes)
+            .map_err(locate)?;
+        context
+            .reserve_row_workspace(node_set_bytes)
             .map_err(locate)?;
         if let (Some(input_rows), Some(started), Some((vectors, (lookups, parsed)))) =
             (input_rows, started, start_usage)
@@ -779,7 +798,7 @@ pub(crate) fn execute_pipeline_with_workspace<T: VectorType>(
                 input_rows,
                 output_rows: current.len(),
                 elapsed_ns: started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
-                node_set_bytes: current.estimated_bytes(),
+                node_set_bytes,
                 vector_read_bytes: context.vector_read_bytes - vectors,
                 payload_lookups: payload_lookups - lookups,
                 payload_parsed_bytes: payload_parsed_bytes - parsed,
@@ -1063,7 +1082,7 @@ impl<T: VectorType> PipelineOperator<T> for TextSearchSource {
             }
         }
         if self.include_ac {
-            for (id, score) in index.search_ac(&self.query) {
+            for (id, score) in context.memtable.search_keywords(&self.query)? {
                 *scores.entry(id).or_default() += f64::from(score) * f64::from(self.ac_weight);
             }
         }

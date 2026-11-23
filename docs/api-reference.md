@@ -1434,7 +1434,7 @@ Python 的参数容器接受字符串键 `Mapping`，包括 `dict`、`MappingPro
 
 `tql`、`prepare_tql` 和 `tql_mut` 的查询文本类型拒绝定位 `query`，发生在解析之前，阶段省略。Python 保留原类型及编码异常。写入口类型拒绝提供 `validation/not_committed`，回调重入提供 `admission/not_committed`，读取入口省略写入结果。
 
-Node Prepared 只绑定参数对象的自有可枚举字符串键。NaN、无穷、undefined、BigInt、Symbol、函数及复合值返回具名绑定错误。属性枚举与 getter 抛出的宿主异常保留原对象与 cause，有效标量沿用原有数值和字符串转换规则。
+Node Prepared 只绑定参数对象的自有可枚举字符串键。NaN、无穷、undefined、超出 64 位整数域的 BigInt、Symbol、函数及复合值返回具名绑定错误。属性枚举与 getter 抛出的宿主异常保留原对象与 cause，有效标量沿用原有数值和字符串转换规则。
 
 命名参数转换及绑定错误提供 `stage=bind` 和 `target.parameter`。缺参、多参与类型错误保留各自错误码和详情，Python 保留原异常继承关系。映射协议产生的宿主异常保留原对象与 cause。Rust 使用 `TriviumError::underlying()` 取得带定位错误的原始变体。覆盖边界见[公共错误契约](error-contracts.md)。
 

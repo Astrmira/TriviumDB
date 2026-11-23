@@ -61,12 +61,7 @@ pub(super) fn node_bytes<T: VectorType>(id: NodeId, mt: &MemTable<T>) -> crate::
     for edge in mt.get_edges(id).unwrap_or(&[]) {
         bytes = bytes
             .checked_add(std::mem::size_of_val(edge) * 2)
-            .and_then(|bytes| bytes.checked_add(edge.label.len()))
-            .and_then(|bytes| {
-                bytes.checked_add(crate::storage::payload_store::query_clone_peak(
-                    &edge.metadata,
-                ))
-            })
+            .and_then(|bytes| bytes.checked_add(edge.clone_heap_bytes()))
             .ok_or_else(overflow)?;
     }
     Ok(bytes)
@@ -85,12 +80,7 @@ pub(super) fn snapshot_bytes<T: VectorType>(node: &Node<T>) -> crate::Result<usi
     for edge in &node.edges {
         bytes = bytes
             .checked_add(std::mem::size_of_val(edge) * 2)
-            .and_then(|v| v.checked_add(edge.label.len()))
-            .and_then(|v| {
-                v.checked_add(crate::storage::payload_store::query_clone_peak(
-                    &edge.metadata,
-                ))
-            })
+            .and_then(|v| v.checked_add(edge.clone_heap_bytes()))
             .ok_or_else(overflow)?;
     }
     Ok(bytes)

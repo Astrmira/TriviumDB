@@ -266,7 +266,7 @@ Rust 直接构造 `TqlQuery` 时需提供 `graph_scope`，直接构造 `EdgeView
 
 `FIND` 入口对全库节点的 JSON Payload 进行条件过滤，功能完全覆盖旧的 `db.filter()` 和 `db.filter_where()` API。无可用属性索引时，Planner 在 `EXPLAIN` 中标记 `cold_payload_scan`；执行器按 Payload 目录顺序访问冷数据，并受 lookup/parse 工作预算约束。高频字段应建立 Hash、Ordered ART、Composite ART、Bitmap 或 N-gram 索引，先缩小 NodeId 候选再执行必要的 residual predicate。
 
-管线的 Payload lookup 和实际解析字节按本次查询执行计量，工作线程继承所属查询的账本。缓存命中计一次查找，冷读另计实际解码的 JSON 字节。PROFILE 中的 Payload 用量记录当前查询的累计值，实例统计维护独立的累计口径。复用执行上下文时重新建立本次账本和阶段统计。
+管线的 Payload lookup 和实际解析字节按本次查询执行计量，工作线程继承所属查询的账本。每次读取已有 Payload 均按原始 JSON 长度扣除解析字节预算，冷读与缓存命中使用相同额度。PROFILE 仅在实际解码时记录解析字节。PROFILE 中的 Payload 用量记录当前查询的累计值，实例统计维护独立的累计口径。复用执行上下文时重新建立本次账本和阶段统计。
 
 ### 基础语法
 
@@ -892,7 +892,7 @@ rows = db.execute_prepared_tql(prepared, {"x": 0.2, "y": 0.8, "bonus": 4})
 
 `SEARCH VECTOR` 的方括号内可混合有限数字字面量与 Prepared 数值参数，例如 `[1e-5, $y, -3E-1]`。十进制字面量支持 `e`/`E` 科学计数法以及正负指数；不完整指数和溢出到非有限值的数字会在解析期 fail-closed。参数只在 bind 阶段写入连续向量，绑定完成后复用与字面量完全相同的 QuIVer/精确检索热路径，不增加候选打分开销。
 
-Node 使用 `prepareTql/executePreparedTql`，Rust 使用 `prepare_tql/execute_prepared_tql`。缺参、额外参数、非数值向量参数和非有限数值全部 fail-closed；同一 Prepared 对象可重复绑定执行。
+Node 的整数参数可使用 `bigint` 精确传入 `-2^63` 到 `2^64 - 1`，例如 `{ id: 9007199254740993n }`。Node 使用 `prepareTql/executePreparedTql`，Rust 使用 `prepare_tql/execute_prepared_tql`。缺参、额外参数、非数值向量参数和非有限数值全部 fail-closed；同一 Prepared 对象可重复绑定执行。
 
 直接执行包含未绑定参数的查询返回明确错误。Rust 手工构造 Prepared AST 时，向量参数槽位必须有效且唯一；绑定过程检查槽位边界并保持原始整数精度。
 

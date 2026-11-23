@@ -284,7 +284,7 @@ Python／Node 的同步模式字符串拒绝、容量预留、MiB 额度、自�
 
 Python Prepared 接受字符串键 `Mapping`，转换值失败时提供 `stage=bind` 与原始 `target.parameter`。映射容器和键错误使用 `target.field=parameters`；映射自身的 `items`、迭代和取值异常沿宿主路径传播。
 
-Node Prepared 在方法内读取原始参数，错误容器提供 `target.field=parameters`。NaN、无穷、undefined、BigInt、Symbol、函数及复合参数值提供 `TDB_INVALID_INPUT`、`stage=bind` 与原始 `target.parameter`，键名保留 NUL 和 Unicode。数组和对象值在标量边界拒绝。容器属性枚举与 getter 抛出的宿主异常保留原对象和 cause，既有属性枚举及标量数值转换继续复用原路径。
+Node Prepared 在方法内读取原始参数，错误容器提供 `target.field=parameters`。NaN、无穷、undefined、超出 64 位整数域的 BigInt、Symbol、函数及复合参数值提供 `TDB_INVALID_INPUT`、`stage=bind` 与原始 `target.parameter`，键名保留 NUL 和 Unicode。数组和对象值在标量边界拒绝。容器属性枚举与 getter 抛出的宿主异常保留原对象和 cause，既有属性枚举及标量数值转换继续复用原路径。
 
 Python 的同步模式与 generation 标识也在请求借用后提取字符串，已覆盖内置类型错误保留原异常继承及规范字段。Node 对这两个字段执行原始字符串校验。manifest 的 SDK 回调拒绝提供 `admission/not_committed`，目标发布结果继续按 Core 文件组完成点描述。
 

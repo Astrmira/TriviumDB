@@ -302,6 +302,9 @@ export async function exercise(file: string): Promise<void> {
     db.rebuildTextIndex([{ id: 11, text: 'primarytoken', keywords: ['primaryalias'] }]);
     const prepared: PreparedTql = db.prepareTql('FIND {kind: "primary"} AS n WITH n RETURN n, $label AS label');
     const rows = db.executePreparedTql(prepared, { label: 'verified' });
+    const wide = db.prepareTql('MATCH (n {id:11}) WHERE $id == 9007199254740993 RETURN n.id AS id');
+    const wideRows = db.executePreparedTql(wide, { id: BigInt('9007199254740993') });
+    check(wideRows.length === 1 && wideRows[0].id === 11, 'Prepared TQL 大整数绑定未命中');
     check(rows.length === 1 && rows[0].n.id === '11' && rows[0].n.payload.kind === 'primary' && rows[0].label === 'verified',
       'Prepared TQL 的节点 ID 或 Payload 与独立样例不符');
     const hits: JsSearchHit[] = db.searchExact([1, 0], 2);

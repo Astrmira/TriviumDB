@@ -718,7 +718,7 @@ fn text_index_keyword_和_bm25() {
 
     mt.index_keyword(1, "rust");
     mt.index_text(2, "hello world rust programming");
-    mt.build_text_index();
+    mt.build_text_index().unwrap();
 
     let ac = mt.text_engine().search_ac("rust");
     assert!(ac.contains_key(&1));

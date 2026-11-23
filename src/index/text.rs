@@ -74,7 +74,8 @@ struct CompiledKeywords {
 pub struct TextIndex {
     // === 1. AC 自动机（特征锚点） ===
     // 用于精确捕获非常短、但置信度极高的指代特征词
-    ac_matcher: OnceLock<Option<CompiledKeywords>>,
+    ac_matcher: OnceLock<CompiledKeywords>,
+    compile_lock: std::sync::Mutex<()>,
     keyword_to_nodes: HashMap<String, Vec<NodeId>>,
     // 只记录注册过关键词的节点，删除无关键词节点时不扫描整个词典。
     keyword_nodes: HashSet<NodeId>,
@@ -304,53 +305,71 @@ impl TextIndex {
 
     /// 全量构建索引 (编译 AC，计算平均文档长度与频次基数)
     pub fn build(&mut self) {
-        self.rebuild_runtime();
+        let _ = self.try_build();
     }
 
-    pub(crate) fn try_build(&mut self) -> crate::error::Result<()> {
-        self.rebuild_runtime();
-        if !self.keyword_to_nodes.is_empty() && self.compiled_keywords().is_none() {
-            return Err(crate::error::TriviumError::InvalidInput(
-                "关键词自动机构建失败".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn rebuild_runtime(&mut self) {
-        self.compiled_keywords();
+    pub(crate) fn try_build(&mut self) -> crate::Result<()> {
+        self.prepare_keywords(|_| Ok(()))?;
         self.total_tokens = self
             .doc_lengths
             .values()
             .map(|length| *length as u128)
             .sum();
         self.refresh_statistics();
+        Ok(())
     }
 
-    fn compiled_keywords(&self) -> Option<&CompiledKeywords> {
-        self.ac_matcher
-            .get_or_init(|| {
-                let mut keywords: Vec<_> = self.keyword_to_nodes.keys().cloned().collect();
-                keywords.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-                if keywords.is_empty() {
-                    return None;
-                }
-                AhoCorasickBuilder::new()
-                    .match_kind(MatchKind::LeftmostLongest)
-                    .build(&keywords)
-                    .ok()
-                    .map(|matcher| {
-                        let bytes = matcher.memory_usage()
-                            + keywords.capacity() * std::mem::size_of::<String>()
-                            + keywords.iter().map(String::capacity).sum::<usize>();
-                        CompiledKeywords {
-                            matcher,
-                            keywords,
-                            bytes,
-                        }
-                    })
-            })
-            .as_ref()
+    pub(crate) fn prepare_keywords<W>(
+        &self,
+        mut reserve: impl FnMut(usize) -> crate::Result<W>,
+    ) -> crate::Result<()> {
+        if self.keyword_to_nodes.is_empty() || self.ac_matcher.get().is_some() {
+            return Ok(());
+        }
+        let _compile = self.compile_lock.lock().unwrap_or_else(|p| p.into_inner());
+        if self.ac_matcher.get().is_some() {
+            return Ok(());
+        }
+        crate::request::check_current()?;
+        // 稀疏前缀状态总数受关键词字节数约束。构建时两种 NFA、排序词表和输出表会同时存活。
+        let peak = self.keyword_to_nodes.keys().fold(8192usize, |bytes, key| {
+            bytes
+                .saturating_add(key.len().saturating_mul(192))
+                .saturating_add(128)
+        });
+        let _workspace = reserve(peak)?;
+        let mut keywords: Vec<_> = self.keyword_to_nodes.keys().cloned().collect();
+        keywords.sort_unstable_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        let matcher = AhoCorasickBuilder::new()
+            .kind(Some(aho_corasick::AhoCorasickKind::ContiguousNFA))
+            .dense_depth(0)
+            .match_kind(MatchKind::LeftmostLongest)
+            .build(&keywords)
+            .map_err(|error| {
+                crate::TriviumError::InvalidInput(format!(
+                    "关键词自动机构建失败 (Keyword automaton build failed): {error}"
+                ))
+            })?;
+        let bytes = matcher
+            .memory_usage()
+            .saturating_add(
+                keywords
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<String>()),
+            )
+            .saturating_add(keywords.iter().map(String::capacity).sum::<usize>());
+        let _extra = if bytes > peak {
+            Some(reserve(bytes - peak)?)
+        } else {
+            None
+        };
+        crate::request::check_current()?;
+        let _ = self.ac_matcher.set(CompiledKeywords {
+            matcher,
+            keywords,
+            bytes,
+        });
+        Ok(())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -360,11 +379,7 @@ impl TextIndex {
     pub fn estimated_memory_bytes(&self) -> usize {
         self.keyword_bytes
             + self.bm25_bytes
-            + self
-                .ac_matcher
-                .get()
-                .and_then(Option::as_ref)
-                .map_or(0, |compiled| compiled.bytes)
+            + self.ac_matcher.get().map_or(0, |compiled| compiled.bytes)
             + self.keyword_nodes.capacity() * std::mem::size_of::<NodeId>()
             + self.doc_lengths.capacity()
                 * (std::mem::size_of::<NodeId>() + std::mem::size_of::<usize>())
@@ -454,6 +469,7 @@ impl TextIndex {
         }
         let mut index = Self {
             ac_matcher: OnceLock::new(),
+            compile_lock: Default::default(),
             keyword_to_nodes: snapshot.keyword_to_nodes,
             keyword_nodes: HashSet::new(),
             bm25_tf: snapshot.bm25_tf,
@@ -550,7 +566,8 @@ impl TextIndex {
     /// 执行 AC 自动机精准锚点激发
     pub fn search_ac(&self, query: &str) -> HashMap<NodeId, f32> {
         let mut results = HashMap::new();
-        if let Some(compiled) = self.compiled_keywords() {
+        let _ = self.prepare_keywords(|_| Ok(()));
+        if let Some(compiled) = self.ac_matcher.get() {
             let query_lower = query.to_lowercase();
             for mat in compiled.matcher.find_iter(&query_lower) {
                 let kw = &compiled.keywords[mat.pattern()];
@@ -585,15 +602,11 @@ mod ledger_tests {
             .sum::<usize>();
         assert_eq!(index.keyword_bytes, keywords);
         assert_eq!(index.bm25_bytes, terms);
-        let compiled = index
-            .ac_matcher
-            .get()
-            .and_then(Option::as_ref)
-            .map_or(0, |ac| {
-                ac.matcher.memory_usage()
-                    + ac.keywords.capacity() * std::mem::size_of::<String>()
-                    + ac.keywords.iter().map(String::capacity).sum::<usize>()
-            });
+        let compiled = index.ac_matcher.get().map_or(0, |ac| {
+            ac.matcher.memory_usage()
+                + ac.keywords.capacity() * std::mem::size_of::<String>()
+                + ac.keywords.iter().map(String::capacity).sum::<usize>()
+        });
         assert_eq!(
             index.estimated_memory_bytes(),
             keywords

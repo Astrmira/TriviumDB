@@ -918,16 +918,22 @@ fn 管线阶段节点向量图与_payload_预算均提前拒绝() {
 }
 
 #[test]
-fn 缓存命中仅计查找而冷读按解析字节准入() {
-    let mut mt = MemTable::<f32>::new(DIM);
-    mt.configure_payload_cache(0, 0);
-    mt.insert_with_id(1, &[1., 0., 0., 0.], json!({"v":1}))
-        .unwrap();
-    mt.configure_payload_cache(4096, 4096);
+fn 缓存冷热共享逻辑字节预算而剖析仅计实际解码() {
     for hot in [false, true] {
+        let mut mt = MemTable::<f32>::new(DIM);
+        mt.configure_payload_cache(0, 0);
+        mt.insert_with_id(1, &[1., 0., 0., 0.], json!({"v":1}))
+            .unwrap();
+        mt.configure_payload_cache(4096, 4096);
         if hot {
             assert_eq!(*mt.get_payload(1).unwrap(), json!({"v":1}));
         }
+        let ops: Vec<Box<dyn PipelineOperator<f32>>> = vec![
+            Box::new(NodeIdsSource { ids: vec![1] }),
+            Box::new(PayloadFilter {
+                filter: Filter::eq("v", json!(1)),
+            }),
+        ];
         let mut ctx = PipelineContext::with_profile(
             &mt,
             PipelineBudget {
@@ -936,31 +942,29 @@ fn 缓存命中仅计查找而冷读按解析字节准入() {
             },
             true,
         );
-        let filter = PayloadFilter {
-            filter: Filter::eq("v", json!(1)),
-        };
-        let result = execute_pipeline(
-            &mut ctx,
-            &[Box::new(NodeIdsSource { ids: vec![1] }), Box::new(filter)],
+        assert!(matches!(
+            execute_pipeline(&mut ctx, &ops).unwrap_err(),
+            triviumdb::TriviumError::PayloadQueryBudgetExceeded {
+                dimension: "parsed_bytes",
+                used: 7,
+                budget: 1
+            }
+        ));
+        let mut ctx = PipelineContext::with_profile(
+            &mt,
+            PipelineBudget {
+                max_payload_parsed_bytes: 7,
+                ..budget()
+            },
+            true,
         );
-        if hot {
-            let rows = result.unwrap();
-            assert_eq!(
-                rows.rows().iter().map(|row| row.id).collect::<Vec<_>>(),
-                [1]
-            );
-            let stage = ctx.metrics.last().unwrap();
-            assert_eq!((stage.payload_lookups, stage.payload_parsed_bytes), (1, 0));
-        } else {
-            assert!(matches!(
-                result.unwrap_err(),
-                triviumdb::TriviumError::PayloadQueryBudgetExceeded {
-                    used: 7,
-                    budget: 1,
-                    ..
-                }
-            ));
-        }
+        let rows = execute_pipeline(&mut ctx, &ops).unwrap();
+        assert_eq!(rows.rows().iter().map(|r| r.id).collect::<Vec<_>>(), [1]);
+        let stage = ctx.metrics.last().unwrap();
+        assert_eq!(
+            (stage.payload_lookups, stage.payload_parsed_bytes),
+            (1, if hot { 0 } else { 7 })
+        );
     }
 }
 

@@ -22,7 +22,7 @@ pub(super) struct Scope<'a, T: VectorType> {
 pub(super) struct Row<T> {
     pub source: Option<usize>,
     pub values: HashMap<String, TqlValue<T>>,
-    group_key: Option<Vec<String>>,
+    group_key: Vec<RuntimeValue>,
 }
 
 // 同分行按完整绑定身份比较，保持不同访问路径和 HashMap 顺序下的分页一致。
@@ -593,7 +593,7 @@ fn finish_inner<T: VectorType>(
         if inputs.is_empty() && group_items.is_empty() {
             groups.insert(Vec::new(), Vec::new());
         }
-        for (group_key, mut group) in groups {
+        for mut group in groups.into_values() {
             if scope.pipeline.is_none() && scope.query.rank.is_none() {
                 group.sort_unstable_by(|&a, &b| {
                     compare_input_identity(&inputs[a], &inputs[b], &scope.query.entry)
@@ -622,10 +622,18 @@ fn finish_inner<T: VectorType>(
                 })?;
                 values.insert(column_name(item), value);
             }
+            let group_key = if scope.query.order_by.is_empty() {
+                Vec::new()
+            } else {
+                group_items
+                    .iter()
+                    .map(|item| tql_value_runtime(&values[&column_name(item)]))
+                    .collect()
+            };
             rows.push(Row {
                 source,
                 values,
-                group_key: Some(group_key),
+                group_key,
             });
         }
     } else {
@@ -645,7 +653,7 @@ fn finish_inner<T: VectorType>(
             rows.push(Row {
                 source: Some(index),
                 values: HashMap::new(),
-                group_key: None,
+                group_key: Vec::new(),
             });
         }
     }
@@ -680,7 +688,11 @@ fn finish_inner<T: VectorType>(
                 }
             }
             left.group_key
-                .cmp(&right.group_key)
+                .iter()
+                .zip(&right.group_key)
+                .map(|(a, b)| compare_for_sort(a, b))
+                .find(|order| !order.is_eq())
+                .unwrap_or_else(|| left.group_key.len().cmp(&right.group_key.len()))
                 .then_with(|| match (left.source, right.source) {
                     (Some(left), Some(right)) => {
                         compare_input_identity(&inputs[left], &inputs[right], &scope.query.entry)

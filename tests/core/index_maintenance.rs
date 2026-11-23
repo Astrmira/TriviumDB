@@ -341,3 +341,148 @@ fn text_workspace_rejection_preserves_facts_and_retries_after_quota_release() {
     );
     reopened.close().unwrap();
 }
+
+#[test]
+fn 零节点检查点保留全部属性索引定义() {
+    let dir = super::support::TestDir::new("empty-index-catalog");
+    let expected: std::collections::BTreeSet<_> = (0..1025).map(|i| format!("key{i}")).collect();
+    for mode in [StorageMode::Rom, StorageMode::Mmap] {
+        let path = dir.file(&format!("{mode:?}.tdb"));
+        let config = Config {
+            dim: 1,
+            storage_mode: mode,
+            auto_build_quiver: false,
+            ..Default::default()
+        };
+        let mut db = Database::<f32>::open_with_config(&path, config).unwrap();
+        db.insert_with_id(1, &[1.], json!({"key0":1})).unwrap();
+        for field in &expected {
+            db.create_index(field).unwrap();
+        }
+        db.delete(1).unwrap();
+        db.close().unwrap();
+        let db = Database::<f32>::open_with_config(&path, config).unwrap();
+        assert_eq!(db.node_count().unwrap(), 0);
+        let fields = db.index_info().unwrap();
+        assert!(fields.iter().all(|f| f.entry_count == 0));
+        assert_eq!(
+            fields
+                .into_iter()
+                .map(|f| f.field)
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn 重建属性目录保留唯一约束且错误不安装部分目录() {
+    use triviumdb::{index::property::PropertyIndexKind, storage::memtable::MemTable};
+    let mut mt = MemTable::<f32>::new(1);
+    mt.insert_with_id(1, &[1.], json!({"key":"abc","n":1}))
+        .unwrap();
+    mt.register_unique_property_index("key").unwrap();
+    let defs = vec![(PropertyIndexKind::Ordered, vec!["n".to_owned()])];
+    mt.rebuild_property_indexes_from_definitions(&defs).unwrap();
+    let before = mt.property_indexes().index_definitions();
+    assert_eq!(mt.unique_index_definitions(), [vec!["key".to_owned()]]);
+    assert!(
+        mt.rebuild_property_indexes_from_definitions(&[(
+            PropertyIndexKind::Ngram,
+            vec!["n".into()]
+        )])
+        .is_err()
+    );
+    assert_eq!(mt.property_indexes().index_definitions(), before);
+    assert_eq!(
+        mt.insert_with_id(2, &[2.], json!({"key":"abc"}))
+            .unwrap_err()
+            .code(),
+        "TDB_UNIQUE_CONSTRAINT"
+    );
+}
+
+#[test]
+fn 拥有型点读和精确双曲检索分别按实例余量准入() {
+    use triviumdb::index::pelorus::{PelorusConfig, PelorusSearchOptions};
+    let dir = super::support::TestDir::new("owned-read-budget");
+    let mut db = Database::<f32>::open(&dir.file("point.tdb"), 256).unwrap();
+    let vector = [0.0; 256];
+    let big = json!({"pad":"x".repeat(32*1024)});
+    db.insert_with_id(1, &vector, big.clone()).unwrap();
+    db.insert_with_id(2, &vector, json!(null)).unwrap();
+    db.upsert_edge(1, 2, "rel", 1., big.clone()).unwrap();
+    db.build_pelorus_index(PelorusConfig::default()).unwrap();
+    let search = PelorusSearchOptions {
+        top_k: 1,
+        exact: true,
+        ..Default::default()
+    };
+    db.set_memory_limit(db.estimated_memory() + 2048).unwrap();
+    for err in [
+        db.get(1).unwrap_err(),
+        db.get_payload(1).unwrap_err(),
+        db.get_edges(1).unwrap_err(),
+        db.get_edge(1, 2, "rel").unwrap_err(),
+        db.get_incoming_edges(2, None).unwrap_err(),
+    ] {
+        assert_eq!(err.code(), "TDB_CAPACITY_RESERVATION_REJECTED");
+    }
+    db.set_memory_limit(0).unwrap();
+    assert_eq!(db.get(1).unwrap().unwrap().payload, big);
+    assert_eq!(db.get_edges(1).unwrap()[0].metadata, big);
+    db.update_payload(1, json!(null)).unwrap();
+    db.set_memory_limit(db.estimated_memory() + 2048).unwrap();
+    assert_eq!(
+        db.search_pelorus(&vector, &search).unwrap_err().code(),
+        "TDB_CAPACITY_RESERVATION_REJECTED"
+    );
+    db.set_memory_limit(0).unwrap();
+    assert_eq!(db.search_pelorus(&vector, &search).unwrap()[0].id, 1);
+}
+
+#[test]
+fn 关键词预热拒绝后仍可编译并返回原始命中() {
+    let dir = super::support::TestDir::new("keyword-build-budget");
+    let mut db = Database::<f32>::open(&dir.file("text.tdb"), 1).unwrap();
+    db.insert_with_id(9, &[1.], json!(null)).unwrap();
+    for i in 0..120 {
+        db.index_keyword(9, &format!("term{i:03}")).unwrap();
+    }
+    let before = db.estimated_memory();
+    db.set_memory_limit(before + 16).unwrap();
+    assert_eq!(
+        db.build_text_index().unwrap_err().code(),
+        "TDB_CAPACITY_RESERVATION_REJECTED"
+    );
+    assert_eq!(db.estimated_memory(), before);
+    db.set_memory_limit(0).unwrap();
+    db.build_text_index().unwrap();
+    let rows = db
+        .tql_values("TEXT AC 'term119' TOP 1 AS n WITH n RETURN n")
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["n"].as_node().unwrap().id)
+            .collect::<Vec<_>>(),
+        [9]
+    );
+}
+
+#[test]
+fn 宽复合索引仅为过滤所用字段对读取一次事实() {
+    let dir = super::support::TestDir::new("pair-scan");
+    let mut db = Database::<f32>::open(&dir.file("pairs.tdb"), 1).unwrap();
+    for id in 1..=20 {
+        db.insert_with_id(id, &[1.], json!({"a":id,"b":id,"c":id,"d":id,"e":id}))
+            .unwrap();
+    }
+    db.create_composite_index(&["a", "b", "c", "d", "e"].map(String::from))
+        .unwrap();
+    let sql = "EXPLAIN SEARCH VECTOR [1] TOP 1 AS n WITH n WHERE n.a == 1 AND n.b == 1 RETURN n";
+    for reads in [20, 0] {
+        let before = db.payload_memory_stats().payload_lookups;
+        assert_eq!(db.tql(sql).unwrap().len(), 1);
+        assert_eq!(db.payload_memory_stats().payload_lookups - before, reads);
+    }
+}

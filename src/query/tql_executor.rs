@@ -3818,19 +3818,22 @@ fn compare_runtime(lhs: &RuntimeValue, op: &TqlCompOp, rhs: &RuntimeValue) -> bo
                 _ => false,
             }
         }
-        (RuntimeValue::Json(a), RuntimeValue::Json(b)) => match op {
-            TqlCompOp::Eq => compare_json(a, b).is_eq(),
-            TqlCompOp::Ne => !compare_json(a, b).is_eq(),
-            _ => false,
-        },
+        (RuntimeValue::Json(a), RuntimeValue::Json(b))
+            if std::mem::discriminant(a) == std::mem::discriminant(b) =>
+        {
+            match op {
+                TqlCompOp::Eq => compare_json(a, b).is_eq(),
+                TqlCompOp::Ne => !compare_json(a, b).is_eq(),
+                _ => false,
+            }
+        }
         (RuntimeValue::Str(a), RuntimeValue::Str(b)) => cmp_ord(a, op, b),
         (RuntimeValue::Bool(a), RuntimeValue::Bool(b)) => match op {
             TqlCompOp::Eq => a == b,
             TqlCompOp::Ne => a != b,
             _ => false,
         },
-        (RuntimeValue::Null, _) | (_, RuntimeValue::Null) => false,
-        _ => matches!(op, TqlCompOp::Ne),
+        _ => false,
     }
 }
 

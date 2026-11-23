@@ -175,7 +175,7 @@ pub(crate) fn search_bounded<T: VectorType>(
                 .saturating_mul(16)
                 .saturating_add(index.len().min(ef_search).saturating_mul(512))
         });
-    let _reservation = mt.resource_runtime().reserve_workspace(
+    let _reservation = mt.reserve_instance_workspace(
         query_bytes
             .saturating_add(k.saturating_mul(64))
             .saturating_add(nav_bytes),

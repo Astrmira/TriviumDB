@@ -119,6 +119,14 @@ fn verified_property_matches<T: VectorType>(
     Ok(ids)
 }
 
+fn edge_clone_bytes(edges: &[crate::node::Edge]) -> usize {
+    edges
+        .iter()
+        .fold(std::mem::size_of_val(edges), |total, edge| {
+            total.saturating_add(edge.clone_heap_bytes())
+        })
+}
+
 fn normalized_database_path(path: &str) -> Result<PathBuf> {
     let requested = Path::new(path);
     if requested.try_exists()? {
@@ -2138,10 +2146,14 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         label: &str,
     ) -> Result<Option<crate::node::Edge>> {
         self.read_operation(|| {
-            read_or_recover(&self.memtable)
-                .get_edge(src, dst, label)
-                .cloned()
-        })
+            let mt = read_or_recover(&self.memtable);
+            let Some(edge) = mt.get_edge(src, dst, label) else {
+                return Ok(None);
+            };
+            let _workspace =
+                mt.reserve_instance_workspace(edge_clone_bytes(std::slice::from_ref(edge)))?;
+            Ok(Some(edge.clone()))
+        })?
     }
 
     pub fn shortest_path(
@@ -2717,8 +2729,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
             lock_or_recover(&self.wal).ensure_writable()?;
             write.phase = WritePhase::Validation;
             let mut mt = write_or_recover(&self.memtable);
-            mt.prepare_text_index()?;
-            mt.try_build_text_index()
+            mt.build_text_index()
         })
     }
 
@@ -2739,6 +2750,10 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
     pub fn get_payload(&self, id: NodeId) -> Result<Option<serde_json::Value>> {
         self.read_operation(|| {
             let mt = read_or_recover(&self.memtable);
+            if !mt.contains(id) {
+                return Ok(None);
+            }
+            let _workspace = mt.reserve_instance_workspace(mt.payload_query_peak(id)?)?;
             mt.try_get_payload(id)
                 .map(|payload| payload.map(|payload| (*payload).clone()))
         })?
@@ -2747,8 +2762,13 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
     pub fn get_edges(&self, id: NodeId) -> Result<Vec<crate::node::Edge>> {
         self.read_operation(|| {
             let mt = read_or_recover(&self.memtable);
-            mt.get_edges(id).map(|e| e.to_vec()).unwrap_or_default()
-        })
+            let edges = mt.get_edges(id).unwrap_or_default();
+            if edges.is_empty() {
+                return Ok(Vec::new());
+            }
+            let _workspace = mt.reserve_instance_workspace(edge_clone_bytes(edges))?;
+            Ok(edges.to_vec())
+        })?
     }
 
     /// 在同一读视图中按来源、目标、标签分页，仅为返回页复制边元数据。
@@ -2789,10 +2809,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                     let bytes = workspace
                         .bytes()
                         .saturating_add(std::mem::size_of::<SubgraphEdge>() * 4)
-                        .saturating_add(edge.label.len())
-                        .saturating_add(crate::storage::payload_store::query_clone_peak(
-                            &edge.metadata,
-                        ));
+                        .saturating_add(edge.clone_heap_bytes());
                     mt.resize_instance_workspace(&mut workspace, bytes)?;
                     page.push(SubgraphEdge {
                         source_id: source,
@@ -2831,7 +2848,24 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         id: NodeId,
         label: Option<&str>,
     ) -> Result<Vec<crate::node::IncomingEdge>> {
-        self.read_operation(|| read_or_recover(&self.memtable).get_incoming_edges(id, label))
+        self.read_operation(|| {
+            let mt = read_or_recover(&self.memtable);
+            let bytes = mt
+                .incoming_edge_refs(id, label)
+                .try_fold(0usize, |total, (_, edge)| {
+                    crate::request::check_current()?;
+                    Ok::<_, TriviumError>(
+                        total
+                            .saturating_add(std::mem::size_of::<crate::node::IncomingEdge>() * 2)
+                            .saturating_add(edge.clone_heap_bytes()),
+                    )
+                })?;
+            if bytes == 0 {
+                return Ok(Vec::new());
+            }
+            let _workspace = mt.reserve_instance_workspace(bytes)?;
+            Ok(mt.get_incoming_edges(id, label))
+        })?
     }
 
     pub fn get_all_ids(&self) -> Result<Vec<NodeId>> {
@@ -3115,6 +3149,15 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
     pub fn get(&self, id: NodeId) -> Result<Option<crate::node::NodeView<T>>> {
         self.read_operation(|| {
             let mt = read_or_recover(&self.memtable);
+            if !mt.contains(id) {
+                return Ok(None);
+            }
+            let edges = mt.get_edges(id).unwrap_or_default();
+            let bytes = mt
+                .payload_query_peak(id)?
+                .saturating_add(mt.dim().saturating_mul(std::mem::size_of::<T>()))
+                .saturating_add(edge_clone_bytes(edges));
+            let _workspace = mt.reserve_instance_workspace(bytes)?;
             let Some(payload) = mt.try_get_payload(id)? else {
                 return Ok(None);
             };
@@ -3124,7 +3167,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                     TriviumError::CorruptedFile("节点缺少向量 (Node vector is missing)".into())
                 })?
                 .to_vec();
-            let edges = mt.get_edges(id).unwrap_or(&[]).to_vec();
+            let edges = edges.to_vec();
             Ok(Some(crate::node::NodeView {
                 id,
                 vector,

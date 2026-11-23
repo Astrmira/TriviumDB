@@ -30,6 +30,7 @@ const MAX_NGRAMS_PER_VALUE: usize = 4096;
 
 pub(crate) fn validate_index_fields(fields: &[String], composite: bool) -> Result<()> {
     if fields.is_empty()
+        || (!composite && fields.len() != 1)
         || fields
             .iter()
             .any(|field| field.is_empty() || field.len() > MAX_FIELD_BYTES)
@@ -2059,7 +2060,15 @@ pub fn save_sidecar(
     bytes.extend_from_slice(&main_size.to_le_bytes());
     bytes.extend_from_slice(&main_crc.to_le_bytes());
     bytes.extend_from_slice(&(node_count as u64).to_le_bytes());
-    bytes.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(
+        &u32::try_from(fields.len())
+            .map_err(|_| {
+                TriviumError::InvalidInput(
+                    "属性索引定义过多 (Too many property index definitions)".into(),
+                )
+            })?
+            .to_le_bytes(),
+    );
     bytes.extend_from_slice(&0u32.to_le_bytes());
 
     bytes.extend_from_slice(&payload_fingerprint.0.to_le_bytes());
@@ -2219,7 +2228,8 @@ fn load_part(
             "属性索引与主数据库 generation 不匹配 (Property index does not match the main database generation)".into(),
         ));
     }
-    if field_count > expected_node_count.saturating_add(1024) {
+    // 每条定义至少包含类型、标志、字段长度和条目数；空库也能保留索引定义。
+    if field_count > payload_end.saturating_sub(offset) / (1 + 1 + 4 + 8) {
         return Err(TriviumError::CorruptedFile(
             "属性索引字段数量不合理 (Unreasonable property index field count)".into(),
         ));
