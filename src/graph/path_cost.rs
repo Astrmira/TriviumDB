@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
-pub(super) enum PathCost {
+pub(crate) enum PathCost {
     Float(f64),
     // 每个字按 2^-1074 为单位存储，对齐到 64 位；跳过值为零的字。
     Words(BTreeMap<usize, u64>),
@@ -58,7 +58,7 @@ impl PathCost {
         }
     }
 
-    pub(super) fn compare(&self, other: &Self) -> Ordering {
+    pub(crate) fn compare(&self, other: &Self) -> Ordering {
         match (self, other) {
             (Self::Float(a), Self::Float(b)) => a.total_cmp(b),
             (Self::Words(a), Self::Words(b)) => a.iter().rev().cmp(b.iter().rev()),
@@ -67,7 +67,7 @@ impl PathCost {
         }
     }
 
-    pub(super) fn finite_value(&self) -> crate::Result<f64> {
+    pub(crate) fn finite_value(&self) -> crate::Result<f64> {
         let cost = self.value();
         if cost.is_finite() {
             Ok(cost)

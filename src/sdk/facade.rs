@@ -56,6 +56,14 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> DatabaseRea
         Database::open_read_only(path, dim).map(|inner| Self { inner })
     }
 
+    pub(crate) fn open_declared_generation(
+        path: &str,
+        dim: usize,
+        manifest: GenerationManifest,
+    ) -> Result<Self> {
+        Database::open_declared_generation(path, dim, manifest).map(|inner| Self { inner })
+    }
+
     pub fn open_immutable(path: &str, dim: usize) -> Result<Self> {
         Database::open_immutable(path, dim).map(|inner| Self { inner })
     }
@@ -101,6 +109,20 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> DatabaseRea
     ) -> Result<Vec<Vec<SearchHit>>> {
         self.inner
             .search_batch(query_vectors, search_config, batch_config)
+    }
+
+    pub fn search_ids(&self, query_vector: &[T], config: &SearchConfig) -> Result<Vec<u64>> {
+        self.inner.search_ids(query_vector, config)
+    }
+
+    pub fn search_ids_batch(
+        &self,
+        query_vectors: &[Vec<T>],
+        search_config: &SearchConfig,
+        batch_config: &BatchSearchConfig,
+    ) -> Result<Vec<Vec<u64>>> {
+        self.inner
+            .search_ids_batch(query_vectors, search_config, batch_config)
     }
 
     pub fn search_exact(&self, query_vector: &[T], top_k: usize) -> Result<Vec<SearchHit>> {

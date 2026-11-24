@@ -221,12 +221,12 @@ impl PayloadStore {
 
     #[cfg(test)]
     pub(crate) fn open_sidecar(path: &Path) -> Result<(u64, Mmap, MappedPayloadRecords)> {
-        Self::open_sidecar_limited(path, |_| Ok(()))
+        Self::open_sidecar_limited(path, |_, _| Ok(()))
     }
 
     pub(crate) fn open_sidecar_limited(
         path: &Path,
-        admit: impl Fn(usize) -> Result<()>,
+        admit: impl Fn(usize, Option<&[u8]>) -> Result<()>,
     ) -> Result<(u64, Mmap, MappedPayloadRecords)> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file) }?;
@@ -272,7 +272,8 @@ impl PayloadStore {
         {
             return Err(TriviumError::CorruptedFile("Payload 文件布局无效".into()));
         }
-        admit(count.saturating_mul(std::mem::size_of::<(NodeId, Range<usize>)>()))?;
+        let directory_bytes = count.saturating_mul(std::mem::size_of::<(NodeId, Range<usize>)>());
+        admit(directory_bytes, None)?;
         let mut records = Vec::new();
         records.try_reserve_exact(count).map_err(|error| {
             TriviumError::CapacityAllocationFailed {
@@ -311,11 +312,7 @@ impl PayloadStore {
                     "Payload 记录 CRC 不匹配: node_id={id}"
                 )));
             }
-            admit(
-                count
-                    .saturating_mul(24)
-                    .saturating_add(raw.len().saturating_mul(64)),
-            )?;
+            admit(directory_bytes, Some(raw))?;
             validate_json(raw)?;
             records.push((id, offset..end));
             previous_id = id;
@@ -465,7 +462,7 @@ impl PayloadStore {
         crate::request::record_payload_lookup()?;
         let raw = self.raw(id);
         if let Some(raw) = raw {
-            crate::request::record_payload_parse(raw.len() as u64)?;
+            crate::request::charge_payload_bytes(raw.len() as u64)?;
         }
         {
             let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
@@ -477,9 +474,8 @@ impl PayloadStore {
             }
             cache.misses = cache.misses.saturating_add(1);
         }
-        let Some(raw) = raw else {
-            return Ok(None);
-        };
+        let Some(raw) = raw else { return Ok(None) };
+        crate::request::record_payload_parse(raw.len() as u64);
         let value = Arc::new(serde_json::from_slice(raw).map_err(|error| {
             TriviumError::CorruptedFile(format!(
                 "Payload JSON 解码失败 (Payload JSON decoding failed): id={id}, {error}"
@@ -496,10 +492,6 @@ impl PayloadStore {
     pub fn iter(&self) -> impl Iterator<Item = (NodeId, Arc<serde_json::Value>)> + '_ {
         self.ids()
             .filter_map(|id| self.get_value(id).map(|value| (id, value)))
-    }
-
-    pub fn values(&self) -> impl Iterator<Item = Arc<serde_json::Value>> + '_ {
-        self.ids().filter_map(|id| self.get_value(id))
     }
 
     pub(crate) fn heap_memory_bytes(&self) -> usize {

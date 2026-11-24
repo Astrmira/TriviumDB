@@ -7,3 +7,6 @@ mod unsafe_audit;
 
 #[path = "../support/cleanup.rs"]
 mod cleanup_files;
+
+#[path = "../support/wal_frames.rs"]
+mod wal_frames;

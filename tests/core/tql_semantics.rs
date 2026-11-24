@@ -24,6 +24,38 @@ fn 有限BM25参数保留精确排名与可表示分数() {
     db.close().unwrap();
 }
 
+#[test]
+fn 具名边标量按实际引用读取端点属性并校验空页排名() {
+    let root = TestDir::new("edge-scalar-read");
+    let mut db =
+        Database::<f32>::open_with_config(&root.file("graph.tdb"), config(StorageMode::Mmap))
+            .unwrap();
+    for id in [1, 2] {
+        db.insert_with_id(id, &[1.], json!({"x":id, "body":"x".repeat(64 * 1024)}))
+            .unwrap();
+    }
+    db.link(1, 2, "rel", 1.).unwrap();
+    let before = db.payload_memory_stats().payload_lookups;
+    let rows = db
+        .tql("MATCH (a)-[e]->(b) RETURN COUNT(a.id) AS nodes, COUNT(e.label) AS labels")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(scalar(&rows[0]["nodes"]), json!(1));
+    assert_eq!(scalar(&rows[0]["labels"]), json!(1));
+    assert_eq!(db.payload_memory_stats().payload_lookups, before);
+    let rows = db
+        .tql("MATCH (a)-[e]->(b) RETURN SUM(b.x) AS total")
+        .unwrap();
+    assert_eq!(scalar(&rows[0]["total"]), json!(2));
+    assert_eq!(db.payload_memory_stats().payload_lookups - before, 1);
+    for page in ["", " LIMIT 0", " LIMIT 1"] {
+        let sql = format!("MATCH (a)-[e]->(b) RANK b BY VECTOR [1,0] TOP 1 RETURN e.label{page}");
+        let error = db.tql(&sql).unwrap_err();
+        assert_eq!(error.code(), "TDB_DIMENSION_MISMATCH", "{sql}");
+    }
+    db.close().unwrap();
+}
+
 fn config(mode: StorageMode) -> Config {
     Config {
         dim: 1,

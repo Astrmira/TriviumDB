@@ -141,6 +141,11 @@ pub(crate) fn write_manifest_with_write_info(
     write: &mut crate::error::WriteErrorInfo,
 ) -> Result<GenerationManifest> {
     validate_generation_id(generation_id)?;
+    #[cfg(feature = "test-hooks")]
+    crate::test_hooks::hit_for_path(
+        crate::test_hooks::ConcurrencyPoint::GenerationManifestHashing,
+        db_path,
+    );
     let files = generation_suffixes(db_path)
         .into_iter()
         .map(|suffix| checksum_file(Path::new(&format!("{db_path}{suffix}")), suffix))
@@ -187,7 +192,20 @@ pub fn validate_manifest(
     expected_dtype: &str,
     expected_dim: usize,
 ) -> Result<GenerationManifest> {
-    let manifest = read_manifest(db_path)?;
+    validate_declared_manifest(
+        db_path,
+        expected_dtype,
+        expected_dim,
+        read_manifest(db_path)?,
+    )
+}
+
+pub(crate) fn validate_declared_manifest(
+    db_path: &str,
+    expected_dtype: &str,
+    expected_dim: usize,
+    manifest: GenerationManifest,
+) -> Result<GenerationManifest> {
     if manifest.dtype != expected_dtype || manifest.dim != expected_dim {
         return Err(TriviumError::ImmutableArtifactInvalid {
             reason: "清单 dtype 或维度不匹配 (Manifest dtype or dimension mismatch)".into(),
@@ -280,6 +298,16 @@ pub fn validate_manifest_for_generation(
     db_path: &str,
     expected_generation_id: &str,
 ) -> Result<GenerationManifest> {
+    validate_manifest_files(
+        db_path,
+        read_generation_manifest(db_path, expected_generation_id)?,
+    )
+}
+
+pub(crate) fn read_generation_manifest(
+    db_path: &str,
+    expected_generation_id: &str,
+) -> Result<GenerationManifest> {
     let declared = read_manifest(db_path)?;
     if declared.generation_id != expected_generation_id {
         return Err(TriviumError::ImmutableArtifactInvalid {
@@ -289,7 +317,7 @@ pub fn validate_manifest_for_generation(
             ),
         });
     }
-    validate_manifest_files(db_path, declared)
+    Ok(declared)
 }
 
 pub(crate) fn read_bounded_metadata(path: &Path) -> std::io::Result<Vec<u8>> {

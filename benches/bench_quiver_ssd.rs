@@ -1,4 +1,7 @@
 //! 生产INT8路径的缓存容量、I/O、召回及资源测量。计时用于报告，结果等价按完整命中核对。
+#[path = "support/recall.rs"]
+mod recall;
+
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::io::Read;
@@ -218,12 +221,10 @@ fn main() {
                     } else {
                         reference = Some(answers.clone());
                     }
-                    let mut matched = 0;
+                    let recall = recall::at_k(&answers, &truth, 10, 1..=nodes as u64, |hit| *hit);
                     let mut hash = 0;
-                    for (hits, truth) in answers.iter().zip(&truth) {
-                        assert_eq!(hits.len(), 10);
+                    for hits in &answers {
                         for &(id, score) in hits {
-                            matched += usize::from(truth.contains(&id));
                             hash = support::mix_hash(
                                 support::mix_hash(hash, id),
                                 u64::from(score.to_bits()),
@@ -235,7 +236,7 @@ fn main() {
                         "round":round,"variant":variant,"ef":ef,"source":source,"artifact_sha256":artifact_hash,"open_ms":open_ms,"configure_ms":configure_ms,
                         "qps":query_count as f64 / elapsed,"p50_ms":support::percentile_sorted(&latencies,50),
                         "p95_ms":support::percentile_sorted(&latencies,95),"p99_ms":support::percentile_sorted(&latencies,99),
-                        "recall_at_10":matched as f64 / (query_count * 10) as f64,"result_hash":hash,
+                        "recall_at_10":recall,"result_hash":hash,
                         "before":before,"after":after,"runtime":runtime.stats(),
                         "process_memory":triviumdb::observability::process_memory_snapshot()}));
                     reader.close();

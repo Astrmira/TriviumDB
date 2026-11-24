@@ -6,8 +6,9 @@ import triviumdb
 
 
 def check(actual, expected):
+    assert type(actual) is type(expected), (actual, expected)
     if isinstance(expected, float):
-        assert isinstance(actual, (int, float)) and abs(actual - expected) < 1e-6, (actual, expected)
+        assert abs(actual - expected) < 1e-6, (actual, expected)
     elif isinstance(expected, list):
         assert len(actual) == len(expected), (actual, expected)
         for value, reference in zip(actual, expected):
@@ -20,20 +21,22 @@ def check(actual, expected):
         assert actual == expected, (actual, expected)
 
 
+def check_rows(result, expected):
+    assert isinstance(result, list)
+    converted = []
+    for reference in expected:
+        row = reference.copy()
+        for key in ("id", "a", "b"):
+            if row.get(key) is not None:
+                row[key] = int(row[key])
+        if "path" in row:
+            row["path"] = [int(node) for node in row["path"]]
+        converted.append(row)
+    check([item.row for item in result], converted)
+
+
 def run_tql_documents_graphs(root: str) -> None:
     fixture = json.loads((Path(__file__).parents[1] / "contracts/tql_documents_graphs_cases.json").read_text(encoding="utf-8"))
-
-    def rows(result):
-        converted = []
-        for result_row in result:
-            row = dict(result_row.row)
-            for key in ("id", "a", "b"):
-                if key in row and row[key] is not None:
-                    row[key] = str(row[key])
-            if "path" in row:
-                row["path"] = [str(node) for node in row["path"]]
-            converted.append(row)
-        return converted
 
     for dtype in ("f32", "f16", "u64"):
         path = str(Path(root) / f"tql-documents-graphs-{dtype}.tdb")
@@ -50,12 +53,12 @@ def run_tql_documents_graphs(root: str) -> None:
             db.graph_request(json.dumps({"operation": "put", "graph": graph}))
         for case in fixture["cases"]:
             if dtype in case["dtypes"]:
-                check(rows(db.tql(case["query"])), case["expected"])
+                check_rows(db.tql(case["query"]), case["expected"])
         edge = db.tql("GRAPH {graph_ids:['words']} MATCH (a)-[e:rel]->(b) RETURN e")[0].row["e"]
         assert edge == {"type": "edge", "source": 11, "target": 21, "label": "rel", "weight": 2.0, "metadata": {"owner": "words"}, "graph_id": "words"}
         prepared = db.prepare_tql("GRAPH {graph_ids:[$graph]} DOCUMENTS {operation:'search',query:{text:$text}} WITH _ AS seed,document AS evidence EXPAND seed [:rel*1..1] AS related RETURN related.id AS id,evidence.document_id AS doc")
         assert prepared.parameter_names() == ["graph", "text"]
-        check(rows(db.execute_prepared_tql(prepared, {"graph": "words", "text": "alpha"})), [{"id": "21", "doc": "10"}])
+        check_rows(db.execute_prepared_tql(prepared, {"graph": "words", "text": "alpha"}), [{"id": "21", "doc": "10"}])
         try:
             db.tql("GRAPH {graph_ids:['missing']} MATCH (n) RETURN n")
         except triviumdb.TriviumDBError as error:
@@ -69,8 +72,8 @@ def run_tql_documents_graphs(root: str) -> None:
             for residency in ("ssd", "hot"):
                 db.quiver_request(json.dumps({"operation": "configure", "options": {"encoding": "centered_int4", "query_precision": "fp32", "residency": residency, "cache_bytes": 8192, "io_depth": 1, "use_for_ann": False}}))
                 case = fixture["cases"][0]
-                check(rows(db.tql(case["query"].replace("strategy:'exact'", "strategy:'ann',rerank:'compressed'"))), case["expected"])
+                check_rows(db.tql(case["query"].replace("strategy:'exact'", "strategy:'ann',rerank:'compressed'")), case["expected"])
         db.close()
         db = triviumdb.TriviumDB(path, dim=2, dtype=dtype, auto_build_quiver=False, access_mode="read_only")
-        check(rows(db.tql(fixture["cases"][2]["query"])), fixture["cases"][2]["expected"])
+        check_rows(db.tql(fixture["cases"][2]["query"]), fixture["cases"][2]["expected"])
         db.close()

@@ -81,6 +81,16 @@ def run_quiver_ssd(root: str) -> None:
                     assert configured["residency"] == residency
                     assert configured["routing_shared"] is True
                     assert request(search) == {"hits": fixture["expected_hits"]}
+        options = dict(fixture["options"], encoding="centered_int8", query_precision="fp32",
+                       cache_bytes=0, use_for_ann=True)
+        expected_ids = [int(hit["id"]) for hit in fixture["expected_hits"]]
+        for residency in ("ssd", "hot"):
+            request({"operation": "configure", "options": dict(options, residency=residency)})
+            before = request({"operation": "stats"})["cold_read_calls"]
+            ids = db.search_ids(vector(1), top_k=4, recall_k=4, ann_rerank_limit=4, min_score=-1.0)
+            after = request({"operation": "stats"})["cold_read_calls"]
+            assert ids == expected_ids
+            assert after - before == (len(expected_ids) if residency == "ssd" else 0)
         request({"operation": "configure", "options": fixture["options"]})
         try:
             request({"operation": "configure", "options": {"query_precision": "fp16"}})

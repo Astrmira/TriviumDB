@@ -6,8 +6,10 @@
 //! 用法:
 //!   cargo bench --bench bench_recall_at_k
 
+#[path = "support/recall.rs"]
+mod recall;
+
 use rayon::prelude::*;
-use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
 use std::time::Instant;
@@ -108,7 +110,7 @@ fn main() {
     let ef_values = [8, 16, 32, 64, 128, 256, 512, 768, 1024, 1536, 2048];
 
     // 预构建每个 K 的 GT 集合
-    let gt_sets: Vec<Vec<HashSet<u64>>> = k_values
+    let gt_sets: Vec<Vec<Vec<u64>>> = k_values
         .iter()
         .map(|&k| {
             (0..n_test)
@@ -116,7 +118,7 @@ fn main() {
                     gt_data[i * k_gt..i * k_gt + k]
                         .iter()
                         .map(|&id| id as u64)
-                        .collect::<HashSet<u64>>()
+                        .collect()
                 })
                 .collect()
         })
@@ -144,19 +146,18 @@ fn main() {
             };
 
             let t_search = Instant::now();
-            let hits: usize = (0..n_test)
+            let answers: Vec<_> = (0..n_test)
                 .into_par_iter()
                 .map(|i| {
                     let q = &test_data[i * dim..(i + 1) * dim];
-                    let res = index.search_flat(q, &train_data, &search_cfg);
-                    let gt_set = &gt_sets[ki][i];
-                    res.iter().filter(|&&(id, _)| gt_set.contains(&id)).count()
+                    index.search_flat(q, &train_data, &search_cfg)
                 })
-                .sum();
-
+                .collect();
             let elapsed = t_search.elapsed().as_secs_f64();
             let qps = n_test as f64 / elapsed;
-            let recall = hits as f64 / (n_test * k) as f64;
+            let recall = recall::at_k(&answers, &gt_sets[ki], k, 0..=n_train as u64 - 1, |hit| {
+                *hit
+            });
 
             print!("  {:>9.2}%  {:>10.0}", recall * 100.0, qps);
         }

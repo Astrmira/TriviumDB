@@ -352,15 +352,7 @@ fn roundtrip<T: VectorType + Serialize + DeserializeOwned>() {
         db.close().unwrap();
     }
 }
-fn files(path: &std::path::Path) -> std::collections::BTreeMap<std::ffi::OsString, Vec<u8>> {
-    std::fs::read_dir(path)
-        .unwrap()
-        .map(|entry| {
-            let entry = entry.unwrap();
-            (entry.file_name(), std::fs::read(entry.path()).unwrap())
-        })
-        .collect()
-}
+use crate::physical_files::files;
 
 #[test]
 fn 三种dtype及两种存储模式的文档向量与RRF符合独立样例() {

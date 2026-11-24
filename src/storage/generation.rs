@@ -18,6 +18,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const CURRENT_VERSION: u16 = 1;
 static CURRENT_NONCE: AtomicU64 = AtomicU64::new(1);
 
+fn lease_error(id: &str, error: std::io::Error) -> TriviumError {
+    if error.kind() == std::io::ErrorKind::WouldBlock
+        || error
+            .raw_os_error()
+            .is_some_and(|code| Some(code) == fs2::lock_contended_error().raw_os_error())
+    {
+        TriviumError::GenerationBusy {
+            generation_id: id.to_owned(),
+        }
+    } else {
+        TriviumError::Io(error)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CurrentGeneration {
     pub format_version: u16,
@@ -233,23 +247,22 @@ impl GenerationStore {
             .read(true)
             .write(true)
             .open(&lease_path)?;
-        lease
-            .try_lock_shared()
-            .map_err(|_| TriviumError::GenerationBusy {
-                generation_id: current.generation_id.clone(),
-            })?;
+        FileExt::try_lock_shared(&lease)
+            .map_err(|error| lease_error(&current.generation_id, error))?;
         let path = directory.join(&current.database_file);
-        let manifest = crate::storage::snapshot::validate_manifest_for_generation(
+        let manifest = crate::storage::snapshot::read_generation_manifest(
             &path.to_string_lossy(),
             &current.generation_id,
         )?;
-        let reader = DatabaseReader::open_immutable(&path.to_string_lossy(), dim)?;
+        let expected_count = manifest.node_count;
+        let reader =
+            DatabaseReader::open_declared_generation(&path.to_string_lossy(), dim, manifest)?;
         let node_count = reader.node_count()?;
-        if node_count != manifest.node_count {
+        if node_count != expected_count {
             return Err(TriviumError::ImmutableArtifactInvalid {
                 reason: format!(
                     "manifest node_count {} 与数据库 {} 不一致",
-                    manifest.node_count, node_count
+                    expected_count, node_count
                 ),
             });
         }
@@ -301,11 +314,7 @@ impl GenerationStore {
             .read(true)
             .write(true)
             .open(&lease_path)?;
-        lease
-            .try_lock_exclusive()
-            .map_err(|_| TriviumError::GenerationBusy {
-                generation_id: generation_id.to_string(),
-            })?;
+        FileExt::try_lock_exclusive(&lease).map_err(|error| lease_error(generation_id, error))?;
         validate_generation_database(
             &current_directory.join(&current.database_file),
             &current.generation_id,
@@ -503,22 +512,26 @@ fn validate_generation_database(path: &Path, generation_id: &str) -> Result<()> 
             "代际数据库路径须为 UTF-8 (Generation database path must be UTF-8)".into(),
         )
     })?;
-    let manifest = crate::storage::snapshot::validate_manifest_for_generation(path, generation_id)?;
+    let manifest = crate::storage::snapshot::read_generation_manifest(path, generation_id)?;
+    let expected_count = manifest.node_count;
     let count = match manifest.dtype.as_str() {
-        "f32" => DatabaseReader::<f32>::open_immutable(path, manifest.dim)?.node_count(),
+        "f32" => DatabaseReader::<f32>::open_declared_generation(path, manifest.dim, manifest)?
+            .node_count(),
         "half::binary16::f16" => {
-            DatabaseReader::<half::f16>::open_immutable(path, manifest.dim)?.node_count()
+            DatabaseReader::<half::f16>::open_declared_generation(path, manifest.dim, manifest)?
+                .node_count()
         }
-        "u64" => DatabaseReader::<u64>::open_immutable(path, manifest.dim)?.node_count(),
+        "u64" => DatabaseReader::<u64>::open_declared_generation(path, manifest.dim, manifest)?
+            .node_count(),
         dtype => Err(TriviumError::ImmutableArtifactInvalid {
             reason: format!("代际类型不受支持 (Unsupported generation dtype): {dtype}"),
         }),
     }?;
-    if count != manifest.node_count {
+    if count != expected_count {
         return Err(TriviumError::ImmutableArtifactInvalid {
             reason: format!(
                 "代际节点数与清单不匹配 (Generation node count does not match manifest): {count} != {}",
-                manifest.node_count
+                expected_count
             ),
         });
     }
@@ -633,4 +646,18 @@ fn validate_generation_name(value: &str) -> Result<()> {
         .at_field("generation_id"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod lease_errors {
+    use super::*;
+    #[test]
+    fn 租约竞争与底层权限错误分别报告() {
+        assert!(
+            matches!(lease_error("g",fs2::lock_contended_error()),TriviumError::GenerationBusy{generation_id} if generation_id=="g")
+        );
+        assert!(
+            matches!(lease_error("g",std::io::Error::from(std::io::ErrorKind::PermissionDenied)),TriviumError::Io(e) if e.kind()==std::io::ErrorKind::PermissionDenied)
+        );
+    }
 }

@@ -146,6 +146,46 @@ fn 内置五种解析保留完整正文与独立预期来源范围() {
     }
 }
 
+#[test]
+fn 同一修订的多个命中保留原文的字节与行列() {
+    let dir = TestDir::new("source-coordinates");
+    let mut db = Database::<f32>::open(&dir.file("db.tdb"), 2).unwrap();
+    let parsed = parse(&mut db, "note.txt", "甲\r\nalpha\r\n🐾 alpha");
+    request(
+        &mut db,
+        json!({"operation":"put_parsed","document":{"parsed":parsed,"root":{"id":"10","vector":[1,0],"payload":{}}}}),
+    );
+    let query: DocumentSearchQuery =
+        serde_json::from_value(json!({"text":"alpha","level":"document","include_matches":true}))
+            .unwrap();
+    let result = db.search_documents(&query).unwrap();
+    assert_eq!(result.groups.len(), 1);
+    assert_eq!(result.groups[0].hits.len(), 1);
+    let positions: Vec<_> = result.groups[0].hits[0]
+        .matches
+        .iter()
+        .map(|hit| {
+            let spans = &hit.evidence.source_spans;
+            assert_eq!(spans.len(), 1);
+            let s = &spans[0];
+            (
+                s.text.as_str(),
+                s.source_start,
+                s.source_end,
+                s.line,
+                s.column,
+                s.end_line,
+                s.end_column,
+            )
+        })
+        .collect();
+    assert_eq!(
+        positions,
+        [("alpha", 5, 10, 2, 1, 2, 6), ("alpha", 17, 22, 3, 3, 3, 8)]
+    );
+    db.close().unwrap();
+}
+
 fn begin(id: &str, document_id: &str, content: &str, expected: Value) -> Value {
     use sha2::{Digest, Sha256};
     json!({"operation":"begin_upload","upload":{"upload_id":id,"source_id":"note.txt","source_revision":"file-2","parser_id":"external-v1","content_hash":format!("sha256:{:x}",Sha256::digest(content.as_bytes())),"root":{"id":document_id,"vector":[1,0],"payload":{"title":"published"}},"expected_revision":expected}})
@@ -1097,7 +1137,12 @@ fn 有限共享工作区可展开单个归档的短证据() {
     let dir = TestDir::new("archived-context-quota");
     let path = dir.file("data.tdb");
     let cfg = config(StorageMode::Mmap);
-    let mut db = Database::<f32>::open_with_config(&path, cfg).unwrap();
+    let mut db = Database::<f32>::open_with_runtime(
+        &path,
+        cfg,
+        triviumdb::ResourceRuntime::new(Default::default()).unwrap(),
+    )
+    .unwrap();
     let parsed = parse(
         &mut db,
         "archive.txt",
@@ -1108,6 +1153,18 @@ fn 有限共享工作区可展开单个归档的短证据() {
         json!({"operation":"put_parsed","document":{
             "parsed":parsed,"root":{"id":"10","vector":[1,0],"payload":{}}
         }}),
+    );
+    db.set_memory_limit(db.estimated_memory() + 16 * 1024)
+        .unwrap();
+    assert_eq!(
+        db.get_document(10).unwrap_err().code(),
+        "TDB_CAPACITY_RESERVATION_REJECTED"
+    );
+    assert_eq!(db.resource_stats().reserved_workspace_bytes, 0);
+    db.set_memory_limit(0).unwrap();
+    assert_eq!(
+        db.get_document(10).unwrap().unwrap().content,
+        format!("alpha{}", "x".repeat(64 * 1024))
     );
     db.close().unwrap();
     // 为库保留 16 MiB，维护保留 1 MiB，读请求独享其余 1.5 MiB。

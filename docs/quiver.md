@@ -1,6 +1,6 @@
 # QuIVer 向量索引
 
-> 本文介绍 `0.9.4-beta.1` 的 QuIVer 图导航、原始向量精排、可选压缩重排、冷热驻留、构建维护与资源计量。版本记录见[变更说明](changes/0.9.4-beta.1.md)，冻结研究资料见 [ICDE 复现归档](../evaluation/README.md)。
+> 本文介绍 `0.9.4-beta.2` 的 QuIVer 图导航、原始向量精排、可选压缩重排、冷热驻留、构建维护与资源计量。版本记录见[变更说明](changes/0.9.4-beta.2.md)，冻结研究资料见 [ICDE 复现归档](../evaluation/README.md)。
 
 ---
 
@@ -66,6 +66,14 @@ QuIVer ANN 面向主流 embedding 模型输出的真实语义向量，覆盖文�
 概念上，每维重建值为 `符号 × (弱幅值 + 强位 × 幅值差)`；SM-L2 比较重建向量之间的平方距离。最终结果由原始向量余弦精排产生，召回率随近似候选的覆盖范围变化。
 
 底层 `QuIVerSearchConfig` 的有效候选宽度至少覆盖 `top_k`，并受节点数限制。未显式指定 `rerank_limit` 时默认预算为 64，实际预算按 `min(有效候选宽度, max(top_k, 指定预算或64))` 计算。上层管线显式传入的预算继续生效；过滤拒绝和墓碑不占成功精排名额。低 `ef` 会收紧有效精排预算，普通默认查询继续使用 SM-L2。
+
+Rust、Python 和 Node.js 的数据库检索入口采用相同的 ANN 预算。导航宽度至少覆盖 64、有效 `recall_k` 和实际候选需求，再按索引规模截断。`recall_k=0` 时按 `max(64, 8 × top_k)` 计算。关闭图扩散且不需要文本融合、高级重排或自定义 Hook 的纯向量查询只让 QuIVer 返回最终 Top-K，排名确定后读取返回条目的 Payload。只有向量召回且无需残差搜索或自定义 Hook 时，图扩散和高级重排向 QuIVer 请求外层种子池大小。`rerank_k` 控制这个外层候选池。需要单独指定导航宽度和精排预算时，压缩运行时的 `search_quiver` 及对应语言入口接收底层参数。
+
+通过 `SearchConfig::ann_rerank_limit`（Rust）、关键字参数 `ann_rerank_limit`（Python）或检索配置 `annRerankLimit`（Node.js）指定 QuIVer 精排候选数。例如 Python 的 `db.search_advanced(query, top_k=100, recall_k=4000, ann_rerank_limit=1000, expand_depth=0)` 使用 4,000 的导航宽度、1,000 的精排预算并返回最多 100 条。预算至少覆盖内层所需结果数，导航宽度至少覆盖有效预算，两者均受索引节点数限制。省略预算时采用 64 候选的默认规则。
+
+只消费 ID 时使用 Rust/Python 的 `search_ids` 和 `search_ids_batch`，或 Node.js 的 `searchIds` 和 `searchIdsBatch`。这些入口遵循相同的向量排序和过滤规则。纯向量查询省去结果 Payload 的读取和包装，属性过滤与 Hook 仍可读取各自所需的 Payload。批次按输入顺序返回每条查询的 ID 列表。Node.js 的 ID 保持现有安全整数约束。
+
+Python 的 `search`、`search_advanced` 和 `search_ids` 接受一维 `memoryview`。对本机字节序、C 连续且 dtype 与数据库匹配的向量，绑定通过独立的只读快照在释放 GIL 后执行检索，避免逐分量读取 Python 对象。`search_ids_batch` 接受相同格式的二维 `memoryview`。
 
 ---
 
@@ -134,6 +142,8 @@ Hot 驻留保存压缩记录与共享均值，评分按组解包。SSD 驻留使
 ```
 
 `use_for_ann=true` 接入普通混合检索中的 QuIVer 召回与 TQL QuIVer 向量来源。文档 ANN 和混合检索通过 `DocumentVectorOptions.rerank="compressed"` 独立选择压缩 Reader，复用已配置的编码、查询精度、Hot／SSD 与缓存预算。文档默认 `rerank="original"`，结果通过 `retrieval.compression` 返回实际压缩配置。详见[文档向量与混合召回](documents.md#文档向量与混合召回)。TQL 的压缩重排分数标记为 Approximate。原始向量精确扫描通过现有精确入口选择。默认配置为 codec 1、INT8 查询、SSD 驻留、零 Ready 缓存以及 `use_for_ann=false`。
+
+配置一次后，普通 Python ANN 可以直接传入查询向量。只取 ID 时使用 `db.search_ids(query_vector, top_k=10, recall_k=88, ann_rerank_limit=64)`，需要分数及 Payload 时使用 `db.search`。Node.js 对应 `db.searchIds(queryVector, { topK: 10, recallK: 88, annRerankLimit: 64 })`。这些入口使用当前压缩重排配置，查询向量无需逐条转成 JSON。需要逐请求 I/O 统计时使用下文的 `quiver_request` 或 `quiverRequest`。
 
 普通查询按实际使用的来源准备压缩索引。精确扫描、纯文本及图文档查询、仅输出计划的 `EXPLAIN` 直接使用各自的数据来源。向量写入后的压缩代际刷新由后续压缩 ANN 或显式维护操作触发。
 

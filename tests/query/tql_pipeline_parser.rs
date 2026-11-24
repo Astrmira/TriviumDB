@@ -28,7 +28,7 @@ fn cognitive_graph() -> MemTable<f32> {
     mt.index_text(3, "python scripting language");
     mt.index_keyword(1, "memory safety");
     mt.index_keyword(2, "vector search");
-    mt.build_text_index();
+    mt.build_text_index().unwrap();
     mt
 }
 

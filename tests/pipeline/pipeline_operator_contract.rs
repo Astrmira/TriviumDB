@@ -918,39 +918,53 @@ fn 管线阶段节点向量图与_payload_预算均提前拒绝() {
 }
 
 #[test]
-fn 命中解析缓存与冷读消耗相同的请求预算() {
-    let mut mt = MemTable::<f32>::new(DIM);
-    mt.configure_payload_cache(0, 0);
-    mt.insert_with_id(1, &[1., 0., 0., 0.], json!({"v":1}))
-        .unwrap();
-    mt.configure_payload_cache(4096, 4096);
+fn 缓存冷热共享逻辑字节预算而剖析仅计实际解码() {
     for hot in [false, true] {
+        let mut mt = MemTable::<f32>::new(DIM);
+        mt.configure_payload_cache(0, 0);
+        mt.insert_with_id(1, &[1., 0., 0., 0.], json!({"v":1}))
+            .unwrap();
+        mt.configure_payload_cache(4096, 4096);
         if hot {
             assert_eq!(*mt.get_payload(1).unwrap(), json!({"v":1}));
         }
-        let mut ctx = PipelineContext::new(
+        let ops: Vec<Box<dyn PipelineOperator<f32>>> = vec![
+            Box::new(NodeIdsSource { ids: vec![1] }),
+            Box::new(PayloadFilter {
+                filter: Filter::eq("v", json!(1)),
+            }),
+        ];
+        let mut ctx = PipelineContext::with_profile(
             &mt,
             PipelineBudget {
                 max_payload_parsed_bytes: 1,
                 ..budget()
             },
+            true,
         );
-        let filter = PayloadFilter {
-            filter: Filter::eq("v", json!(1)),
-        };
-        let error = execute_pipeline(
-            &mut ctx,
-            &[Box::new(NodeIdsSource { ids: vec![1] }), Box::new(filter)],
-        )
-        .unwrap_err();
         assert!(matches!(
-            error,
+            execute_pipeline(&mut ctx, &ops).unwrap_err(),
             triviumdb::TriviumError::PayloadQueryBudgetExceeded {
+                dimension: "parsed_bytes",
                 used: 7,
-                budget: 1,
-                ..
+                budget: 1
             }
         ));
+        let mut ctx = PipelineContext::with_profile(
+            &mt,
+            PipelineBudget {
+                max_payload_parsed_bytes: 7,
+                ..budget()
+            },
+            true,
+        );
+        let rows = execute_pipeline(&mut ctx, &ops).unwrap();
+        assert_eq!(rows.rows().iter().map(|r| r.id).collect::<Vec<_>>(), [1]);
+        let stage = ctx.metrics.last().unwrap();
+        assert_eq!(
+            (stage.payload_lookups, stage.payload_parsed_bytes),
+            (1, if hot { 0 } else { 7 })
+        );
     }
 }
 

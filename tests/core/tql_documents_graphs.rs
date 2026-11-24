@@ -480,6 +480,14 @@ fn 组合查询在文档图读取与导航处取消均归还额度且允许完�
     use triviumdb::test_hooks::{ConcurrencyPoint, pause_at_request};
     for (point, query) in [
         (
+            ConcurrencyPoint::TextPosting,
+            "TEXT BM25 'alpha' TOP 2 AS n WITH n RETURN n.id AS id ORDER BY id",
+        ),
+        (
+            ConcurrencyPoint::TextPosting,
+            "TEXT AC 'alpha' TOP 2 AS n WITH n RETURN n.id AS id ORDER BY id",
+        ),
+        (
             ConcurrencyPoint::NamedGraphRead,
             "GRAPH {graph_ids:['events']} MATCH (n) RETURN n.id AS id ORDER BY id",
         ),
@@ -497,9 +505,15 @@ fn 组合查询在文档图读取与导航处取消均归还额度且允许完�
         ),
     ] {
         let root = TestDir::new("tql-document-cancel");
-        let db = database::<f32>(&root.file("data.tdb"), "f32");
+        let mut db = database::<f32>(&root.file("data.tdb"), "f32");
+        if point == ConcurrencyPoint::TextPosting {
+            for id in [11, 21] {
+                db.index_text(id, "alpha").unwrap();
+                db.index_keyword(id, "alpha").unwrap();
+            }
+        }
         let expected = json_rows(db.tql(query).unwrap());
-        let baseline = db.resource_stats().reserved_workspace_bytes;
+        let workspace = super::workspace::Workspace::capture(&db);
         let context =
             triviumdb::sdk::RequestContext::new("tql-document-cancel", Default::default(), false)
                 .unwrap();
@@ -509,21 +523,72 @@ fn 组合查询在文档图读取与导航处取消均归还额度且允许完�
         let worker_context = context.clone();
         let worker = std::thread::spawn(move || worker_context.run(|| worker_db.tql(query)));
         gate.wait_until_arrived();
-        let held = db.resource_stats().reserved_workspace_bytes;
+        workspace.held(&db);
         context.cancel();
         drop(gate);
         assert_eq!(
             worker.join().unwrap().unwrap_err().code(),
             "TDB_QUERY_CANCELLED"
         );
-        assert!(
-            held > baseline,
-            "{point:?} 的持有额度 {held}，基线 {baseline}"
-        );
-        assert_eq!(db.resource_stats().reserved_workspace_bytes, baseline);
+        workspace.released(&db);
         assert_eq!(json_rows(db.tql(query).unwrap()), expected);
         let mut db = std::sync::Arc::into_inner(db).unwrap();
         db.close().unwrap();
         std::fs::rename(root.file("data.tdb"), root.file("moved.tdb")).unwrap();
     }
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn 图查询持有的实例额度会拒绝竞争读取并在取消后恢复() {
+    use triviumdb::test_hooks::{ConcurrencyPoint, pause_at_request};
+
+    let root = TestDir::new("graph-workspace-contention");
+    let mut db = database::<f32>(&root.file("data.tdb"), "f32");
+    let payload = json!("x".repeat(64 * 1024));
+    db.insert_with_id(1000, &[0., 1.], payload.clone()).unwrap();
+    let graph = NamedGraphScope {
+        graph_ids: vec!["words".into()],
+        ..Default::default()
+    };
+    let read_graph =
+        |db: &Database<f32>| db.named_graph_scope(&graph, &NamedGraphLimits::default());
+    assert_eq!(db.get(1000).unwrap().unwrap().payload, payload);
+
+    // 以公开准入诊断确定恰好允许这次读取的额度；正向对照验证同一配置确实可以读取。
+    db.set_memory_limit(db.estimated_memory() + 1).unwrap();
+    let err = db.get(1000).unwrap_err();
+    assert_eq!(err.code(), "TDB_CAPACITY_RESERVATION_REJECTED");
+    let details = err.details();
+    let limit =
+        details["current_bytes"].as_u64().unwrap() + details["estimated_bytes"].as_u64().unwrap();
+    db.set_memory_limit(usize::try_from(limit).unwrap())
+        .unwrap();
+    assert_eq!(db.get(1000).unwrap().unwrap().payload, payload);
+
+    assert_eq!(read_graph(&db).unwrap().members, [11, 21, 31]);
+    let workspace = super::workspace::Workspace::capture(&db);
+    let ctx = triviumdb::sdk::RequestContext::new("graph-budget-holder", Default::default(), false)
+        .unwrap();
+    let gate = pause_at_request(ConcurrencyPoint::NamedGraphRead, ctx.request_id());
+    std::thread::scope(|scope| {
+        let task = scope.spawn(|| ctx.run(|| read_graph(&db)));
+        gate.wait_until_arrived();
+        // 在释放屏障后断言结果，避免断言失败时阻塞工作线程。
+        let competing = db.get(1000);
+        ctx.cancel();
+        drop(gate);
+        assert_eq!(
+            task.join().unwrap().unwrap_err().code(),
+            "TDB_QUERY_CANCELLED"
+        );
+        assert_eq!(
+            competing.unwrap_err().code(),
+            "TDB_CAPACITY_RESERVATION_REJECTED"
+        );
+    });
+    workspace.released(&db);
+    assert_eq!(db.get(1000).unwrap().unwrap().payload, payload);
+    assert_eq!(read_graph(&db).unwrap().members, [11, 21, 31]);
+    workspace.released(&db);
 }

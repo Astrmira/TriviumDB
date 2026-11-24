@@ -21,6 +21,9 @@
 //!   # 跳过已完成的子实验，从 1c 开始
 //!   $env:TRIVIUM_SENSITIVITY_START="1c"
 
+#[path = "support/recall.rs"]
+mod recall;
+
 use rayon::prelude::*;
 use std::fs::File;
 use std::io::Read;
@@ -279,17 +282,20 @@ fn measure_single_thread(index: &QuIVer, eval: &SearchEval<'_>, ef: usize) -> (f
     };
 
     let t = Instant::now();
-    let mut hits = 0usize;
-    for i in 0..eval.n_test {
-        let q = &eval.test[i * eval.dim..(i + 1) * eval.dim];
-        let res = index.search_flat(q, eval.train, &cfg);
-        hits += res
-            .iter()
-            .filter(|&&(id, _)| eval.gts[i].contains(&id))
-            .count();
-    }
+    let answers: Vec<_> = (0..eval.n_test)
+        .map(|i| {
+            let q = &eval.test[i * eval.dim..(i + 1) * eval.dim];
+            index.search_flat(q, eval.train, &cfg)
+        })
+        .collect();
     let elapsed = t.elapsed().as_secs_f64();
-    let recall = hits as f64 / (eval.n_test * eval.top_k) as f64;
+    let recall = recall::at_k(
+        &answers,
+        eval.gts,
+        eval.top_k,
+        0..=(eval.train.len() / eval.dim) as u64 - 1,
+        |hit| *hit,
+    );
     let qps = eval.n_test as f64 / elapsed;
     (recall, qps)
 }
@@ -303,18 +309,21 @@ fn measure_multi_thread(index: &QuIVer, eval: &SearchEval<'_>, ef: usize) -> (f6
     };
 
     let t = Instant::now();
-    let hits: usize = (0..eval.n_test)
+    let answers: Vec<_> = (0..eval.n_test)
         .into_par_iter()
         .map(|i| {
             let q = &eval.test[i * eval.dim..(i + 1) * eval.dim];
-            let res = index.search_flat(q, eval.train, &cfg);
-            res.iter()
-                .filter(|&&(id, _)| eval.gts[i].contains(&id))
-                .count()
+            index.search_flat(q, eval.train, &cfg)
         })
-        .sum();
+        .collect();
     let elapsed = t.elapsed().as_secs_f64();
-    let recall = hits as f64 / (eval.n_test * eval.top_k) as f64;
+    let recall = recall::at_k(
+        &answers,
+        eval.gts,
+        eval.top_k,
+        0..=(eval.train.len() / eval.dim) as u64 - 1,
+        |hit| *hit,
+    );
     let qps = eval.n_test as f64 / elapsed;
     (recall, qps)
 }
@@ -633,19 +642,19 @@ fn experiment_thread_scaling(ds: &DataSet) {
         };
 
         let t = Instant::now();
-        let _hits: usize = pool.install(|| {
+        let answers: Vec<_> = pool.install(|| {
             (0..ds.n_test)
                 .into_par_iter()
                 .map(|i| {
                     let q = &ds.test[i * ds.dim..(i + 1) * ds.dim];
-                    let res = index.search_flat(q, &ds.train, &cfg);
-                    res.iter()
-                        .filter(|&&(id, _)| ds.gts[i].contains(&id))
-                        .count()
+                    index.search_flat(q, &ds.train, &cfg)
                 })
-                .sum()
+                .collect()
         });
         let qps = ds.n_test as f64 / t.elapsed().as_secs_f64();
+        recall::at_k(&answers, &ds.gts, top_k, 0..=ds.n_train as u64 - 1, |hit| {
+            *hit
+        });
         println!("{:<10} {:>12.0} {:>11.1}x", num_threads, qps, qps / qps_1t);
     }
 }

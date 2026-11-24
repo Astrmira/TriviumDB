@@ -1,20 +1,14 @@
 //! 用发布版及冻结前源码生成的独立制品核对文档结构升级与确认语义。
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, path::Path};
+use std::path::Path;
 use triviumdb::database::{Config, StorageMode};
 use triviumdb::{ConsoleSession, Database};
 use triviumdb_migrate::Options;
 
-fn files(path: &Path) -> BTreeMap<std::ffi::OsString, Vec<u8>> {
-    std::fs::read_dir(path)
-        .unwrap()
-        .map(|entry| {
-            let entry = entry.unwrap();
-            (entry.file_name(), std::fs::read(entry.path()).unwrap())
-        })
-        .collect()
-}
+#[path = "../../../tests/support/files.rs"]
+mod physical_files;
+use physical_files::files;
 
 #[test]
 fn schema_one_migrates_to_current_without_changing_document_or_receipt_identity() {

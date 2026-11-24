@@ -7,13 +7,6 @@ pub enum FileRole {
     Wal,
     PropertyIndex,
     GraphIndex,
-    Quiver,
-    QuiverMeta,
-    Text,
-    TextMeta,
-    Manifest,
-    IndexContainer,
-    Lock,
 }
 
 impl FileRole {
@@ -26,13 +19,6 @@ impl FileRole {
             Self::Wal => ".wal",
             Self::PropertyIndex => ".pidx",
             Self::GraphIndex => ".gidx",
-            Self::Quiver => ".quiver",
-            Self::QuiverMeta => ".quiver.meta",
-            Self::Text => ".text",
-            Self::TextMeta => ".text.meta",
-            Self::Manifest => ".manifest.json",
-            Self::IndexContainer => ".idx",
-            Self::Lock => ".lock",
         }
     }
 }

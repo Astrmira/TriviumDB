@@ -1,7 +1,6 @@
 use super::fixture::*;
 use super::mutation::{Mutation, field_boundary_mutations, truncation_mutations};
 use super::spec::{FLUSH_MARKER, FileRole, TDB_HEADER};
-use triviumdb::database::Database;
 
 #[test]
 fn 当前提交标记字段边界_crc及未知版本矩阵() {
@@ -9,9 +8,7 @@ fn 当前提交标记字段边界_crc及未知版本矩阵() {
     let marker = std::fs::read(format!("{source}.flush_ok")).unwrap();
     assert_eq!(marker.len(), 81);
     assert_eq!(marker[4], 4);
-    let control = Database::<f32>::open_read_only(&source, DIM).unwrap();
-    assert_eq!(control.all_node_ids().unwrap(), [1, 2, 3, 4, 5, 6, 7, 8]);
-    drop(control);
+    with_read_only(&source, |result| assert_seed(&result.unwrap()));
 
     let mutations = field_boundary_mutations(FLUSH_MARKER)
         .into_iter()
@@ -29,12 +26,21 @@ fn 当前提交标记字段边界_crc及未知版本矩阵() {
             &candidate,
             &[FileRole::Tdb, FileRole::Vec, FileRole::Payload],
         );
-        std::fs::write(format!("{candidate}.flush_ok"), mutation.apply(&marker)).unwrap();
-        assert!(
-            Database::<f32>::open_read_only(&candidate, DIM).is_err(),
-            "变异应被拒绝: {mutation:?}"
-        );
-        assert_read_only_zero_write(&candidate);
+        let changed = mutation.apply(&marker);
+        let version_changed = changed.get(4).is_some_and(|v| *v != marker[4]);
+        std::fs::write(format!("{candidate}.flush_ok"), changed).unwrap();
+        with_read_only(&candidate, |result| {
+            let error = result.err().expect("变异的提交标记必须拒绝");
+            assert!(
+                error.code() == "TDB_CORRUPTED_FILE"
+                    || (version_changed
+                        && matches!(
+                            error.code(),
+                            "TDB_MIGRATION_REQUIRED" | "TDB_UNSUPPORTED_SIDECAR_VERSION"
+                        )),
+                "{mutation:?}: {error}"
+            );
+        });
         cleanup(&candidate);
     }
     cleanup(&source);
@@ -70,8 +76,7 @@ fn marker修复自身crc后_错误尺寸和文件crc仍被语义校验拒绝() {
             .apply(&marker),
         );
         std::fs::write(format!("{candidate}.flush_ok"), changed).unwrap();
-        assert!(Database::<f32>::open_read_only(&candidate, DIM).is_err());
-        assert_read_only_zero_write(&candidate);
+        with_read_only(&candidate, assert_corrupt);
         cleanup(&candidate);
     }
     cleanup(&source);
@@ -91,9 +96,24 @@ fn tdb头部每个字段边界与逐字段截断均不panic且只读零写() {
             &candidate,
             &[FileRole::Vec, FileRole::Payload, FileRole::FlushMarker],
         );
-        std::fs::write(&candidate, mutation.apply(&tdb)).unwrap();
-        let _ = Database::<f32>::open_read_only(&candidate, DIM);
-        assert_read_only_zero_write(&candidate);
+        let changed = mutation.apply(&tdb);
+        std::fs::write(&candidate, &changed).unwrap();
+        with_read_only(&candidate, |result| match result {
+            Ok(db) if changed == tdb => assert_seed(&db),
+            Ok(_) => panic!("已改变的主文件必须被检查点校验拒绝：{mutation:?}"),
+            Err(err) => assert!(
+                changed != tdb
+                    && matches!(
+                        err.code(),
+                        "TDB_UNSUPPORTED_DATABASE_VERSION"
+                            | "TDB_MIGRATION_REQUIRED"
+                            | "TDB_CORRUPTED_FILE"
+                            | "TDB_DIMENSION_MISMATCH"
+                            | "TDB_DTYPE_MISMATCH"
+                    ),
+                "{mutation:?}: {err}"
+            ),
+        });
         cleanup(&candidate);
     }
     cleanup(&source);
@@ -118,8 +138,7 @@ fn vec长度元素边界和非有限值由跨文件校验拒绝() {
             &[FileRole::Tdb, FileRole::Payload, FileRole::FlushMarker],
         );
         std::fs::write(format!("{candidate}.vec"), variant).unwrap();
-        assert!(Database::<f32>::open_read_only(&candidate, DIM).is_err());
-        assert_read_only_zero_write(&candidate);
+        with_read_only(&candidate, assert_corrupt);
         cleanup(&candidate);
     }
     cleanup(&source);

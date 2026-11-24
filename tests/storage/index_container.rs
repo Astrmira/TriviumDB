@@ -25,6 +25,11 @@ fn seed(path: &str, mode: StorageMode) {
     db.index_keyword(11, "beta").unwrap();
     db.create_index("kind").unwrap();
     db.build_quiver_index(None).unwrap();
+    db.flush().unwrap();
+    assert_eq!(
+        db.index_memory_stats().persisted_bytes,
+        std::fs::metadata(format!("{path}.idx")).unwrap().len()
+    );
     db.close().unwrap();
 }
 
@@ -101,6 +106,7 @@ fn 统一容器保留全部组件且旧映射关闭后可移动重开() {
             },
         )
         .unwrap();
+        assert_eq!(db.index_memory_stats().persisted_bytes, before.len() as u64);
         facts(&db);
         let retained = db.get(7).unwrap().unwrap();
         db.close().unwrap();

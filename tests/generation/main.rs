@@ -486,3 +486,6 @@ fn 指针替换后同步失败交回未知结果并可按当前代确认() {
     );
     store.publish_current("two", "data.tdb").unwrap();
 }
+
+#[path = "../support/files.rs"]
+mod physical_files;

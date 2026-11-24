@@ -6,6 +6,15 @@ fn compare(left: &RefScalar, right: &RefScalar) -> Option<Ordering> {
     match (left, right) {
         (RefScalar::Bool(left), RefScalar::Bool(right)) => Some(left.cmp(right)),
         (RefScalar::Integer(left), RefScalar::Integer(right)) => Some(left.cmp(right)),
+        (RefScalar::Float(a), RefScalar::Float(b)) => {
+            f64::from_bits(*a).partial_cmp(&f64::from_bits(*b))
+        }
+        (RefScalar::Integer(i), RefScalar::Float(f)) => {
+            Some(super::model::compare_integer_float(*i, f64::from_bits(*f)))
+        }
+        (RefScalar::Float(f), RefScalar::Integer(i)) => {
+            Some(super::model::compare_integer_float(*i, f64::from_bits(*f)).reverse())
+        }
         (RefScalar::String(left), RefScalar::String(right)) => Some(left.cmp(right)),
         (RefScalar::Null, RefScalar::Null) => Some(Ordering::Equal),
         _ => None,
@@ -87,7 +96,7 @@ pub fn evaluate(database: &RefDatabase, query: &Query) -> Vec<CanonicalRow> {
             apply_page(&mut nodes, *offset, *limit);
             nodes
                 .into_iter()
-                .map(|node| BTreeMap::from([("id".into(), RefScalar::Integer(node.id as i64))]))
+                .map(|node| BTreeMap::from([("id".into(), RefScalar::Integer(node.id.into()))]))
                 .collect()
         }
         Query::Match {
@@ -123,8 +132,8 @@ pub fn evaluate(database: &RefDatabase, query: &Query) -> Vec<CanonicalRow> {
                 .into_iter()
                 .map(|(source, target)| {
                     BTreeMap::from([
-                        ("source".into(), RefScalar::Integer(source as i64)),
-                        ("target".into(), RefScalar::Integer(target as i64)),
+                        ("source".into(), RefScalar::Integer(source.into())),
+                        ("target".into(), RefScalar::Integer(target.into())),
                     ])
                 })
                 .collect()
@@ -145,7 +154,7 @@ pub fn evaluate(database: &RefDatabase, query: &Query) -> Vec<CanonicalRow> {
                 .map(|(group, count)| {
                     BTreeMap::from([
                         ("group".into(), RefScalar::String(group)),
-                        ("count".into(), RefScalar::Integer(count)),
+                        ("count".into(), RefScalar::Integer(count.into())),
                     ])
                 })
                 .collect()

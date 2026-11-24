@@ -12,8 +12,94 @@ use super::types::{PyGroupedSearchResult, PyHookContext, PySearchHit, search_hit
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
+fn id_search_config(
+    py: Python<'_>,
+    top_k: Py<PyAny>,
+    recall_k: Py<PyAny>,
+    min_score: Py<PyAny>,
+    payload_filter: Option<&Bound<'_, PyAny>>,
+    exact: Py<PyAny>,
+    ann_rerank_limit: Option<&Bound<'_, PyAny>>,
+) -> PyResult<crate::database::SearchConfig> {
+    Ok(crate::database::SearchConfig {
+        top_k: extract_argument(py, top_k.bind(py), "top_k", None)?,
+        recall_k: extract_argument(py, recall_k.bind(py), "recall_k", None)?,
+        min_score: read_float(min_score.bind(py), "min_score")?,
+        payload_filter: payload_filter
+            .map(|value| mapping_to_filter(py, value))
+            .transpose()?,
+        ann_rerank_limit: ann_rerank_limit
+            .map(|value| extract_argument(py, value, "ann_rerank_limit", None))
+            .transpose()?,
+        expand_depth: 0,
+        enable_advanced_pipeline: false,
+        ..Default::default()
+    }
+    .with_exact(extract_argument(py, exact.bind(py), "exact", None)?))
+}
+
 #[pymethods]
 impl PyTriviumDB {
+    /// 向量检索只返回命中 ID。
+    #[pyo3(signature = (query_vector, top_k=integer_argument(5), recall_k=integer_argument(0), min_score=float_argument(0.0), payload_filter=None, *, exact=boolean_argument(false), ann_rerank_limit=None), text_signature="($self, query_vector, top_k=5, recall_k=0, min_score=0.0, payload_filter=None, *, exact=False, ann_rerank_limit=None)")]
+    fn search_ids(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        query_vector: Bound<'_, PyAny>,
+        top_k: Py<PyAny>,
+        recall_k: Py<PyAny>,
+        min_score: Py<PyAny>,
+        payload_filter: Option<&Bound<'_, PyAny>>,
+        exact: Py<PyAny>,
+        ann_rerank_limit: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Vec<u64>> {
+        let (_request, db) = database_read(slf)?;
+        let config = id_search_config(
+            py,
+            top_k,
+            recall_k,
+            min_score,
+            payload_filter,
+            exact,
+            ann_rerank_limit,
+        )?;
+        dispatch!(db, inner => super::vectors::with_query(py, &query_vector, |query| inner.search_ids(query, &config)))
+    }
+
+    /// 批量向量检索按输入顺序返回每条查询的命中 ID。
+    #[pyo3(signature = (query_vectors, top_k=integer_argument(5), recall_k=integer_argument(0), min_score=float_argument(0.0), payload_filter=None, parallelism=integer_argument(0), *, exact=boolean_argument(false), ann_rerank_limit=None), text_signature="($self, query_vectors, top_k=5, recall_k=0, min_score=0.0, payload_filter=None, parallelism=0, *, exact=False, ann_rerank_limit=None)")]
+    fn search_ids_batch(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        query_vectors: Bound<'_, PyAny>,
+        top_k: Py<PyAny>,
+        recall_k: Py<PyAny>,
+        min_score: Py<PyAny>,
+        payload_filter: Option<&Bound<'_, PyAny>>,
+        parallelism: Py<PyAny>,
+        exact: Py<PyAny>,
+        ann_rerank_limit: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Vec<Vec<u64>>> {
+        let (_request, db) = database_read(slf)?;
+        let config = id_search_config(
+            py,
+            top_k,
+            recall_k,
+            min_score,
+            payload_filter,
+            exact,
+            ann_rerank_limit,
+        )?;
+        let parallelism = extract_argument(py, parallelism.bind(py), "parallelism", None)?;
+        let batch = crate::database::BatchSearchConfig { parallelism };
+        let (ids, _workspace) = dispatch!(db, inner => {
+            let (queries, _input) = super::vectors::queries(&query_vectors, inner)?;
+            py.detach(|| inner.search_ids_batch_with_workspace(&queries, &config, &batch))
+        })
+        .map_err(to_py_error)?;
+        Ok(ids)
+    }
+
     /// 带 Hook 上下文的检索：返回 (hits, context)
     ///
     /// 除了返回检索结果外，同时返回 HookContext 对象，
@@ -25,7 +111,7 @@ impl PyTriviumDB {
     /// print(ctx.timings)   # {'hook_pre_search': 0.1, 'graph_expand': 2.3, ...}
     /// print(ctx.custom_data)  # Hook 注入的自定义数据
     /// ```
-    #[pyo3(signature = (query_vector, top_k=integer_argument(5), recall_k=integer_argument(0), rerank_k=integer_argument(0), expand_depth=integer_argument(2), min_score=float_argument(0.0), payload_filter=None, *, exact=boolean_argument(false)), text_signature="($self, query_vector, top_k=5, recall_k=0, rerank_k=0, expand_depth=2, min_score=0.0, payload_filter=None, *, exact=False)")]
+    #[pyo3(signature = (query_vector, top_k=integer_argument(5), recall_k=integer_argument(0), rerank_k=integer_argument(0), expand_depth=integer_argument(0), min_score=float_argument(0.0), payload_filter=None, *, exact=boolean_argument(false), ann_rerank_limit=None), text_signature="($self, query_vector, top_k=5, recall_k=0, rerank_k=0, expand_depth=0, min_score=0.0, payload_filter=None, *, exact=False, ann_rerank_limit=None)")]
     fn search_with_context(
         slf: &Bound<'_, Self>,
         py: Python<'_>,
@@ -37,6 +123,7 @@ impl PyTriviumDB {
         min_score: Py<PyAny>,
         payload_filter: Option<&Bound<'_, PyAny>>,
         exact: Py<PyAny>,
+        ann_rerank_limit: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<(Vec<PySearchHit>, PyHookContext)> {
         let (_request, borrowed) = database_read(slf)?;
         let this = &*borrowed;
@@ -51,6 +138,9 @@ impl PyTriviumDB {
             None => None,
         };
         let config = crate::database::SearchConfig {
+            ann_rerank_limit: ann_rerank_limit
+                .map(|value| extract_argument(py, value, "ann_rerank_limit", None))
+                .transpose()?,
             top_k,
             recall_k,
             rerank_k,
@@ -118,7 +208,7 @@ impl PyTriviumDB {
         Ok((hits, ctx))
     }
 
-    #[pyo3(signature = (query_vector, top_k=integer_argument(5), recall_k=integer_argument(0), rerank_k=integer_argument(0), expand_depth=integer_argument(0), min_score=float_argument(0.0), payload_filter=None, max_edges_per_node=integer_argument(0), min_edge_weight=float_argument(0.0), edge_direction=string_argument("out"), *, exact=boolean_argument(false)), text_signature="($self, query_vector, top_k=5, recall_k=0, rerank_k=0, expand_depth=0, min_score=0.0, payload_filter=None, max_edges_per_node=0, min_edge_weight=0.0, edge_direction='out', *, exact=False)")]
+    #[pyo3(signature = (query_vector, top_k=integer_argument(5), recall_k=integer_argument(0), rerank_k=integer_argument(0), expand_depth=integer_argument(0), min_score=float_argument(0.0), payload_filter=None, max_edges_per_node=integer_argument(0), min_edge_weight=float_argument(0.0), edge_direction=string_argument("out"), *, exact=boolean_argument(false), ann_rerank_limit=None), text_signature="($self, query_vector, top_k=5, recall_k=0, rerank_k=0, expand_depth=0, min_score=0.0, payload_filter=None, max_edges_per_node=0, min_edge_weight=0.0, edge_direction='out', *, exact=False, ann_rerank_limit=None)")]
     fn search(
         slf: &Bound<'_, Self>,
         py: Python<'_>,
@@ -133,6 +223,7 @@ impl PyTriviumDB {
         min_edge_weight: Py<PyAny>,
         edge_direction: Py<PyAny>,
         exact: Py<PyAny>,
+        ann_rerank_limit: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<PySearchHit>> {
         let (_request, borrowed) = database_read(slf)?;
         let this = &*borrowed;
@@ -152,6 +243,9 @@ impl PyTriviumDB {
         };
 
         let config = crate::database::SearchConfig {
+            ann_rerank_limit: ann_rerank_limit
+                .map(|value| extract_argument(py, value, "ann_rerank_limit", None))
+                .transpose()?,
             top_k,
             recall_k,
             rerank_k,
@@ -166,22 +260,11 @@ impl PyTriviumDB {
         }
         .with_exact(exact);
 
-        let results = match &this.inner {
-            DbBackend::F32(db) => {
-                let vec: Vec<f32> = super::vectors::vector(&query_vector, "query_vector", None)?;
-                py.detach(|| db.search_hybrid(None, Some(&vec), &config))
-            }
-            DbBackend::F16(db) => {
-                let vec16: Vec<half::f16> =
-                    super::vectors::vector(&query_vector, "query_vector", None)?;
-                py.detach(|| db.search_hybrid(None, Some(&vec16), &config))
-            }
-            DbBackend::U64(db) => {
-                let vec: Vec<u64> = super::vectors::vector(&query_vector, "query_vector", None)?;
-                py.detach(|| db.search_hybrid(None, Some(&vec), &config))
-            }
-        }
-        .map_err(to_py_error)?;
+        let results = dispatch!(this, db =>
+            super::vectors::with_query(py, &query_vector, |query| {
+                db.search_hybrid(None, Some(query), &config)
+            })
+        )?;
 
         results
             .into_iter()
@@ -195,7 +278,7 @@ impl PyTriviumDB {
             .collect::<PyResult<Vec<_>>>()
     }
 
-    #[pyo3(signature = (query_vector, top_k=integer_argument(5), recall_k=integer_argument(0), rerank_k=integer_argument(0), expand_depth=integer_argument(2), min_score=float_argument(0.0), payload_filter=None, max_edges_per_node=integer_argument(0), min_edge_weight=float_argument(0.0), edge_direction=string_argument("out"), *, exact=boolean_argument(false)), text_signature="($self, query_vector, top_k=5, recall_k=0, rerank_k=0, expand_depth=2, min_score=0.0, payload_filter=None, max_edges_per_node=0, min_edge_weight=0.0, edge_direction='out', *, exact=False)")]
+    #[pyo3(signature = (query_vector, top_k=integer_argument(5), recall_k=integer_argument(0), rerank_k=integer_argument(0), expand_depth=integer_argument(2), min_score=float_argument(0.0), payload_filter=None, max_edges_per_node=integer_argument(0), min_edge_weight=float_argument(0.0), edge_direction=string_argument("out"), *, exact=boolean_argument(false), ann_rerank_limit=None), text_signature="($self, query_vector, top_k=5, recall_k=0, rerank_k=0, expand_depth=2, min_score=0.0, payload_filter=None, max_edges_per_node=0, min_edge_weight=0.0, edge_direction='out', *, exact=False, ann_rerank_limit=None)")]
     fn search_grouped(
         slf: &Bound<'_, Self>,
         py: Python<'_>,
@@ -210,6 +293,7 @@ impl PyTriviumDB {
         min_edge_weight: Py<PyAny>,
         edge_direction: Py<PyAny>,
         exact: Py<PyAny>,
+        ann_rerank_limit: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PyGroupedSearchResult> {
         let (_request, borrowed) = database_read(slf)?;
         let this = &*borrowed;
@@ -227,6 +311,9 @@ impl PyTriviumDB {
             .map(|dict| mapping_to_filter(py, dict))
             .transpose()?;
         let config = crate::database::SearchConfig {
+            ann_rerank_limit: ann_rerank_limit
+                .map(|value| extract_argument(py, value, "ann_rerank_limit", None))
+                .transpose()?,
             top_k,
             recall_k,
             rerank_k,
@@ -277,7 +364,7 @@ impl PyTriviumDB {
         })
     }
 
-    #[pyo3(signature = (query_vectors, top_k=integer_argument(5), recall_k=integer_argument(0), rerank_k=integer_argument(0), expand_depth=integer_argument(0), min_score=float_argument(0.0), parallelism=integer_argument(0), *, exact=boolean_argument(false)), text_signature="($self, query_vectors, top_k=5, recall_k=0, rerank_k=0, expand_depth=0, min_score=0.0, parallelism=0, *, exact=False)")]
+    #[pyo3(signature = (query_vectors, top_k=integer_argument(5), recall_k=integer_argument(0), rerank_k=integer_argument(0), expand_depth=integer_argument(0), min_score=float_argument(0.0), parallelism=integer_argument(0), *, exact=boolean_argument(false), ann_rerank_limit=None), text_signature="($self, query_vectors, top_k=5, recall_k=0, rerank_k=0, expand_depth=0, min_score=0.0, parallelism=0, *, exact=False, ann_rerank_limit=None)")]
     fn search_batch(
         slf: &Bound<'_, Self>,
         py: Python<'_>,
@@ -289,6 +376,7 @@ impl PyTriviumDB {
         min_score: Py<PyAny>,
         parallelism: Py<PyAny>,
         exact: Py<PyAny>,
+        ann_rerank_limit: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<Vec<PySearchHit>>> {
         let (_request, borrowed) = database_read(slf)?;
         let this = &*borrowed;
@@ -300,6 +388,9 @@ impl PyTriviumDB {
         let parallelism = extract_argument(py, parallelism.bind(py), "parallelism", None)?;
         let exact = extract_argument(py, exact.bind(py), "exact", None)?;
         let config = crate::database::SearchConfig {
+            ann_rerank_limit: ann_rerank_limit
+                .map(|value| extract_argument(py, value, "ann_rerank_limit", None))
+                .transpose()?,
             top_k,
             recall_k,
             rerank_k,
@@ -310,21 +401,10 @@ impl PyTriviumDB {
         }
         .with_exact(exact);
         let batch_config = crate::database::BatchSearchConfig { parallelism };
-        let (results, _response_workspace) = match &this.inner {
-            DbBackend::F32(db) => {
-                let queries: Vec<Vec<f32>> = super::vectors::queries(&query_vectors, db.dim())?;
-                py.detach(|| db.search_batch_with_workspace(&queries, &config, &batch_config))
-            }
-            DbBackend::F16(db) => {
-                let queries: Vec<Vec<half::f16>> =
-                    super::vectors::queries(&query_vectors, db.dim())?;
-                py.detach(|| db.search_batch_with_workspace(&queries, &config, &batch_config))
-            }
-            DbBackend::U64(db) => {
-                let queries: Vec<Vec<u64>> = super::vectors::queries(&query_vectors, db.dim())?;
-                py.detach(|| db.search_batch_with_workspace(&queries, &config, &batch_config))
-            }
-        }
+        let (results, _response_workspace) = dispatch!(this, db => {
+            let (queries, _input) = super::vectors::queries(&query_vectors, db)?;
+            py.detach(|| db.search_batch_with_workspace(&queries, &config, &batch_config))
+        })
         .map_err(to_py_error)?;
 
         results
@@ -368,8 +448,8 @@ impl PyTriviumDB {
             min_edge_weight=float_argument(0.0),
             edge_direction=string_argument("out"),
             *,
-            exact=boolean_argument(false)
-        ), text_signature="($self, query_vector, top_k=5, recall_k=0, rerank_k=0, expand_depth=2, min_score=0.0, teleport_alpha=0.0, enable_advanced_pipeline=True, enable_sparse_residual=False, fista_lambda=0.1, fista_threshold=0.3, enable_dpp=False, dpp_quality_weight=1.0, enable_refractory_fatigue=False, enable_text_hybrid_search=False, text_boost=1.5, custom_query_text=None, payload_filter=None, force_brute_force=False, expand_labels=None, max_edges_per_node=0, min_edge_weight=0.0, edge_direction='out', *, exact=False)")]
+            exact=boolean_argument(false), ann_rerank_limit=None
+        ), text_signature="($self, query_vector, top_k=5, recall_k=0, rerank_k=0, expand_depth=2, min_score=0.0, teleport_alpha=0.0, enable_advanced_pipeline=True, enable_sparse_residual=False, fista_lambda=0.1, fista_threshold=0.3, enable_dpp=False, dpp_quality_weight=1.0, enable_refractory_fatigue=False, enable_text_hybrid_search=False, text_boost=1.5, custom_query_text=None, payload_filter=None, force_brute_force=False, expand_labels=None, max_edges_per_node=0, min_edge_weight=0.0, edge_direction='out', *, exact=False, ann_rerank_limit=None)")]
     fn search_advanced(
         slf: &Bound<'_, Self>,
         py: Python<'_>,
@@ -397,6 +477,7 @@ impl PyTriviumDB {
         min_edge_weight: Py<PyAny>,
         edge_direction: Py<PyAny>,
         exact: Py<PyAny>,
+        ann_rerank_limit: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<PySearchHit>> {
         let (_request, borrowed) = database_read(slf)?;
         let this = &*borrowed;
@@ -455,6 +536,9 @@ impl PyTriviumDB {
         };
 
         let config = crate::database::SearchConfig {
+            ann_rerank_limit: ann_rerank_limit
+                .map(|value| extract_argument(py, value, "ann_rerank_limit", None))
+                .transpose()?,
             top_k,
             recall_k,
             rerank_k,
@@ -482,22 +566,11 @@ impl PyTriviumDB {
 
         let q_text = custom_query_text.as_deref();
 
-        let results = match &this.inner {
-            DbBackend::F32(db) => {
-                let vec: Vec<f32> = super::vectors::vector(&query_vector, "query_vector", None)?;
-                py.detach(|| db.search_hybrid(q_text, Some(&vec), &config))
-            }
-            DbBackend::F16(db) => {
-                let vec16: Vec<half::f16> =
-                    super::vectors::vector(&query_vector, "query_vector", None)?;
-                py.detach(|| db.search_hybrid(q_text, Some(&vec16), &config))
-            }
-            DbBackend::U64(db) => {
-                let vec: Vec<u64> = super::vectors::vector(&query_vector, "query_vector", None)?;
-                py.detach(|| db.search_hybrid(q_text, Some(&vec), &config))
-            }
-        }
-        .map_err(to_py_error)?;
+        let results = dispatch!(this, db =>
+            super::vectors::with_query(py, &query_vector, |query| {
+                db.search_hybrid(q_text, Some(query), &config)
+            })
+        )?;
 
         results
             .into_iter()
@@ -511,7 +584,7 @@ impl PyTriviumDB {
             .collect::<PyResult<Vec<_>>>()
     }
 
-    #[pyo3(signature = (query_vector, query_text, top_k=integer_argument(5), expand_depth=integer_argument(2), min_score=float_argument(0.0), hybrid_alpha=float_argument(0.7), payload_filter=None, *, exact=boolean_argument(false)), text_signature="($self, query_vector, query_text, top_k=5, expand_depth=2, min_score=0.0, hybrid_alpha=0.7, payload_filter=None, *, exact=False)")]
+    #[pyo3(signature = (query_vector, query_text, top_k=integer_argument(5), expand_depth=integer_argument(2), min_score=float_argument(0.0), hybrid_alpha=float_argument(0.7), payload_filter=None, *, exact=boolean_argument(false), ann_rerank_limit=None), text_signature="($self, query_vector, query_text, top_k=5, expand_depth=2, min_score=0.0, hybrid_alpha=0.7, payload_filter=None, *, exact=False, ann_rerank_limit=None)")]
     fn search_hybrid(
         slf: &Bound<'_, Self>,
         py: Python<'_>,
@@ -523,6 +596,7 @@ impl PyTriviumDB {
         hybrid_alpha: Py<PyAny>,
         payload_filter: Option<&Bound<'_, PyAny>>,
         exact: Py<PyAny>,
+        ann_rerank_limit: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<PySearchHit>> {
         let (_request, borrowed) = database_read(slf)?;
         let this = &*borrowed;
@@ -538,6 +612,9 @@ impl PyTriviumDB {
         };
 
         let config = crate::database::SearchConfig {
+            ann_rerank_limit: ann_rerank_limit
+                .map(|value| extract_argument(py, value, "ann_rerank_limit", None))
+                .transpose()?,
             top_k,
             expand_depth,
             min_score,

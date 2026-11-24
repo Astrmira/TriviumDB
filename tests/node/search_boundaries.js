@@ -14,9 +14,17 @@ function verifyHybridWeights(root, TriviumDB) {
     db.indexText(2, 'rareword')
     db.buildTextIndex()
     const hybrid = alpha => db.searchHybrid([1, 0], 'rareword', 2, 0, 0, alpha, undefined, true)
+    assert.deepEqual(db.searchHybrid([1, 0], 'rareword', 2, 0, 0, 0.2, undefined, false, 2).map(hit => hit.id), [2, 1])
+    for (const width of [0, -1, 1.5, '8']) {
+      assert.throws(() => db.searchHybrid([1, 0], 'rareword', 2, 0, 0, 0.2, undefined, false, width),
+        error => error.code === 'TDB_INVALID_INPUT')
+    }
     assert.deepEqual(hybrid(1), db.searchExact([1, 0], 2))
     assert.deepEqual(hybrid(0).map(hit => hit.id), [2])
     assert.deepEqual(hybrid(0.2).map(hit => hit.id), [2, 1])
+    db.link(1, 2, 'edge', 1)
+    const diagnosed = db.searchWithContext([1, 0], { topK: 2, minScore: 0.9, exact: true }).hits
+    assert.deepEqual(diagnosed.map(hit => [hit.id, hit.score, hit.payload]), [[1, 1, { name: 'z' }]])
     for (const alpha of [-1, 2, 1.00000001, NaN, Infinity]) {
       assert.throws(() => hybrid(alpha), error => error.code === 'TDB_INVALID_INPUT')
     }
@@ -28,6 +36,21 @@ function verifyHybridWeights(root, TriviumDB) {
 
 async function verifySearchEntries(root, TriviumDB) {
   verifyHybridWeights(root, TriviumDB)
+  const budgeted = new TriviumDB(path.join(root, 'batch-input.tdb'), { dim: 2 })
+  try {
+    budgeted.insertWithId(7, [1, 0], {})
+    budgeted.setMemoryLimit(1)
+    const tooWide = new Array(100000)
+    Object.defineProperty(tooWide, 0, { get() { throw new Error('超额行不应开始读取元素') } })
+    for (const search of [q => budgeted.searchIdsBatch(q), q => budgeted.searchBatch(q)]) {
+      for (const input of [[tooWide], new Float32Array(512 * 1024)]) {
+        await assert.rejects(search(input), error => error.code === 'TDB_CAPACITY_RESERVATION_REJECTED')
+      }
+    }
+    assert.deepEqual(await budgeted.searchIdsBatch([[1, 0]], { exact: true }), [[7]])
+  } finally {
+    budgeted.close()
+  }
   const query = entries.query
   const records = new Map(entries.records.map(record => [record.id, record]))
   function verify(hits, item) {
@@ -56,6 +79,7 @@ async function verifySearchEntries(root, TriviumDB) {
           verify(result.hits, item)
           assert.equal(result.context.observations.vector_route_quiver, 0)
           verify(db.searchAdvanced(query, { ...config, enableAdvancedPipeline: false }), item)
+          assert.deepEqual(db.searchIds(query, config), item.ids)
           verify(db.searchHybrid(query, '', topK, 0, item.min_score, undefined, item.filter, item.exact), item)
           if (!item.filter) {
             const batch = await db.searchBatch([query, query], topK, 2, item.min_score, item.exact)
@@ -79,6 +103,24 @@ async function verifySearchEntries(root, TriviumDB) {
       if (indexed) {
         db.search(query, 1)
         assert.equal(db.searchWithContext(query, { topK: 1 }).context.observations.vector_route_quiver, 1)
+        const options = { topK: 3, recallK: 200, expandDepth: 0, annRerankLimit: 240 }
+        const { hits, context } = db.searchWithContext(query, options)
+        assert.equal(context.observations.quiver_ef_search, 240)
+        assert.equal(context.observations.quiver_rerank_limit, 240)
+        assert.equal(context.observations.quiver_top_k, 3)
+        assert.equal(hits.length, 3)
+        assert.deepEqual(db.searchAdvanced(query, options), hits.map(hit => ({
+          id: hit.id, score: 1, payload: { id: hit.id },
+        })))
+        assert.deepEqual(db.searchIds(query, options), hits.map(hit => hit.id))
+        assert.deepEqual(
+          await db.searchIdsBatch([query, [0, 1]], { ...options, minScore: 0.5 }, 2),
+          [hits.map(hit => hit.id), []],
+        )
+        assert.throws(
+          () => db.searchAdvanced(query, { annRerankLimit: 0 }),
+          error => error.code === 'TDB_INVALID_INPUT' && error.target?.field === 'annRerankLimit',
+        )
       }
       const result = db.searchWithContext(query, { topK: 3, expandDepth: 0, exact: true })
       assert.equal(result.context.observations.vector_route_quiver, 0)

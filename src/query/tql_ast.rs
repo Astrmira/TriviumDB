@@ -480,6 +480,8 @@ pub enum TqlExpr {
     PathStrength { var: String },
     /// 路径条数。
     PathCount { var: String },
+    /// 有界简单路径是否受枚举上限截断。
+    PathTruncated { var: String },
     /// 社区 ID。
     Community { var: String },
     /// 当前行携带的路径。
@@ -514,6 +516,7 @@ impl TqlExpr {
             | Self::Path { var }
             | Self::PathStrength { var }
             | Self::PathCount { var }
+            | Self::PathTruncated { var }
             | Self::PathLength { var }
             | Self::PathRank { var }
             | Self::GraphMetric { var, .. } => Some(var),

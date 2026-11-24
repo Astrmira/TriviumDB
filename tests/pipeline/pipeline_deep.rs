@@ -100,7 +100,7 @@ fn COV6_03_nmf_multiplicative() {
         1.0, 0.0, 0.5, 0.0, 0.0, 1.0, 0.0, 0.5, 0.8, 0.2, 0.4, 0.1, 0.1, 0.9, 0.05, 0.4, 0.5, 0.5,
         0.25, 0.25,
     ];
-    let (w, h) = nmf_multiplicative_update(&v_flat, 5, 4, 2, 50, 1e-4);
+    let (w, h) = nmf_multiplicative_update(&v_flat, 5, 4, 2, 50, 1e-4).unwrap();
     assert_eq!(w.len(), 5 * 2);
     assert_eq!(h.len(), 2 * 4);
 }

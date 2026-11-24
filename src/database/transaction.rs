@@ -102,7 +102,12 @@ fn next_transaction_id(counter: &std::sync::atomic::AtomicU64) -> Result<u64> {
 /// 设计要点：
 /// - 幂等性：已存在的 ID 会被跳过
 /// - 无论是否跳过插入，都推进 `next_id` 防止 ID 复用
-pub(crate) fn replay_entry<T: VectorType>(mt: &mut MemTable<T>, entry: WalEntry<T>) -> Result<()> {
+pub(crate) fn replay_entry<T: VectorType>(
+    mt: &mut MemTable<T>,
+    entry: WalEntry<T>,
+    held_bytes: usize,
+) -> Result<()> {
+    use crate::storage::payload_store::query_decode_peak;
     let extra = match &entry {
         WalEntry::Delete { id } => mt
             .named_graphs
@@ -131,17 +136,17 @@ pub(crate) fn replay_entry<T: VectorType>(mt: &mut MemTable<T>, entry: WalEntry<
             .saturating_add(mt.editing.queue_bytes()),
         WalEntry::Insert { payload, .. } => mt
             .estimate_reserve_bytes(1)?
-            .saturating_add(payload.len().saturating_mul(64)),
-        WalEntry::UpdatePayload { payload, .. } => payload.len().saturating_mul(64),
+            .saturating_add(query_decode_peak(payload.as_bytes())?),
+        WalEntry::UpdatePayload { payload, .. } => query_decode_peak(payload.as_bytes())?,
         WalEntry::Link {
             label, metadata, ..
         } => label
             .len()
             .saturating_mul(5)
-            .saturating_add(metadata.len().saturating_mul(64)),
+            .saturating_add(query_decode_peak(metadata.as_bytes())?),
         _ => 0,
     };
-    mt.check_load_allocation(extra)?;
+    mt.check_load_allocation(extra.saturating_add(held_bytes))?;
     match entry {
         WalEntry::Insert {
             id,
@@ -1395,7 +1400,7 @@ mod guard_tests {
             snapshot: Some(" ".repeat(64 * 1024 * 1024 + 1025)),
         };
         assert_eq!(
-            replay_entry(&mut mt, entry).unwrap_err().code(),
+            replay_entry(&mut mt, entry, 0).unwrap_err().code(),
             "TDB_CORRUPTED_FILE"
         );
         assert!(mt.named_graphs.graphs.is_empty());
@@ -1414,6 +1419,8 @@ mod guard_tests {
             let mut db = Database::<f32>::open(path.to_str().unwrap(), 2).unwrap();
             db.insert_with_id(1, &[1., 0.], serde_json::json!({"state":"old"}))
                 .unwrap();
+            let path_admission = db.enter_operation().unwrap();
+            let facts = std::sync::Arc::clone(&db.memtable);
             let handle = db.search_handle();
             let barrier = pause_at(ConcurrencyPoint::BeforeSearchReadLock);
             let query = std::thread::spawn(move || {
@@ -1435,6 +1442,18 @@ mod guard_tests {
             let result = db.commit_tx(tx);
             drop(failure);
             barrier.release();
+            // 已取得生命周期准入的路径读取，在写锁释放后必须看到同一个恢复边界。
+            let path_error = crate::graph::pathfinding::shortest_path_bidirectional(
+                &super::super::read_or_recover(&facts),
+                1,
+                1,
+                None,
+                &Default::default(),
+            )
+            .unwrap_err();
+            assert!(matches!(path_error, TriviumError::WalClosed));
+            drop(path_admission);
+            drop(facts);
             let result_query = query.join().unwrap();
             assert!(matches!(
                 result.unwrap_err().underlying(),

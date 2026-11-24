@@ -655,8 +655,8 @@ fn 延期加载与删除预留遵守预算且失败不追加WAL() {
         crate::artifact::read(format!("{path}.text")).unwrap(),
         before_text
     );
-    assert!(db.get(1).unwrap().is_some());
     db.set_memory_limit(0).unwrap();
+    assert!(db.get(1).unwrap().is_some());
     db.build_text_index().unwrap();
     assert_eq!(search(&db, "alpha"), vec![1]);
 }

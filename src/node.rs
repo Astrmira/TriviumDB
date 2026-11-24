@@ -19,6 +19,16 @@ pub struct Edge {
     pub metadata: serde_json::Value,
 }
 
+impl Edge {
+    pub(crate) fn clone_heap_bytes(&self) -> usize {
+        self.label
+            .len()
+            .saturating_add(crate::storage::payload_store::query_clone_peak(
+                &self.metadata,
+            ))
+    }
+}
+
 /// 指向目标节点的完整入边视图。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IncomingEdge {

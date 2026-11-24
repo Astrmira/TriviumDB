@@ -102,7 +102,10 @@ pub fn assert_projection_distinct_differential(database: &Database<f32>, referen
         .take(7)
         .map(|node| {
             BTreeMap::from([
-                ("_".into(), CanonicalValue::Node(node.id)),
+                (
+                    "_".into(),
+                    super::canonical::expected_node(reference, node.id),
+                ),
                 (
                     "rank".into(),
                     CanonicalValue::Integer(node.payload["rank"].as_i64().unwrap()),

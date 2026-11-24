@@ -67,6 +67,57 @@ fn 扩散执行中取消归还工作区并允许新请求完整重试() {
     assert_eq!(runtime.stats().reserved_workspace_bytes, 0);
 }
 
+#[test]
+fn 认知计算中取消会归还请求额度且同一实例可以重试() {
+    let dir = super::support::TestDir::new("cognitive-cancellation");
+    let runtime = triviumdb::ResourceRuntime::new(Default::default()).unwrap();
+    let mut db = Database::<f32>::open_with_runtime(
+        &dir.file("data.tdb"),
+        triviumdb::database::Config {
+            dim: 2,
+            ..Default::default()
+        },
+        runtime.clone(),
+    )
+    .unwrap();
+    db.insert_with_id(1, &[1., 0.], json!({})).unwrap();
+    db.insert_with_id(2, &[0., 1.], json!({})).unwrap();
+    for (name, stage) in [
+        (
+            "residual",
+            "RESIDUAL s BY VECTOR [0,1] TOP 1 LAMBDA 0.1 THRESHOLD 0 ITERATIONS 2",
+        ),
+        ("diversify", "DIVERSIFY s TOP 1 QUALITY_WEIGHT 1"),
+        ("topics", "TOPICS s K 1 ITERATIONS 2"),
+    ] {
+        let query =
+            format!("SEARCH VECTOR [1,0] TOP 1 AS s WITH s {stage} AS r WITH r RETURN r.id AS id");
+        let request = triviumdb::sdk::RequestContext::new(name, Default::default(), false).unwrap();
+        let gate = triviumdb::test_hooks::pause_at_request(
+            ConcurrencyPoint::CognitiveStep,
+            request.request_id(),
+        );
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| request.run(|| db.tql(&query)));
+            gate.wait_until_arrived();
+            assert!(runtime.stats().reserved_workspace_bytes > 0);
+            request.cancel();
+            gate.release();
+            assert_eq!(
+                worker.join().unwrap().unwrap_err().code(),
+                "TDB_QUERY_CANCELLED"
+            );
+        });
+        assert_eq!(runtime.stats().reserved_workspace_bytes, 0);
+        let rows = db.tql(&query).unwrap();
+        assert_eq!(rows.len(), 1);
+        let expected = if name == "residual" { 2 } else { 1 };
+        assert!(
+            matches!(rows[0]["id"],triviumdb::query::tql_executor::TqlValue::Int(id) if id==expected)
+        );
+    }
+}
+
 fn test_serial_guard() -> MutexGuard<'static, ()> {
     static SERIAL: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
     SERIAL
@@ -533,6 +584,79 @@ fn 查询写交错_更新向量必须等待完整查询释放读锁() {
 }
 
 #[test]
+fn 邻域扫描中途取消后释放额度并可重试() {
+    let root = tempfile::tempdir().unwrap();
+    let mut db =
+        Database::<f32>::open(root.path().join("neighbors.tdb").to_str().unwrap(), 1).unwrap();
+    for id in 1..=3 {
+        db.insert_with_id(id, &[1.], json!(id)).unwrap();
+    }
+    db.link(1, 2, "next", 1.).unwrap();
+    db.link(2, 3, "next", 1.).unwrap();
+    let request =
+        triviumdb::sdk::RequestContext::new("neighbor-read", Default::default(), false).unwrap();
+    let gate = triviumdb::test_hooks::pause_at_request(
+        ConcurrencyPoint::NeighborhoodEdges,
+        request.request_id(),
+    );
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| request.run(|| db.neighbors(1, 2)));
+        gate.wait_until_arrived();
+        request.cancel();
+        drop(gate);
+        assert_eq!(
+            worker.join().unwrap().unwrap_err().code(),
+            "TDB_QUERY_CANCELLED"
+        );
+    });
+    assert_eq!(db.resource_stats().reserved_workspace_bytes, 0);
+    assert_eq!(db.neighbors(1, 2).unwrap(), [2, 3]);
+    db.close().unwrap();
+}
+
+#[test]
+fn 同代等待者共用预算且丢弃构建不会确认发布() {
+    let _serial = test_serial_guard();
+    let path = tmp_db("quiver-dropped-owner");
+    cleanup(&path);
+    let mut db = Database::<f32>::open(&path, 1).unwrap();
+    let n = triviumdb::storage::memtable::auto_quiver_node_threshold(1);
+    let mut tx = db.begin_tx();
+    for id in 1..=n as u64 {
+        tx.insert_with_id(id, &[1.], json!(null));
+    }
+    tx.commit().unwrap();
+    let first = db.prepare_auto_quiver_build().unwrap().unwrap();
+    let used = db.resource_stats().reserved_workspace_bytes;
+    drop(first);
+    db.set_memory_limit(db.estimated_memory() + used + 128)
+        .unwrap();
+    let owner = db.prepare_auto_quiver_build().unwrap().unwrap();
+    assert!(db.prepare_auto_quiver_build().unwrap().is_none());
+    let gate = pause_at(ConcurrencyPoint::QuiverBuildFollowerWaiting);
+    std::thread::scope(|scope| {
+        let follower = scope.spawn(|| db.build_quiver_index(None));
+        gate.wait_until_arrived();
+        drop(owner);
+        gate.release();
+        assert_eq!(
+            follower.join().unwrap().unwrap_err().code(),
+            "TDB_INVALID_INPUT"
+        );
+    });
+    assert!(
+        db.prepare_auto_quiver_build()
+            .unwrap()
+            .unwrap()
+            .execute()
+            .unwrap()
+    );
+    assert!(db.prepare_auto_quiver_build().unwrap().is_none());
+    db.close().unwrap();
+    cleanup(&path);
+}
+
+#[test]
 fn QuIVer单飞_同代际只有一个构建者() {
     let _serial = test_serial_guard();
     let path = tmp_db("quiver_singleflight");
@@ -608,4 +732,39 @@ fn 查询交错_RwLock允许第二查询进入共享读区() {
     assert_eq!(second.join().unwrap().len(), 1);
     drop(db);
     cleanup(&path);
+}
+
+#[test]
+fn 构建属性索引中取消保留目录且同一实例可重试() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::<f32>::open(dir.path().join("index.tdb").to_str().unwrap(), 1).unwrap();
+    db.insert_with_id(1, &[1.], json!({"key":"a"})).unwrap();
+    let request =
+        triviumdb::sdk::RequestContext::new("cancel-property-index", Default::default(), false)
+            .unwrap();
+    let gate = triviumdb::test_hooks::pause_at_request(
+        ConcurrencyPoint::PropertyIndexBuildRow,
+        request.request_id(),
+    );
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| request.run(|| db.create_index("key")));
+        gate.wait_until_arrived();
+        request.cancel();
+        drop(gate);
+        assert_eq!(
+            worker.join().unwrap().unwrap_err().code(),
+            "TDB_QUERY_CANCELLED"
+        );
+    });
+    assert!(db.index_info().unwrap().is_empty());
+    assert_eq!(db.resource_stats().reserved_workspace_bytes, 0);
+    db.create_index("key").unwrap();
+    let fields = db.index_info().unwrap();
+    assert_eq!(
+        fields
+            .iter()
+            .map(|f| (f.field.as_str(), f.entry_count))
+            .collect::<Vec<_>>(),
+        [("key", 1)]
+    );
 }

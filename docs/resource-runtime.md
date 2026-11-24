@@ -1,6 +1,6 @@
 # 多实例共享资源运行时
 
-> 本文说明 `0.9.4-beta.1` 的多实例共享资源运行时，包括配额、工作区、线程和任务准入。Rust、Python 和 Node.js 使用同一套内核语义。版本记录见[变更说明](changes/0.9.4-beta.1.md)。
+> 本文说明 `0.9.4-beta.2` 的多实例共享资源运行时，包括配额、工作区、线程和任务准入。Rust、Python 和 Node.js 使用同一套内核语义。版本记录见[变更说明](changes/0.9.4-beta.2.md)。
 
 ---
 
@@ -48,7 +48,11 @@
 
 显式正文与关键词登记在构建前检查实例预算并预留共享工作区，估算包含分词、字符串转换与索引增长。拒绝保留原文本事实，临时预留在返回时归还。文件组发布错误通过 `write.phase=publish` 报告结果，提交标记完成后的 WAL 清理失败保留 `committed`，具体入口见[公共错误契约](error-contracts.md)。
 
+关键词自动机在显式预热或首次 AC 查询时申请编译工作区，按关键词字节数和词条数估算。额度不足时保留词表，调整额度后可在同一实例重试。
+
 ### 查询工作区
+
+节点、Payload、单条边和整组入边或出边的点读，在复制数据前按实际内容估算并申请实例和共享额度。分批文档读取另计归档展开峰值。Pelorus 精确检索和 ANN 均计入查询向量及各自所需的工作区。
 
 资源不足立即返回错误，宿主可以限流、退避重试或释放闲置实例。检索参数、结果完整性和排序遵循调用方选择的查询语义。
 
@@ -137,11 +141,13 @@ second.close()
 
 Node.js 配额参数单位为 MiB，运行时资源拒绝的 `error.code` 为 `QueueFull`。宿主按错误码和预算字段处理重试。`resourceStats()` / `stats()` 的 JSON 字段与 Rust 统计保持一致，使用下划线命名。
 
-`QueueFull` 错误还包含与 Python 相同的 `resource`、`requested`、`used`、`limit` 字段，TypeScript 对应 `ResourceBudgetError` 接口。同步调用与 `searchBatch()` 的 Promise 拒绝采用同一映射；JS 错误对象在事件循环线程上创建。
+`QueueFull` 错误包含 `resource`、`requested`、`used`、`limit` 字段，TypeScript 对应 `ResourceBudgetError` 接口。同步调用和 `searchBatch()`、`searchIdsBatch()` 的 Promise 拒绝使用相同字段。JS 错误对象在事件循环线程上创建。
 
 ---
 
 ## 实例诊断与可用额度
+
+`index_memory_stats().persisted_bytes` 返回最近一次成功发布的 `.idx` 文件长度，包含文件头、各索引段和对齐填充；打开已有数据库时按磁盘文件长度初始化。`mapped_bytes` 统计当前映射的字节，Rom 和 Mmap 可对同一磁盘索引报告不同的映射量。
 
 | Rust | Python | Node.js | 范围 |
 | --- | --- | --- | --- |

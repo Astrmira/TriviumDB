@@ -18,7 +18,7 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
             let mt = read_or_recover(&self.memtable);
             let request_bytes =
                 crate::storage::payload_store::serialized_json_len(query)?.saturating_mul(32);
-            let mut workspace = self.resource_runtime.reserve_workspace(0)?;
+            let mut workspace = mt.reserve_instance_workspace(0)?;
             reserve(&mt, self.memory_limit, &mut workspace, request_bytes)?;
             let mut sources = BTreeMap::<NodeId, Vec<&DocumentContextSeed>>::new();
             for seed in &query.seeds {
@@ -122,6 +122,23 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
                     )?;
                     keys.push(key.clone());
                 }
+                // 合并后的窗口依起点有序，一次扫描即可取得本修订的全部行列位置。
+                let base = base.saturating_add(expanded.ranges.len().saturating_mul(256));
+                reserve(
+                    &mt,
+                    self.memory_limit,
+                    &mut workspace,
+                    base.saturating_add(returned.saturating_mul(4)),
+                )?;
+                let boundaries: Vec<_> = expanded
+                    .ranges
+                    .iter()
+                    .flat_map(|&(start, end)| [start, end])
+                    .collect();
+                let locations = crate::error::QuerySpan::at_many(&snapshot.content, &boundaries)?
+                    .into_iter()
+                    .map(|span| (span.start_byte, span))
+                    .collect::<BTreeMap<_, _>>();
                 let mut windows = Vec::new();
                 for (start, end) in expanded.ranges {
                     returned = returned.saturating_add(evidence_charge(&snapshot, start, end)?);
@@ -136,8 +153,13 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
                         &mut workspace,
                         base.saturating_add(returned.saturating_mul(4)),
                     )?;
-                    windows.push(evidence(&snapshot, start, end)?);
+                    windows.push(evidence_at(&snapshot, start, end, Some(&locations))?);
                 }
+                snapshot.locate_source_spans(
+                    windows
+                        .iter_mut()
+                        .flat_map(|window| window.source_spans.iter_mut()),
+                )?;
                 result.push(DocumentContext {
                     document_id: id,
                     revision: snapshot.revision,

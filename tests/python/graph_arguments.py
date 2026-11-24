@@ -4,7 +4,7 @@ import json
 import threading
 from pathlib import Path
 import triviumdb
-from query_arguments import check_input_error
+from input_errors import check_input_error
 
 
 def run_graph_arguments(root):

@@ -844,6 +844,7 @@ impl<T: VectorType + Serialize + serde::de::DeserializeOwned> Database<T> {
             } => {
                 let mt = super::read_or_recover(&self.memtable);
                 mt.ensure_readable()?;
+                let mut workspace = mt.reserve_instance_workspace(0)?;
                 let path = crate::graph::pathfinding::shortest_path_checked(
                     &*mt,
                     id(&source)?,
@@ -855,7 +856,7 @@ impl<T: VectorType + Serialize + serde::de::DeserializeOwned> Database<T> {
                         if visited.max(examined) > options.max_operations {
                             check_count(visited.max(examined), options.max_operations)?;
                         }
-                        Ok::<_, TriviumError>(())
+                        crate::graph::pathfinding::admit_path_nodes(&mt, &mut workspace, visited)
                     },
                 )?;
                 respond(&json!({"path":path.map(strings)}), false)

@@ -103,9 +103,13 @@ pub struct SearchConfig {
     /// 最终返回数量。
     pub top_k: usize,
     /// 初始召回池大小；0 表示自动取 `max(top_k * 8, 64)`。
+    /// 显式值控制 QuIVer 导航宽度，受 64、候选需求和索引规模约束。
     pub recall_k: usize,
     /// SA-PPR/FISTA/DPP 前的重排池大小；0 表示自动取 `max(top_k * 4, 32)`。
     pub rerank_k: usize,
+    /// QuIVer 内部精排候选数。须为正整数，省略时默认 64。
+    /// 实际预算至少覆盖内层输出数，至多为索引节点数；导航宽度不足时同步扩大。
+    pub ann_rerank_limit: Option<usize>,
     pub expand_depth: usize,
     /// 图扩散允许的边标签；None 表示全部，Some(empty) 表示禁止扩散。
     pub expand_labels: Option<Vec<String>>,
@@ -176,6 +180,7 @@ impl Default for SearchConfig {
             top_k: 5,
             recall_k: 0,
             rerank_k: 0,
+            ann_rerank_limit: None,
             expand_depth: 2,
             expand_labels: None,
             max_edges_per_node: 0,

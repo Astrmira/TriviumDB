@@ -83,7 +83,7 @@ fn matrix<T: VectorType + serde::Serialize + serde::de::DeserializeOwned>(dtype:
             assert_eq!(db.resource_stats().active_tasks, 0);
             assert_eq!(
                 maintenance::facts(&db),
-                maintenance::expected(false, json!([]))
+                maintenance::expected::<T>(false, json!([]))
             );
         }
         let database = Arc::new(Mutex::new(db));
@@ -129,7 +129,7 @@ fn matrix<T: VectorType + serde::Serialize + serde::de::DeserializeOwned>(dtype:
                 assert_eq!(core.resource_stats().active_tasks, 0);
                 assert_eq!(
                     maintenance::facts(&core),
-                    maintenance::expected(false, json!([]))
+                    maintenance::expected::<T>(false, json!([]))
                 );
             }
         }
@@ -138,7 +138,7 @@ fn matrix<T: VectorType + serde::Serialize + serde::de::DeserializeOwned>(dtype:
         let mut reopened = Database::<T>::open_with_runtime(&path, config, runtime).unwrap();
         assert_eq!(
             maintenance::facts(&reopened),
-            maintenance::expected(false, json!([]))
+            maintenance::expected::<T>(false, json!([]))
         );
         reopened.flush().unwrap();
         reopened.close().unwrap();

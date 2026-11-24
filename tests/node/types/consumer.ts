@@ -1,7 +1,7 @@
 import {
   TriviumDB, ResourceRuntime, ConsoleSession, RequestContext, verifySnapshot, restoreSnapshot, type TriviumDBOptions, type TransactionOperation,
   type JsSearchHit, type PreparedTql, type ShutdownStatus, type StorageInfo,
-  type JsEdge, type JsIncomingEdge, type JsNodeView,
+  type QueryRow, type QueryNode, type JsEdge, type JsIncomingEdge, type JsNodeView,
   type TriviumDBError, type ResourceBudgetError, type ErrorInteger, type DType, type WriteErrorInfo, type ResourceFailure,
 } from 'triviumdb';
 
@@ -9,9 +9,19 @@ function check(condition: boolean, message: string): asserts condition {
   if (!condition) throw new Error(message);
 }
 
+function isQueryNode(value: QueryRow[string]): value is QueryNode {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    && 'id' in value && typeof value.id === 'string' && 'payload' in value
+    && 'numEdges' in value && typeof value.numEdges === 'number';
+}
+
 export function inspectRequestContext(database: TriviumDB): void {
   const exactHits: JsSearchHit[] = database.search([1, 0], 5, 0, undefined, undefined, true);
-  const exactAdvanced: JsSearchHit[] = database.searchAdvanced([1, 0], { exact: true });
+  const exactAdvanced: JsSearchHit[] = database.searchAdvanced([1, 0], { exact: true, annRerankLimit: 128 });
+  const ids: number[] = database.searchIds([1, 0], { annRerankLimit: 128 });
+  const batchIds: Promise<number[][]> = database.searchIdsBatch([[1, 0]]);
+  void ids;
+  void batchIds;
   const exactBatch: Promise<JsSearchHit[][]> = database.searchBatch([[1, 0]], 5, 1, undefined, true);
   void [exactHits, exactAdvanced, exactBatch];
   // @ts-expect-error 精确开关使用布尔值。
@@ -27,6 +37,8 @@ export function inspectRequestContext(database: TriviumDB): void {
   // @ts-expect-error Hook 命中的 ID 使用十进制字符串。
   database.setHook({ onCustomRecall: () => [{ id: 1, score: 1 }] });
   const context = new RequestContext('typed-request', 0);
+  // @ts-expect-error 任意 TQL 列可包含标量，使用节点字段前需要缩窄类型。
+  database.tql('MATCH (n) RETURN n')[0].n.id;
   const identity: string = context.requestId;
   const node: JsNodeView | null = context.run(() => database.get(7));
   const asynchronous: Promise<JsSearchHit[][]> = context.run(async () => database.searchBatch([[1, 0]]));
@@ -284,7 +296,7 @@ export async function exercise(file: string): Promise<void> {
   console.detach();
   try {
     const operations: TransactionOperation[] = [
-      { type: 'insertWithId', id: 11, vector: [1, 0], payload: { kind: 'primary' } },
+      { type: 'insertWithId', id: 11, vector: [1, 0], payload: { wide: 9007199254740993n, kind: 'primary' } },
       { type: 'insertWithId', id: 22, vector: [0, 1], payload: { kind: 'neighbor' } },
     ];
     const inserted: number[] = db.commitTransaction(operations);
@@ -296,9 +308,16 @@ export async function exercise(file: string): Promise<void> {
     check(JSON.stringify(incomingMetadata) === '{"note":"typed-metadata"}', '入边元数据与样例不符');
     db.createIndex('kind');
     db.rebuildTextIndex([{ id: 11, text: 'primarytoken', keywords: ['primaryalias'] }]);
-    const prepared: PreparedTql = db.prepareTql('FIND {kind: "primary"} AS n WITH n RETURN n, $label AS label');
+    const prepared: PreparedTql = db.prepareTql('FIND {kind: "primary"} AS n WITH n RETURN n, n.wide AS wide, $label AS label');
     const rows = db.executePreparedTql(prepared, { label: 'verified' });
-    check(rows.length === 1 && rows[0].n.id === '11' && rows[0].n.payload.kind === 'primary' && rows[0].label === 'verified',
+    const wide = db.prepareTql('MATCH (n {id:11}) WHERE $id == 9007199254740993 RETURN n.id AS id');
+    const wideRows = db.executePreparedTql(wide, { id: BigInt('9007199254740993') });
+    check(wideRows.length === 1 && wideRows[0].id === 11, 'Prepared TQL 大整数绑定未命中');
+    check(rows.length === 1 && isQueryNode(rows[0].n), '查询应返回单个节点投影');
+    const projected = rows[0].n;
+    check(projected.id === '11' && typeof projected.payload === 'object' && projected.payload !== null
+      && !Array.isArray(projected.payload) && projected.payload.kind === 'primary' && projected.payload.wide === 9007199254740993n
+      && rows[0].wide === '9007199254740993' && rows[0].label === 'verified',
       'Prepared TQL 的节点 ID 或 Payload 与独立样例不符');
     const hits: JsSearchHit[] = db.searchExact([1, 0], 2);
     check(hits.length === 2, '精确向量查询必须返回两个样例节点');
@@ -321,7 +340,7 @@ export async function exercise(file: string): Promise<void> {
       const node = reader.get<{ kind: string }>(11);
       check(node !== null && node.id === 11 && node.payload.kind === 'primary', '持久化节点内容不符');
       const text = reader.tql('TEXT AC "primaryalias" TOP 10 AS hits WITH hits RETURN hits');
-      check(text.length === 1 && text[0].hits.id === '11', '持久化关键词关联到错误节点');
+      check(text.length === 1 && isQueryNode(text[0].hits) && text[0].hits.id === '11', '持久化关键词关联到错误节点');
     } finally {
       reader.close();
     }
@@ -398,6 +417,9 @@ export function rejectedInputs(db: TriviumDB): void {
   db.searchWithContext([1, 0], { recallK: '1' });
   // @ts-expect-error 高级配置中的边数量必须为数值。
   db.searchAdvanced([1, 0], { maxEdgesPerNode: '1' });
+  db.searchHybrid([1, 0], 'term', 2, 0, 0, 0.5, null, false, 32);
+  // @ts-expect-error 精排候选上限必须为数值。
+  db.searchHybrid([1, 0], 'term', 2, 0, 0, 0.5, null, false, '32');
   // @ts-expect-error 混合检索文本必须为字符串。
   db.searchHybrid([1, 0], 1);
   // @ts-expect-error 查询文本必须为字符串。

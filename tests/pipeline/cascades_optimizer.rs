@@ -617,3 +617,112 @@ fn pipeline默认不采集指标且显式profile可采集() {
     assert_eq!(profiled.metrics.len(), 1);
     assert_eq!(profiled.metrics[0].output_rows, 3);
 }
+
+#[test]
+fn 最终标量投影在独立阶段登记真实的Payload读取() {
+    let mut mt = MemTable::<f32>::new(1);
+    mt.insert_with_id(1, &[1.], json!({"label":"目标"}))
+        .unwrap();
+    let query =
+        parse_tql("EXPLAIN ANALYZE SEARCH VECTOR [1] TOP 1 AS n WITH n RETURN n.label AS label")
+            .unwrap();
+    let plan = execute_tql(&query, &mt).unwrap();
+    let stages = plan[0]["plan"].payload["pipeline_stage_actuals"]
+        .as_array()
+        .unwrap();
+    let projection = stages.last().unwrap();
+    assert_eq!(projection["operator"], "return");
+    assert_eq!(projection["actual_rows"], 1);
+    assert_eq!(projection["payload_lookups"], 1);
+}
+
+#[test]
+fn 文本召回按所选倒排索引准入并合并共享命中() {
+    use triviumdb::query::pipeline::TextSearchSource;
+    let mut mt = graph();
+    mt.index_text(7, "alpha");
+    mt.index_keyword(7, "alpha");
+    let source = |bm25, ac| TextSearchSource {
+        query: "alpha".into(),
+        top_k: 1,
+        k1: 1.2,
+        b: 0.75,
+        ac_weight: 2.,
+        include_bm25: bm25,
+        include_ac: ac,
+    };
+    let budget = PipelineBudget {
+        max_nodes: 2,
+        ..Default::default()
+    };
+    for (bm25, ac, expected) in [
+        (true, false, (4f64 / 3.).ln()),
+        (false, true, 2.),
+        (true, true, 2. + (4f64 / 3.).ln()),
+    ] {
+        let mut context = PipelineContext::new(&mt, budget);
+        let result = execute_pipeline(&mut context, &[Box::new(source(bm25, ac))]).unwrap();
+        assert_eq!(result.len(), 1);
+        let row = &result.rows()[0];
+        assert_eq!(row.id, 7);
+        assert!((row.text_score.as_ref().unwrap().value - expected).abs() < 1e-6);
+    }
+    mt.index_text(8, "alpha");
+    mt.index_keyword(9, "alpha");
+    let mut context = PipelineContext::new(&mt, budget);
+    assert_eq!(
+        execute_pipeline(&mut context, &[Box::new(source(true, true))])
+            .unwrap_err()
+            .code(),
+        "TDB_QUERY_BUDGET"
+    );
+}
+
+#[test]
+fn 孤立起点占用匹配步数而文本入口只按索引规模准入() {
+    // 公开 MATCH 步数上限恰为十万，最后一个无边节点使遍历超额。
+    let mut mt = MemTable::<f32>::new(1);
+    for id in 1..=100_000 {
+        mt.raw_insert(id, &[1.], serde_json::Value::Null).unwrap();
+    }
+    let edge_query = parse_tql("MATCH (a)-[e]->(b) RETURN e.label").unwrap();
+    assert!(execute_tql_values(&edge_query, &mt).unwrap().is_empty());
+    mt.raw_insert(100_001, &[1.], serde_json::Value::Null)
+        .unwrap();
+    assert_eq!(
+        execute_tql_values(&edge_query, &mt).unwrap_err().code(),
+        "TDB_QUERY_EXECUTION"
+    );
+    mt.index_text(100_001, "needle");
+    let text_query = parse_tql("TEXT BM25 'needle' TOP 1 AS n WITH n RETURN n.id AS id").unwrap();
+    let rows = execute_tql_values(&text_query, &mt).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(
+        rows[0]["id"],
+        triviumdb::query::tql_executor::TqlValue::Int(100_001)
+    ));
+}
+
+#[test]
+fn 列对统计从复合键得到各列基数及实际行数() {
+    let mut mt = MemTable::new(1);
+    for (id, a, b) in [(1, "x", 1), (2, "x", 1), (3, "x", 2), (4, "y", 2)] {
+        mt.insert_with_id(id, &[1f32], json!({"a":a,"b":b}))
+            .unwrap();
+    }
+    mt.register_composite_property_index(&["b".into(), "a".into()]);
+    let stats = mt.column_pair_stats();
+    assert_eq!(stats.len(), 1);
+    let pair = &stats[0];
+    assert_eq!(
+        (
+            pair.left_field.as_str(),
+            pair.right_field.as_str(),
+            pair.left_distinct,
+            pair.right_distinct,
+            pair.joint_distinct,
+            pair.sampled_rows
+        ),
+        ("b", "a", 2, 2, 3, 4)
+    );
+}

@@ -1,25 +1,10 @@
+use super::canonical::{CanonicalValue, canonicalize_rows};
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use triviumdb::database::Database;
-use triviumdb::query::tql_executor::TqlValue;
 use triviumdb::query::tql_prepared::TqlParamValue;
 
 use crate::support;
-
-fn canonical(rows: Vec<HashMap<String, TqlValue<f32>>>) -> Vec<u64> {
-    let mut output = rows
-        .into_iter()
-        .map(|row| {
-            row.values()
-                .find_map(|value| match value {
-                    TqlValue::Node(node) => Some(node.id),
-                    _ => None,
-                })
-                .expect("查询行必须包含节点")
-        })
-        .collect::<Vec<_>>();
-    output.sort_unstable();
-    output
-}
 
 #[test]
 fn Prepared与Direct在多组参数下逐行一致() {
@@ -52,11 +37,38 @@ fn Prepared与Direct在多组参数下逐行一致() {
         let actual = database
             .execute_prepared_tql(&prepared, &parameters)
             .unwrap();
-        assert_eq!(canonical(actual), canonical(direct));
+        let mut expected = (1..=24i64)
+            .filter(|rank| (min..=max).contains(rank))
+            .map(|rank| {
+                let node = CanonicalValue::Node {
+                    id: rank as u64,
+                    vector: [rank as f32, 1.].map(f32::to_bits).to_vec(),
+                    payload: Box::new(CanonicalValue::Object(BTreeMap::from([(
+                        "rank".into(),
+                        CanonicalValue::Integer(rank),
+                    )]))),
+                    edges: Vec::new(),
+                };
+                BTreeMap::from([
+                    ("node".into(), node),
+                    ("rank".into(), CanonicalValue::Integer(rank)),
+                ])
+            })
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(
+            canonicalize_rows(actual, false),
+            expected,
+            "Prepared: {min}..={max}"
+        );
+        assert_eq!(
+            canonicalize_rows(direct, false),
+            expected,
+            "Direct: {min}..={max}"
+        );
     }
-    assert!(
-        database
-            .execute_prepared_tql(&prepared, &HashMap::new())
-            .is_err()
-    );
+    let missing = database
+        .execute_prepared_tql(&prepared, &HashMap::new())
+        .unwrap_err();
+    assert_eq!(missing.code(), "TDB_MISSING_QUERY_PARAMETER");
 }

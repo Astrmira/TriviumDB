@@ -174,6 +174,19 @@ impl VersionSnapshot {
         format!("\"{}-g{}\"", self.epoch, self.generation)
     }
 
+    pub fn node_representation_etag(&self, node_tag: &str) -> String {
+        format!("{}-g{}\"", node_tag.trim_end_matches('"'), self.generation)
+    }
+
+    fn matches_node_version(&self, expected: &str, node_tag: &str) -> bool {
+        expected == node_tag
+            || expected
+                .strip_prefix(node_tag.trim_end_matches('"'))
+                .and_then(|tail| tail.strip_prefix("-g"))
+                .and_then(|tail| tail.strip_suffix('"'))
+                .and_then(|digits| digits.parse::<u64>().ok())
+                .is_some_and(|generation| generation <= self.generation)
+    }
     pub fn node_etag(&self, id: u64, version: u64) -> String {
         format!(
             "\"{}-f{}-n{}-v{}\"",
@@ -730,20 +743,36 @@ impl EngineHandle {
         &self,
         ids: Vec<u64>,
         deadline: Instant,
-    ) -> Result<(Vec<NodeView<f32>>, VersionSnapshot), ApiError> {
+    ) -> Result<(Vec<u8>, VersionSnapshot), ApiError> {
         let versions = self.inner.versions.clone();
         let control = QueryControl::with_deadline(deadline);
         self.run_read(deadline, control.clone(), move |database| {
-            let mut nodes = Vec::with_capacity(ids.len());
+            // 逐节点编码，重复请求同一大节点时也只保留一个解码副本。
+            let mut body = crate::BoundedBody::new(crate::MAX_RESPONSE_BYTES);
+            body.append(br#"{"nodes":["#)?;
+            let mut first = true;
+            let mut missing = Vec::new();
             for (index, id) in ids.into_iter().enumerate() {
                 if index & 0xff == 0 {
                     control.check().map_err(ApiError::from)?;
                 }
                 if let Some(node) = database.get(id).map_err(ApiError::from)? {
-                    nodes.push(node);
+                    if !first {
+                        body.append(b",")?;
+                    }
+                    body.json(&crate::protocol::WireNode(&node))?;
+                    first = false;
+                } else {
+                    missing.push(id.to_string());
                 }
             }
-            Ok((nodes, lock_or_recover(&versions).snapshot()))
+            let version = lock_or_recover(&versions).snapshot();
+            body.append(br#"],"missingIds":"#)?;
+            body.json(&missing)?;
+            body.append(br#","generation":"#)?;
+            body.json(&version.global_etag())?;
+            body.append(b"}")?;
+            Ok((body.bytes, version))
         })
         .await
     }
@@ -767,10 +796,12 @@ impl EngineHandle {
         .await
     }
 
-    pub async fn reachable(
+    pub async fn shortest_path(
         &self,
         id: u64,
-        config: ReachabilityConfig,
+        target: u64,
+        max_depth: usize,
+        label: Option<String>,
         deadline: Instant,
     ) -> Result<(ReachabilityOutput, VersionSnapshot), ApiError> {
         let versions = self.inner.versions.clone();
@@ -778,7 +809,7 @@ impl EngineHandle {
         self.run_read(deadline, control.clone(), move |database| {
             control.check().map_err(ApiError::from)?;
             let result = database
-                .reachable_detailed(id, &config)
+                .shortest_path_detailed(id, target, max_depth, label)
                 .map_err(ApiError::from)?;
             control.check().map_err(ApiError::from)?;
             Ok((result, lock_or_recover(&versions).snapshot()))
@@ -1854,7 +1885,11 @@ fn validate_transaction_preconditions(
     for (id, expected) in &request.expected_nodes {
         let current = versions.node_versions.get(id).copied().unwrap_or(0);
         let current_etag = versions.snapshot().node_etag(*id, current);
-        if expected != &current_etag || !database.contains(*id).map_err(ApiError::from)? {
+        if !versions
+            .snapshot()
+            .matches_node_version(expected, &current_etag)
+            || !database.contains(*id).map_err(ApiError::from)?
+        {
             return Err(ApiError::write_conflict(format!(
                 "节点 {id} 版本不匹配：期望 {expected}，当前 {current_etag} (Node {id} version mismatch: expected {expected}, current {current_etag})"
             )));

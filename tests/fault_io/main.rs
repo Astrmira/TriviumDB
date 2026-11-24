@@ -36,3 +36,7 @@ mod wal_failure_state;
 
 #[path = "../support/cleanup.rs"]
 mod cleanup_files;
+
+#[cfg(feature = "test-hooks")]
+#[path = "../support/facts.rs"]
+mod node_facts;

@@ -153,6 +153,7 @@ enum Operation {
     Flush,
     Compact,
     Reopen,
+    CloseReopen,
     TransactionCommit,
     TransactionRollback,
     TransactionRejected {
@@ -236,7 +237,8 @@ fn generate_operation(rng: &mut StdRng, model: &ReferenceDb) -> Operation {
         },
         80..=84 => Operation::Flush,
         85..=88 => Operation::Compact,
-        89..=92 => Operation::Reopen,
+        89..=90 => Operation::Reopen,
+        91..=92 => Operation::CloseReopen,
         93..=95 => Operation::TransactionCommit,
         96..=97 => Operation::TransactionRollback,
         _ if !model.nodes.is_empty() => Operation::TransactionRejected {
@@ -244,6 +246,11 @@ fn generate_operation(rng: &mut StdRng, model: &ReferenceDb) -> Operation {
         },
         _ => Operation::TransactionRollback,
     }
+}
+
+fn assert_write(result: triviumdb::Result<()>, expected_ok: bool, rejection: &str) {
+    let expected = if expected_ok { Ok(()) } else { Err(rejection) };
+    assert_eq!(result.map_err(|error| error.code()), expected);
 }
 
 fn apply_operation(operation: &Operation, db: &mut Database<f32>, model: &mut ReferenceDb) {
@@ -259,7 +266,7 @@ fn apply_operation(operation: &Operation, db: &mut Database<f32>, model: &mut Re
         } => {
             let expected = model.insert_with_id(*id, vector.clone(), payload.clone());
             let actual = db.insert_with_id(*id, vector, payload.clone());
-            assert_eq!(actual.is_ok(), expected);
+            assert_write(actual, expected, "TDB_NODE_ALREADY_EXISTS");
         }
         Operation::UpdatePayload { id, payload } => {
             let expected = if let Some(node) = model.nodes.get_mut(id) {
@@ -268,7 +275,11 @@ fn apply_operation(operation: &Operation, db: &mut Database<f32>, model: &mut Re
             } else {
                 false
             };
-            assert_eq!(db.update_payload(*id, payload.clone()).is_ok(), expected);
+            assert_write(
+                db.update_payload(*id, payload.clone()),
+                expected,
+                "TDB_NODE_NOT_FOUND",
+            );
         }
         Operation::UpdateVector { id, vector } => {
             let expected = if let Some(node) = model.nodes.get_mut(id) {
@@ -277,11 +288,15 @@ fn apply_operation(operation: &Operation, db: &mut Database<f32>, model: &mut Re
             } else {
                 false
             };
-            assert_eq!(db.update_vector(*id, vector).is_ok(), expected);
+            assert_write(
+                db.update_vector(*id, vector),
+                expected,
+                "TDB_NODE_NOT_FOUND",
+            );
         }
         Operation::Delete { id } => {
             let expected = model.delete(*id);
-            assert_eq!(db.delete(*id).is_ok(), expected);
+            assert_write(db.delete(*id), expected, "TDB_NODE_NOT_FOUND");
         }
         Operation::Link {
             source,
@@ -290,7 +305,11 @@ fn apply_operation(operation: &Operation, db: &mut Database<f32>, model: &mut Re
             weight,
         } => {
             let expected = model.link(*source, *target, label, *weight);
-            assert_eq!(db.link(*source, *target, label, *weight).is_ok(), expected);
+            assert_write(
+                db.link(*source, *target, label, *weight),
+                expected,
+                "TDB_NODE_NOT_FOUND",
+            );
         }
         Operation::UnlinkLabel {
             source,
@@ -298,7 +317,11 @@ fn apply_operation(operation: &Operation, db: &mut Database<f32>, model: &mut Re
             label,
         } => {
             let expected = model.unlink_label(*source, *target, label);
-            assert_eq!(db.unlink_label(*source, *target, label).is_ok(), expected);
+            assert_write(
+                db.unlink_label(*source, *target, label),
+                expected,
+                "TDB_NODE_NOT_FOUND",
+            );
         }
         Operation::CreateIndex { field } => {
             db.create_index(field).unwrap();
@@ -310,7 +333,7 @@ fn apply_operation(operation: &Operation, db: &mut Database<f32>, model: &mut Re
         }
         Operation::Flush => db.flush().unwrap(),
         Operation::Compact => db.compact().unwrap(),
-        Operation::Reopen => {}
+        Operation::Reopen | Operation::CloseReopen => {}
         Operation::TransactionCommit => {
             let first_payload = payload_for(model.next_id.saturating_add(100));
             let second_payload = payload_for(model.next_id.saturating_add(101));
@@ -341,7 +364,7 @@ fn apply_operation(operation: &Operation, db: &mut Database<f32>, model: &mut Re
             let mut tx = db.begin_tx();
             tx.update_payload(*duplicate_id, payload_for(7_777));
             tx.insert_with_id(*duplicate_id, &vector_for(7_777), payload_for(7_777));
-            assert!(tx.commit().is_err(), "非法事务必须整体拒绝");
+            assert_eq!(tx.commit().unwrap_err().code(), "TDB_NODE_ALREADY_EXISTS");
             assert_eq!(
                 db.all_node_ids().unwrap(),
                 before_ids,
@@ -375,6 +398,11 @@ fn canonical_edges(db: &Database<f32>) -> BTreeSet<ReferenceEdge> {
 }
 
 fn assert_matches_model(db: &Database<f32>, model: &ReferenceDb, context: &str) {
+    assert_eq!(
+        db.list_indexes().unwrap(),
+        model.indexes.iter().cloned().collect::<Vec<_>>(),
+        "{context}: 索引清单不一致"
+    );
     let actual_ids = db
         .all_node_ids()
         .unwrap()
@@ -474,6 +502,7 @@ fn run_state_machine(seed: u64, mode: StorageMode) {
     };
     let mut db = Database::<f32>::open_with_config(&path, config).unwrap();
     let mut model = ReferenceDb::new();
+    let mut published_indexes = BTreeSet::new();
     let mut rng = StdRng::seed_from_u64(seed);
     let mut history = Vec::new();
 
@@ -481,9 +510,21 @@ fn run_state_machine(seed: u64, mode: StorageMode) {
         let operation = generate_operation(&mut rng, &model);
         history.push(operation.clone());
         apply_operation(&operation, &mut db, &mut model);
-        if matches!(operation, Operation::Reopen) {
-            drop(db);
-            db = Database::<f32>::open_with_config(&path, config).unwrap();
+        match operation {
+            Operation::Flush | Operation::Compact => published_indexes.clone_from(&model.indexes),
+            Operation::CloseReopen => {
+                db.close().unwrap();
+                published_indexes.clone_from(&model.indexes);
+                drop(db);
+                db = Database::<f32>::open_with_config(&path, config).unwrap();
+            }
+            Operation::Reopen => {
+                // 普通索引定义随检查点发布；析构只排空 WAL 写缓冲。
+                drop(db);
+                db = Database::<f32>::open_with_config(&path, config).unwrap();
+                model.indexes.clone_from(&published_indexes);
+            }
+            _ => {}
         }
         let context = format!(
             "seed={seed:#x}, mode={mode:?}, step={step}, operation={operation:?}, history={history:?}"

@@ -6,7 +6,6 @@
 //! - 图谱极度自环与重边
 //! - 狂暴随机写入后的图谱与数据一致性验证
 
-use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use triviumdb::database::Database;
 
@@ -27,73 +26,62 @@ fn cleanup(path: &str) {
 // ════════ 1. 物理并发安全性测试 ════════
 
 #[test]
-fn 测试_并发读写安全_单写多读互不恐慌() {
-    let path = tmp_db("concurrent_rw");
-    cleanup(&path);
-
-    let db = Arc::new(Mutex::new(Database::<f32>::open(&path, DIM).unwrap()));
-
-    // 初始化基座
-    let id_base = db
-        .lock()
-        .unwrap()
-        .insert(&[1.0, 1.0, 1.0, 1.0], serde_json::json!({"init": true}))
+fn 测试_共享读者验证已确认写入并在释放后允许压实() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("readers.tdb");
+    let path = file.to_str().unwrap();
+    let db = triviumdb::SharedDatabase::<f32>::open(path, DIM).unwrap();
+    let sentinel = db
+        .try_write(|db| db.insert(&[1.; DIM], serde_json::json!({"init":true})))
         .unwrap();
-
-    let mut handles = vec![];
-    let barrier = Arc::new(Barrier::new(6)); // 1 写 + 5 读
-
-    // Spawn 5 Reader threads
-    for _ in 0..5 {
-        let db_clone = db.clone();
-        let b_clone = barrier.clone();
-        handles.push(thread::spawn(move || {
-            b_clone.wait(); // 对齐起跑线
-            let mut reads = 0;
-            // 疯狂读取
-            for _ in 0..1_000 {
-                let lock = db_clone.lock().unwrap();
-                let _ = lock.get(id_base);
-                let _ = lock.search(&[1.0, 1.0, 1.0, 1.0], 5, 0, 0.0);
-                drop(lock);
-                reads += 1;
-            }
-            reads
-        }));
-    }
-
-    // Spawn 1 Writer thread
-    let db_write = db.clone();
-    let b_write = barrier.clone();
-    let writer_handle = thread::spawn(move || {
-        b_write.wait(); // 对齐起跑线
-        let mut writes = 0;
-        for j in 0..500 {
-            let mut lock = db_write.lock().unwrap();
-            let _ = lock.insert(&[j as f32, 0.0, 0.0, 0.0], serde_json::json!({"seq": j}));
-            if j % 50 == 0 {
-                // 定期触发自动压缩重组（最危险的系统底层锁竞争区域）
-                lock.compact().unwrap();
-            }
-            drop(lock);
-            writes += 1;
+    let mut last = None;
+    for batch in 0..=10 {
+        // 外层读租约持有至子线程退出，写入竞争与读者重叠由作用域保证。
+        db.try_read(|_| {
+            thread::scope(|scope| {
+                for _ in 0..5 {
+                    scope.spawn(|| {
+                        db.try_read(|db| {
+                            let node = db.get(sentinel)?.unwrap();
+                            assert_eq!(node.vector, [1.; DIM]);
+                            assert_eq!(node.payload, serde_json::json!({"init":true}));
+                            let hits = db.search(&[1.; DIM], 1, 0, 0.)?;
+                            assert_eq!(hits.len(), 1);
+                            assert_eq!(hits[0].id, sentinel);
+                            if let Some((id, seq)) = last {
+                                assert_eq!(
+                                    db.get_payload(id)?,
+                                    Some(serde_json::json!({"seq":seq}))
+                                );
+                            }
+                            assert_eq!(db.node_count()?, 1 + 50 * batch);
+                            Ok(())
+                        })
+                        .unwrap()
+                    });
+                }
+                scope.spawn(|| {
+                    assert_eq!(
+                        db.try_write(|db| db.compact()).unwrap_err().code(),
+                        "TDB_BUSY"
+                    );
+                });
+            });
+            Ok(())
+        })
+        .unwrap();
+        if batch < 10 {
+            db.try_write(|db| {
+                for seq in batch * 50..(batch + 1) * 50 {
+                    let id =
+                        db.insert(&[seq as f32, 0., 0., 0.], serde_json::json!({"seq":seq}))?;
+                    last = Some((id, seq));
+                }
+                db.compact()
+            })
+            .unwrap();
         }
-        writes
-    });
-
-    // 等待所有线程完成
-    for h in handles {
-        h.join().unwrap();
     }
-    writer_handle.join().unwrap();
-
-    assert_eq!(
-        db.lock().unwrap().node_count().unwrap(),
-        501,
-        "高速并发读写混合后，节点数量应完全正确且无丢失"
-    );
-
-    cleanup(&path);
 }
 
 // ════════ 2. 病态数学边界测试 ════════

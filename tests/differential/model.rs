@@ -55,15 +55,32 @@ impl RefDatabase {
 pub enum RefScalar {
     Null,
     Bool(bool),
-    Integer(i64),
+    Integer(i128),
+    Float(u64),
     String(String),
+}
+
+// JSON 整数在 i64 至 u64 的范围内，先比较浮点数的整数部分，再比较剩余小数。
+pub fn compare_integer_float(integer: i128, float: f64) -> std::cmp::Ordering {
+    assert!(float.is_finite());
+    integer
+        .cmp(&(float as i128))
+        .then_with(|| 0.0f64.partial_cmp(&float.fract()).unwrap())
 }
 
 impl RefScalar {
     pub fn from_json(value: Option<&Value>) -> Self {
         match value {
             Some(Value::Bool(value)) => Self::Bool(*value),
-            Some(Value::Number(value)) => value.as_i64().map_or(Self::Null, Self::Integer),
+            Some(Value::Number(value)) => {
+                if let Some(n) = value.as_i64() {
+                    Self::Integer(n.into())
+                } else if let Some(n) = value.as_u64() {
+                    Self::Integer(n.into())
+                } else {
+                    Self::Float(value.as_f64().unwrap().to_bits())
+                }
+            }
             Some(Value::String(value)) => Self::String(value.clone()),
             _ => Self::Null,
         }

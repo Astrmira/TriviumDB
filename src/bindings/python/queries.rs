@@ -1,7 +1,7 @@
 //! TQL、Prepared 参数与查询结果的语言适配。
 
 use super::arguments::{extract_argument, extract_management_argument};
-use super::database::{DbBackend, PyTriviumDB, database_read, database_write};
+use super::database::{PyTriviumDB, database_read, database_write};
 use super::errors::{argument_input_error, attach_error_info, to_py_error, write_admission_error};
 use super::json::{json_to_pyobject, pyobject_to_json};
 use super::types::PyQueryRow;
@@ -64,32 +64,76 @@ fn collect_prepared_parameters(
     Ok(values)
 }
 
-fn tql_row_to_json<T: crate::VectorType>(
-    row: std::collections::HashMap<String, crate::query::tql_executor::TqlValue<T>>,
-) -> serde_json::Value {
+fn convert_rows<T: crate::VectorType>(
+    py: Python<'_>,
+    rows: crate::query::tql_executor::TqlValueResult<T>,
+) -> PyResult<Vec<PyQueryRow>> {
     use crate::query::tql_executor::TqlValue;
-    let mut output = serde_json::Map::new();
-    for (name, value) in row {
-        let value = match value {
-            TqlValue::Node(node) => serde_json::json!({
-                "id": node.id,
-                "payload": node.payload,
-                "num_edges": node.edges.len(),
-            }),
-            TqlValue::Edge(edge) => edge.query_json(edge.source_id.into(), edge.target_id.into()),
-            TqlValue::Int(value) => serde_json::json!(value),
-            TqlValue::UInt(value) => serde_json::json!(value),
-            TqlValue::Float(value) => serde_json::json!(value),
-            TqlValue::String(value) => serde_json::json!(value),
-            TqlValue::Bool(value) => serde_json::json!(value),
-            TqlValue::Path(value) => serde_json::json!(value),
-            TqlValue::List(value) => serde_json::Value::Array(value),
-            TqlValue::Object(value) => serde_json::Value::Object(value),
-            TqlValue::Null => serde_json::Value::Null,
-        };
-        output.insert(name, value);
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let py_row = PyDict::new(py);
+        for (name, value) in row {
+            match value {
+                TqlValue::Node(node) => {
+                    let node_dict = PyDict::new(py);
+                    node_dict.set_item("id", node.id)?;
+                    node_dict.set_item("payload", json_to_pyobject(py, &node.payload)?)?;
+                    node_dict.set_item("num_edges", node.edges.len())?;
+                    py_row.set_item(name, node_dict)?;
+                }
+                TqlValue::Edge(edge) => {
+                    let edge_dict = PyDict::new(py);
+                    edge_dict.set_item("type", "edge")?;
+                    edge_dict.set_item("source", edge.source_id)?;
+                    if let Some(graph_id) = &edge.graph_id {
+                        edge_dict.set_item("graph_id", graph_id)?;
+                    }
+                    edge_dict.set_item("target", edge.target_id)?;
+                    edge_dict.set_item("label", edge.label)?;
+                    edge_dict.set_item("weight", edge.weight)?;
+                    edge_dict.set_item("metadata", json_to_pyobject(py, &edge.metadata)?)?;
+                    py_row.set_item(name, edge_dict)?;
+                }
+                TqlValue::Int(value) => {
+                    py_row.set_item(name, value)?;
+                }
+                TqlValue::UInt(value) => {
+                    py_row.set_item(name, value)?;
+                }
+                TqlValue::Float(value) => {
+                    py_row.set_item(name, value)?;
+                }
+                TqlValue::String(value) => {
+                    py_row.set_item(name, value)?;
+                }
+                TqlValue::Bool(value) => {
+                    py_row.set_item(name, value)?;
+                }
+                TqlValue::Path(value) => {
+                    py_row.set_item(name, value)?;
+                }
+                TqlValue::List(value) => {
+                    py_row.set_item(
+                        name,
+                        json_to_pyobject(py, &serde_json::Value::Array(value))?,
+                    )?;
+                }
+                TqlValue::Object(value) => {
+                    py_row.set_item(
+                        name,
+                        json_to_pyobject(py, &serde_json::Value::Object(value))?,
+                    )?;
+                }
+                TqlValue::Null => {
+                    py_row.set_item(name, py.None())?;
+                }
+            }
+        }
+        out.push(PyQueryRow {
+            row: py_row.into_any().unbind(),
+        });
     }
-    serde_json::Value::Object(output)
+    Ok(out)
 }
 
 #[pyclass(name = "PreparedTql")]
@@ -132,94 +176,8 @@ impl PyTriviumDB {
         let (_request, borrowed) = database_read(slf)?;
         let this = &*borrowed;
         let query: String = extract_argument(py, &query, "query", None)?;
-        fn convert_rows<T: crate::VectorType>(
-            py: Python<'_>,
-            rows: crate::query::tql_executor::TqlValueResult<T>,
-        ) -> PyResult<Vec<PyQueryRow>> {
-            use crate::query::tql_executor::TqlValue;
-            let mut out = Vec::with_capacity(rows.len());
-            for row in rows {
-                let py_row = PyDict::new(py);
-                for (name, value) in row {
-                    match value {
-                        TqlValue::Node(node) => {
-                            let node_dict = PyDict::new(py);
-                            let _ = node_dict.set_item("id", node.id);
-                            let _ =
-                                node_dict.set_item("payload", json_to_pyobject(py, &node.payload)?);
-                            let _ = node_dict.set_item("num_edges", node.edges.len());
-                            let _ = py_row.set_item(name, node_dict);
-                        }
-                        TqlValue::Edge(edge) => {
-                            let edge_dict = PyDict::new(py);
-                            let _ = edge_dict.set_item("type", "edge");
-                            let _ = edge_dict.set_item("source", edge.source_id);
-                            if let Some(graph_id) = &edge.graph_id {
-                                edge_dict.set_item("graph_id", graph_id)?;
-                            }
-                            let _ = edge_dict.set_item("target", edge.target_id);
-                            let _ = edge_dict.set_item("label", edge.label);
-                            let _ = edge_dict.set_item("weight", edge.weight);
-                            let _ = edge_dict
-                                .set_item("metadata", json_to_pyobject(py, &edge.metadata)?);
-                            let _ = py_row.set_item(name, edge_dict);
-                        }
-                        TqlValue::Int(value) => {
-                            let _ = py_row.set_item(name, value);
-                        }
-                        TqlValue::UInt(value) => {
-                            py_row.set_item(name, value)?;
-                        }
-                        TqlValue::Float(value) => {
-                            let _ = py_row.set_item(name, value);
-                        }
-                        TqlValue::String(value) => {
-                            let _ = py_row.set_item(name, value);
-                        }
-                        TqlValue::Bool(value) => {
-                            let _ = py_row.set_item(name, value);
-                        }
-                        TqlValue::Path(value) => {
-                            let _ = py_row.set_item(name, value);
-                        }
-                        TqlValue::List(value) => {
-                            let _ = py_row.set_item(
-                                name,
-                                json_to_pyobject(py, &serde_json::Value::Array(value))?,
-                            );
-                        }
-                        TqlValue::Object(value) => {
-                            py_row.set_item(
-                                name,
-                                json_to_pyobject(py, &serde_json::Value::Object(value))?,
-                            )?;
-                        }
-                        TqlValue::Null => {
-                            let _ = py_row.set_item(name, py.None());
-                        }
-                    }
-                }
-                out.push(PyQueryRow {
-                    row: py_row.into_any().unbind(),
-                });
-            }
-            Ok(out)
-        }
-
-        match &this.inner {
-            DbBackend::F32(db) => {
-                let rows = py.detach(|| db.tql_values(&query)).map_err(to_py_error)?;
-                convert_rows(py, rows)
-            }
-            DbBackend::F16(db) => {
-                let rows = py.detach(|| db.tql_values(&query)).map_err(to_py_error)?;
-                convert_rows(py, rows)
-            }
-            DbBackend::U64(db) => {
-                let rows = py.detach(|| db.tql_values(&query)).map_err(to_py_error)?;
-                convert_rows(py, rows)
-            }
-        }
+        dispatch!(this, db => py.detach(|| db.tql_values(&query))
+            .map_err(to_py_error).and_then(|rows| convert_rows(py, rows)))
     }
 
     fn prepare_tql(
@@ -248,15 +206,8 @@ impl PyTriviumDB {
             .map_err(|error| argument_input_error(error.into(), "prepared", None))?;
         let values = collect_prepared_parameters(parameters, &prepared.inner)?;
         let plan = &prepared.inner;
-        let rows = dispatch!(this, db => py.detach(|| db.execute_prepared_tql(plan, &values)
-            .map(|rows| rows.into_iter().map(tql_row_to_json).collect::<Vec<_>>())))
-        .map_err(to_py_error)?;
-        rows.into_iter()
-            .map(|row| {
-                let value = json_to_pyobject(py, &row)?;
-                Ok(PyQueryRow { row: value })
-            })
-            .collect()
+        dispatch!(this, db => py.detach(|| db.execute_prepared_tql(plan, &values))
+            .map_err(to_py_error).and_then(|rows| convert_rows(py, rows)))
     }
 
     /// 执行 TQL 写操作（CREATE / SET / DELETE / DETACH DELETE）
@@ -282,10 +233,14 @@ impl PyTriviumDB {
         let query: String = extract_management_argument(py, &query, "query")?;
         let result =
             dispatch!(this, mut db => py.detach(|| db.tql_mut(&query))).map_err(to_py_error)?;
+        let response_error = |err| {
+            super::errors::python_write_error(err, dispatch!(this, db => db.response_write_info()))
+        };
         let dict = PyDict::new(py);
-        let _ = dict.set_item("affected", result.affected);
-        let created: Vec<u64> = result.created_ids;
-        let _ = dict.set_item("created_ids", created);
+        dict.set_item("affected", result.affected)
+            .map_err(response_error)?;
+        dict.set_item("created_ids", result.created_ids)
+            .map_err(response_error)?;
         Ok(dict.into_any().unbind())
     }
 }

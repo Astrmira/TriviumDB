@@ -307,7 +307,7 @@ impl ExecutionContext {
         query: &TqlQuery,
         mt: &MemTable<T>,
         memory: &QueryMemory,
-        workspaces: &[crate::resources::WorkspaceReservation],
+        workspaces: &[crate::resources::RequestWorkspace],
     ) {
         if self.graph.is_some()
             || matches!(
@@ -316,7 +316,7 @@ impl ExecutionContext {
             )
         {
             let bytes = workspaces.iter().fold(
-                mt.estimated_memory_bytes().saturating_add(
+                mt.resident_memory_bytes().saturating_add(
                     self.graph
                         .as_ref()
                         .map_or(0, |graph| graph.reserved_bytes()),
@@ -361,6 +361,9 @@ struct SourcedOperator<T: VectorType> {
 }
 
 impl<T: VectorType> crate::query::pipeline::PipelineOperator<T> for SourcedOperator<T> {
+    fn workspace_rows(&self, mt: &MemTable<T>, input: usize) -> usize {
+        self.inner.workspace_rows(mt, input)
+    }
     fn uses_graph(&self) -> bool {
         self.inner.uses_graph()
     }
@@ -406,6 +409,9 @@ fn requested_row_limit<T: VectorType>(
     limits: &ExecutionContext,
     mt: &MemTable<T>,
 ) -> Result<(usize, bool), TriviumError> {
+    if query.limit == Some(0) {
+        return Ok((0, true));
+    }
     let configured_cap = match limits.max_query_rows {
         Some(0) => usize::MAX,
         Some(value) => value,
@@ -605,14 +611,19 @@ fn execute_tql_context_inner<T: VectorType>(
             && let QueryEntry::Find { filter } = &query.entry
         {
             let ordered = find_ordered_find_plan(query, memtable);
-            let (row_limit, _) = requested_row_limit(
+            let (row_limit, user_limited) = requested_row_limit(
                 query,
                 requires_full_input(query, ordered.is_some()),
                 &limits,
                 memtable,
             )?;
             Some(ordered.unwrap_or_else(|| {
-                plan_find_filter(query, filter, memtable, row_limit.saturating_add(1))
+                plan_find_filter(
+                    query,
+                    filter,
+                    memtable,
+                    row_limit.saturating_add(usize::from(!user_limited)),
+                )
             }))
         } else {
             None
@@ -623,28 +634,14 @@ fn execute_tql_context_inner<T: VectorType>(
             executable.explain = false;
             executable.analyze = false;
             if uses_pipeline(&executable) {
-                let (set, name, aliases, profile, workspaces) =
-                    execute_pipeline_set(&executable, memtable, true, &limits)?;
-                limits.compose_memory(&executable, memtable, &memory, &workspaces);
-                let mut rows = set.into_rows();
-                rows.truncate(admit_input_rows(
+                let (returned, profile) = project_pipeline(
                     &executable,
                     memtable,
                     &limits,
-                    rows.len(),
-                )?);
-                let inputs = rows
-                    .iter()
-                    .map(returning::Input::Pipeline)
-                    .collect::<Vec<_>>();
-                let scope = returning::Scope {
-                    memory: &memory,
-                    query: &executable,
-                    mt: memtable,
-                    limits: &limits,
-                    pipeline: Some((&name, &aliases)),
-                };
-                let returned = returning::finish(&inputs, &scope)?;
+                    &memory,
+                    true,
+                    returning::finish,
+                )?;
                 return Ok(generate_explain_plan(
                     query,
                     memtable,
@@ -678,7 +675,7 @@ fn execute_tql_context_inner<T: VectorType>(
     if let QueryEntry::Match { pattern } | QueryEntry::OptionalMatch { pattern } = &query.entry
         && pattern.edges.iter().any(|edge| edge.var.is_some())
     {
-        let expanded = collect_single_edge_rows(query, pattern, memtable, &limits, &memory)?;
+        let expanded = collect_single_edge_rows(query, pattern, memtable, &limits, &memory, false)?;
         let edge_var = pattern.edges[0].var.as_deref().ok_or_else(|| {
             TriviumError::QueryExecution("缺少边变量 (Missing edge variable)".into())
         })?;
@@ -698,7 +695,7 @@ fn execute_tql_context_inner<T: VectorType>(
         };
         return returning::into_nodes(returning::finish(&inputs, &scope)?, &inputs, &scope);
     }
-    let (results, _) = execute_binding_rows(query, memtable, &limits, &memory)?;
+    let (results, _) = execute_binding_rows(query, memtable, &limits, &memory, false)?;
     let inputs = results
         .iter()
         .map(|row| returning::Input::Nodes(row, None))
@@ -718,8 +715,9 @@ fn execute_binding_rows<T: VectorType>(
     memtable: &MemTable<T>,
     limits: &ExecutionContext,
     memory: &QueryMemory,
+    values_only: bool,
 ) -> Result<(TqlResult<T>, bool), TriviumError> {
-    execute_binding_rows_inner(query, memtable, limits, memory)
+    execute_binding_rows_inner(query, memtable, limits, memory, values_only)
         .map_err(|error| limits.error(error, QueryErrorStage::Execute, SourceSelector::Entry))
 }
 
@@ -728,6 +726,7 @@ fn execute_binding_rows_inner<T: VectorType>(
     memtable: &MemTable<T>,
     limits: &ExecutionContext,
     memory: &QueryMemory,
+    values_only: bool,
 ) -> Result<(TqlResult<T>, bool), TriviumError> {
     let ordered_find = matches!(
         &query.entry,
@@ -736,7 +735,7 @@ fn execute_binding_rows_inner<T: VectorType>(
     let requires_full_input = requires_full_input(query, ordered_find);
     let (row_limit, user_limited) =
         requested_row_limit(query, requires_full_input, limits, memtable)?;
-    let scan_limit = row_limit.saturating_add(1);
+    let scan_limit = row_limit.saturating_add(usize::from(!user_limited));
 
     let mut snapshot_query = query.clone();
     if matches!(
@@ -757,6 +756,7 @@ fn execute_binding_rows_inner<T: VectorType>(
             scan_limit,
             limits.query_control.as_ref(),
             memory,
+            values_only,
         )?,
         QueryEntry::Match { pattern } => (
             execute_match(
@@ -852,6 +852,7 @@ fn test_parallelism_budget() -> crate::query::parallel::QueryParallelismBudget {
 struct PipelineExecutionProfile {
     plan: crate::query::cascades::CascadesPlan,
     metrics: Vec<crate::query::pipeline::PipelineStageMetrics>,
+    return_actuals: Option<serde_json::Value>,
 }
 
 type PipelineSetResult = (
@@ -859,7 +860,8 @@ type PipelineSetResult = (
     String,
     std::collections::BTreeSet<String>,
     Option<PipelineExecutionProfile>,
-    Vec<crate::resources::WorkspaceReservation>,
+    Arc<crate::request::PayloadMeter>,
+    Vec<crate::resources::RequestWorkspace>,
 );
 
 fn uses_pipeline(query: &TqlQuery) -> bool {
@@ -1719,8 +1721,63 @@ fn execute_pipeline_set<T: VectorType>(
     let execution_profile = profile.then_some(PipelineExecutionProfile {
         plan,
         metrics: context.metrics,
+        return_actuals: None,
     });
-    Ok((set, current_name, columns, execution_profile, workspaces))
+    Ok((
+        set,
+        current_name,
+        columns,
+        execution_profile,
+        context.payload_meter,
+        workspaces,
+    ))
+}
+
+/// 节点、标量和执行计划共用最终投影；账本及管线工作区持续到语言无关的返回值构造完成。
+fn project_pipeline<T: VectorType, R>(
+    query: &TqlQuery,
+    mt: &MemTable<T>,
+    limits: &ExecutionContext,
+    memory: &QueryMemory,
+    profile: bool,
+    project: impl FnOnce(
+        &[returning::Input<'_, T>],
+        &returning::Scope<'_, T>,
+    ) -> Result<Vec<R>, TriviumError>,
+) -> Result<(Vec<R>, Option<PipelineExecutionProfile>), TriviumError> {
+    let (set, name, aliases, mut execution, meter, workspaces) =
+        execute_pipeline_set(query, mt, profile, limits)?;
+    let _scope = meter.enter();
+    let before = profile.then(|| (Instant::now(), meter.usage()));
+    limits.compose_memory(query, mt, memory, &workspaces);
+    let mut rows = set.into_rows();
+    rows.truncate(admit_input_rows(query, mt, limits, rows.len())?);
+    let inputs = rows
+        .iter()
+        .map(returning::Input::Pipeline)
+        .collect::<Vec<_>>();
+    let scope = returning::Scope {
+        memory,
+        query,
+        mt,
+        limits,
+        pipeline: Some((&name, &aliases)),
+    };
+    let result = project(&inputs, &scope);
+    meter
+        .check()
+        .map_err(|e| limits.error(e, QueryErrorStage::Execute, SourceSelector::Return))?;
+    let result = result?;
+    if let (Some(execution), Some((start, (lookups, bytes)))) = (&mut execution, before) {
+        let (end_lookups, end_bytes) = meter.usage();
+        execution.return_actuals = Some(serde_json::json!({
+            "operator": "return", "input_rows": inputs.len(), "actual_rows": result.len(),
+            "elapsed_ns": start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+            "payload_lookups": end_lookups - lookups, "payload_parsed_bytes": end_bytes - bytes,
+            "estimated_rows": null, "estimate_error_ratio": null, "estimate_source": null, "estimate_confidence": null,
+        }));
+    }
+    Ok((result, execution))
 }
 
 fn execute_pipeline_node_query<T: VectorType>(
@@ -1736,23 +1793,10 @@ fn execute_pipeline_node_query<T: VectorType>(
             "节点结果 API 无法承载标量列，请使用 tql_values (Node-only result API cannot carry scalar columns; use tql_values)".into(),
         ));
     }
-    let (set, current_name, columns, _, workspaces) =
-        execute_pipeline_set(query, mt, false, &limits)?;
-    limits.compose_memory(query, mt, memory, &workspaces);
-    let mut rows = set.into_rows();
-    rows.truncate(admit_input_rows(query, mt, &limits, rows.len())?);
-    let inputs = rows
-        .iter()
-        .map(returning::Input::Pipeline)
-        .collect::<Vec<_>>();
-    let scope = returning::Scope {
-        memory,
-        query,
-        mt,
-        limits: &limits,
-        pipeline: Some((&current_name, &columns)),
-    };
-    returning::into_nodes(returning::finish(&inputs, &scope)?, &inputs, &scope)
+    project_pipeline(query, mt, &limits, memory, false, |inputs, scope| {
+        returning::into_nodes(returning::finish(inputs, scope)?, inputs, scope)
+    })
+    .map(|(rows, _)| rows)
 }
 
 fn json_to_tql_value<T>(value: serde_json::Value) -> TqlValue<T> {
@@ -1850,7 +1894,7 @@ fn execute_tql_values_context_inner<T: VectorType>(
     }
     if !uses_pipeline(query) {
         limits.compose_memory(query, mt, &memory, &[]);
-        let (rows, _) = execute_binding_rows(query, mt, &limits, &memory)?;
+        let (rows, _) = execute_binding_rows(query, mt, &limits, &memory, true)?;
         let inputs = rows
             .iter()
             .map(|row| returning::Input::Nodes(row, None))
@@ -1865,23 +1909,8 @@ fn execute_tql_values_context_inner<T: VectorType>(
         return returning::finish(&inputs, &scope)
             .map(|rows| rows.into_iter().map(|row| row.values).collect());
     }
-    let (set, current_name, columns, _, workspaces) =
-        execute_pipeline_set(query, mt, false, &limits)?;
-    limits.compose_memory(query, mt, &memory, &workspaces);
-    let mut rows = set.into_rows();
-    rows.truncate(admit_input_rows(query, mt, &limits, rows.len())?);
-    let inputs = rows
-        .iter()
-        .map(returning::Input::Pipeline)
-        .collect::<Vec<_>>();
-    let scope = returning::Scope {
-        memory: &memory,
-        query,
-        mt,
-        limits: &limits,
-        pipeline: Some((&current_name, &columns)),
-    };
-    returning::finish(&inputs, &scope).map(|rows| rows.into_iter().map(|row| row.values).collect())
+    let (rows, _) = project_pipeline(query, mt, &limits, &memory, false, returning::finish)?;
+    Ok(rows.into_iter().map(|row| row.values).collect())
 }
 
 fn execute_single_edge_values<T: VectorType>(
@@ -1891,7 +1920,7 @@ fn execute_single_edge_values<T: VectorType>(
     limits: ExecutionContext,
     memory: &QueryMemory,
 ) -> Result<TqlValueResult<T>, TriviumError> {
-    let expanded = collect_single_edge_rows(query, pattern, mt, &limits, memory)?;
+    let expanded = collect_single_edge_rows(query, pattern, mt, &limits, memory, true)?;
     let edge_var = pattern.edges[0]
         .var
         .as_deref()
@@ -1970,14 +1999,36 @@ fn scoped_match_plan<T: VectorType>(
     }
 }
 
+fn expr_reads_payload(expr: &TqlExpr, binding: &str) -> bool {
+    match expr {
+        TqlExpr::Property { var, field } => var == binding && field != "id",
+        TqlExpr::Binary { left, right, .. } => {
+            expr_reads_payload(left, binding) || expr_reads_payload(right, binding)
+        }
+        TqlExpr::Coalesce(values) => values.iter().any(|expr| expr_reads_payload(expr, binding)),
+        TqlExpr::IsNull { expr, .. } => expr_reads_payload(expr, binding),
+        _ => false,
+    }
+}
+
+fn return_reads_payload(kind: &ReturnExprKind, binding: &str) -> bool {
+    match kind {
+        ReturnExprKind::Property(var, field) => var == binding && field != "id",
+        ReturnExprKind::Aggregate(_, inner) => return_reads_payload(inner, binding),
+        ReturnExprKind::Scalar(expr) => expr_reads_payload(expr, binding),
+        ReturnExprKind::Var(_) => false,
+    }
+}
+
 fn collect_single_edge_rows<T: VectorType>(
     query: &TqlQuery,
     pattern: &TqlPattern,
     mt: &MemTable<T>,
     limits: &ExecutionContext,
     memory: &QueryMemory,
+    values_only: bool,
 ) -> Result<Vec<EdgeBindingRow<T>>, TriviumError> {
-    collect_single_edge_rows_inner(query, pattern, mt, limits, memory)
+    collect_single_edge_rows_inner(query, pattern, mt, limits, memory, values_only)
         .map_err(|error| limits.error(error, QueryErrorStage::Execute, SourceSelector::Entry))
 }
 
@@ -1987,12 +2038,28 @@ fn collect_single_edge_rows_inner<T: VectorType>(
     mt: &MemTable<T>,
     limits: &ExecutionContext,
     memory: &QueryMemory,
+    values_only: bool,
 ) -> Result<Vec<EdgeBindingRow<T>>, TriviumError> {
     if pattern.edges.len() != 1 || pattern.edges[0].hop_range.is_some() || pattern.nodes.len() != 2
     {
         return Err(TriviumError::QueryExecution(
             "具名边要求单跳模式 (Named edges require a single-hop pattern)".into(),
         ));
+    }
+    let ranking = query
+        .rank
+        .as_ref()
+        .map(|rank| {
+            rank_vector(rank, mt)
+                .map(|vector| (rank, vector))
+                .map_err(|error| limits.error(error, QueryErrorStage::Plan, SourceSelector::Rank))
+        })
+        .transpose()?;
+    let (row_limit, user_limited) =
+        requested_row_limit(query, requires_full_input(query, false), limits, mt)?;
+    let scan_limit = row_limit.saturating_add(usize::from(!user_limited));
+    if scan_limit == 0 || query.limit == Some(0) {
+        return Ok(Vec::new());
     }
     let optional = matches!(query.entry, QueryEntry::OptionalMatch { .. });
     let graph = limits.graph(mt);
@@ -2012,7 +2079,6 @@ fn collect_single_edge_rows_inner<T: VectorType>(
     } else {
         Box::new(plan.candidates.iter().copied())
     };
-    let (row_limit, _) = requested_row_limit(query, requires_full_input(query, false), limits, mt)?;
     let scope = returning::Scope {
         memory,
         query,
@@ -2021,6 +2087,44 @@ fn collect_single_edge_rows_inner<T: VectorType>(
         pipeline: None,
     };
     let count_only = counts_match_rows(query);
+    let snapshot_endpoint = |id, var: &str| {
+        // 标量投影按绑定读取所需字段，排名从存储向量单独评分。
+        let full_node = match &query.returns {
+            ReturnClause::All => true,
+            ReturnClause::Variables(names) => names.iter().any(|name| name == var),
+            ReturnClause::Expressions(items) => items.iter().any(|item| match &item.kind {
+                ReturnExprKind::Var(name) => name == var,
+                ReturnExprKind::Scalar(TqlExpr::Variable(name)) => name == var,
+                _ => false,
+            }),
+        };
+        if !values_only || full_node {
+            return memory.snapshot(id, mt);
+        }
+        let needs_payload = query
+            .order_by
+            .iter()
+            .any(|order| expr_reads_payload(&order.expr, var))
+            || matches!(&query.returns, ReturnClause::Expressions(items)
+                if items.iter().any(|item| return_reads_payload(&item.kind, var)));
+        memory.retain(256)?;
+        let payload = if needs_payload {
+            let _decode = memory.temporary(mt.payload_query_peak(id)?)?;
+            let payload = mt
+                .try_get_payload(id)?
+                .ok_or(TriviumError::NodeNotFound(id))?;
+            memory.retain(crate::storage::payload_store::query_clone_peak(&payload))?;
+            (*payload).clone()
+        } else {
+            serde_json::Value::Null
+        };
+        Ok(Node {
+            id,
+            vector: Vec::new(),
+            edges: Vec::new(),
+            payload,
+        })
+    };
     let mut predicate_vars = Vec::new();
     if let Some(predicate) = &query.predicate {
         let default_node = pattern.nodes.iter().find_map(|node| node.var.as_deref());
@@ -2029,11 +2133,9 @@ fn collect_single_edge_rows_inner<T: VectorType>(
     let mut expanded = Vec::new();
     let mut budget = matching::WorkBudget::new(MAX_BUDGET, limits.query_control.as_ref());
     'anchors: for start in candidates {
-        limits.check_cancelled()?;
-        if left
-            .filter
-            .as_ref()
-            .is_some_and(|filter| !matches_filter_with_id(filter, start, mt))
+        budget.step()?;
+        if let Some(filter) = &left.filter
+            && !matches_filter_with_id(filter, start, mt, memory)?
         {
             continue;
         }
@@ -2048,10 +2150,8 @@ fn collect_single_edge_rows_inner<T: VectorType>(
             if left.var.is_some() && left.var == right.var && start != end {
                 continue;
             }
-            if right
-                .filter
-                .as_ref()
-                .is_some_and(|filter| !matches_filter_with_id(filter, end, mt))
+            if let Some(filter) = &right.filter
+                && !matches_filter_with_id(filter, end, mt, memory)?
             {
                 continue;
             }
@@ -2115,7 +2215,7 @@ fn collect_single_edge_rows_inner<T: VectorType>(
                     view = Some(candidate);
                     for (endpoint, id) in [(left, start), (right, end)] {
                         if let Some(var) = &endpoint.var {
-                            nodes.insert(var.clone(), memory.snapshot(id, mt)?);
+                            nodes.insert(var.clone(), snapshot_endpoint(id, var)?);
                         }
                     }
                 }
@@ -2126,28 +2226,28 @@ fn collect_single_edge_rows_inner<T: VectorType>(
                 edge: view,
                 anchor: if plan.reversed { end } else { start },
             });
-            if expanded.len() > row_limit {
+            if expanded.len() >= scan_limit {
                 break 'anchors;
             }
         }
         if optional && !matched {
             let mut nodes = HashMap::new();
             if !count_only && let Some(var) = &left.var {
-                nodes.insert(var.clone(), memory.snapshot(start, mt)?);
+                nodes.insert(var.clone(), snapshot_endpoint(start, var)?);
             }
             expanded.push(EdgeBindingRow {
                 nodes,
                 edge: None,
                 anchor: start,
             });
-            if expanded.len() > row_limit {
+            if expanded.len() >= scan_limit {
                 break;
             }
         }
     }
     expanded.truncate(admit_input_rows(query, mt, limits, expanded.len())?);
-    if let Some(rank) = &query.rank {
-        expanded = rank_rows_by_node(expanded, rank, mt, |row| &row.nodes)
+    if let Some((rank, vector)) = ranking {
+        expanded = rank_rows_by_node(expanded, rank, &vector, mt, |row| &row.nodes)
             .map_err(|error| limits.error(error, QueryErrorStage::Plan, SourceSelector::Rank))?;
     }
     Ok(expanded)
@@ -2216,6 +2316,7 @@ enum BoundMetric {
     Path,
     PathStrength,
     PathCount,
+    PathTruncated,
     PathRank,
     Depth,
     GraphScore,
@@ -2231,11 +2332,12 @@ enum BoundMetric {
 }
 
 impl BoundMetric {
-    const ALL: [Self; 27] = [
+    const ALL: [Self; 28] = [
         Self::Similarity,
         Self::Path,
         Self::PathStrength,
         Self::PathCount,
+        Self::PathTruncated,
         Self::PathRank,
         Self::Depth,
         Self::GraphScore,
@@ -2309,6 +2411,9 @@ impl BoundMetric {
             Self::PairRight => row.pair.map(|v| runtime_u64(v.1)),
             Self::Path => row.path.clone().map(RuntimeValue::Path),
             Self::PathCount => row.path_count.map(|count| runtime_u64(count as u64)),
+            Self::PathTruncated => row.path_strength.map(|score| {
+                RuntimeValue::Bool(score.kind == crate::query::pipeline::ScoreKind::Approximate)
+            }),
             Self::PathRank => row.path_rank.map(|rank| runtime_u64(rank as u64)),
             metric => metric.score(row).map(|s| RuntimeValue::Float(s.value)),
         }
@@ -2443,7 +2548,7 @@ impl<T: VectorType> crate::query::pipeline::PipelineOperator<T> for TqlMatchSour
         let mt = context.memtable;
         let memory = if self.limits.graph.is_some() {
             let memory = QueryMemory::new(context.document_memory_limit()?, mt);
-            memory.include_external(mt.estimated_memory_bytes());
+            memory.include_external(mt.resident_memory_bytes());
             memory
         } else {
             QueryMemory::new(self.limits.memory_limit, mt)
@@ -2457,9 +2562,9 @@ impl<T: VectorType> crate::query::pipeline::PipelineOperator<T> for TqlMatchSour
             }
         };
         let rows = if pattern.edges.iter().any(|edge| edge.var.is_some()) {
-            collect_single_edge_rows(&self.query, pattern, mt, &self.limits, &memory)?
+            collect_single_edge_rows(&self.query, pattern, mt, &self.limits, &memory, false)?
         } else {
-            execute_binding_rows(&self.query, mt, &self.limits, &memory)?
+            execute_binding_rows(&self.query, mt, &self.limits, &memory, false)?
                 .0
                 .into_iter()
                 .map(|nodes| {
@@ -2513,6 +2618,9 @@ impl<T: VectorType> crate::query::pipeline::PipelineOperator<T> for TqlMatchSour
 }
 
 impl<T: VectorType> crate::query::pipeline::PipelineOperator<T> for TqlScopeProjection {
+    fn workspace_rows(&self, _mt: &MemTable<T>, input: usize) -> usize {
+        input
+    }
     fn name(&self) -> &'static str {
         "scope_projection"
     }
@@ -2576,6 +2684,9 @@ struct TqlOutputBinding<T: VectorType> {
     name: String,
 }
 impl<T: VectorType> crate::query::pipeline::PipelineOperator<T> for TqlOutputBinding<T> {
+    fn workspace_rows(&self, mt: &MemTable<T>, input: usize) -> usize {
+        self.inner.workspace_rows(mt, input).max(input)
+    }
     fn uses_graph(&self) -> bool {
         self.inner.uses_graph()
     }
@@ -2785,6 +2896,9 @@ struct TqlNumericIndexFilter {
 }
 
 impl<T: VectorType> crate::query::pipeline::PipelineOperator<T> for TqlNumericIndexFilter {
+    fn workspace_rows(&self, _mt: &MemTable<T>, input: usize) -> usize {
+        input
+    }
     fn name(&self) -> &'static str {
         "tql_numeric_index_filter"
     }
@@ -2809,6 +2923,9 @@ impl<T: VectorType> crate::query::pipeline::PipelineOperator<T> for TqlNumericIn
 }
 
 impl<T: VectorType> crate::query::pipeline::PipelineOperator<T> for PipelinePredicateFilter {
+    fn workspace_rows(&self, _mt: &MemTable<T>, input: usize) -> usize {
+        input
+    }
     fn name(&self) -> &'static str {
         "tql_pipeline_filter"
     }
@@ -2880,6 +2997,7 @@ fn eval_pipeline_row_expr<T: VectorType>(
         }
         TqlExpr::PathStrength { var } => BoundMetric::PathStrength.value(row, var),
         TqlExpr::PathCount { var } => BoundMetric::PathCount.value(row, var),
+        TqlExpr::PathTruncated { var } => BoundMetric::PathTruncated.value(row, var),
         TqlExpr::Path { var } => BoundMetric::Path.value(row, var),
         TqlExpr::PathLength { var } => match BoundMetric::Path.value(row, var) {
             RuntimeValue::Path(path) => runtime_u64(path.len().saturating_sub(1) as u64),
@@ -2964,27 +3082,32 @@ fn apply_graph_first_rank<T: VectorType>(
     rank: &RankClause,
     mt: &MemTable<T>,
 ) -> Result<TqlResult<T>, TriviumError> {
-    rank_rows_by_node(rows, rank, mt, |row| row)
+    rank_rows_by_node(rows, rank, &rank_vector(rank, mt)?, mt, |row| row)
 }
 
-fn rank_rows_by_node<T: VectorType, R, F: Fn(&R) -> &HashMap<String, Node<T>>>(
-    rows: Vec<R>,
-    rank: &RankClause,
-    mt: &MemTable<T>,
-    bindings: F,
-) -> Result<Vec<R>, TriviumError> {
+fn rank_vector<T: VectorType>(rank: &RankClause, mt: &MemTable<T>) -> Result<Vec<T>, TriviumError> {
+    if rank.vector.len() != mt.dim() {
+        return Err(TriviumError::DimensionMismatch {
+            expected: mt.dim(),
+            got: rank.vector.len(),
+        });
+    }
     let query_vector: Vec<T> = rank
         .vector
         .iter()
         .map(T::from_json_number)
         .collect::<Result<Vec<_>, _>>()?;
-    if query_vector.len() != mt.dim() {
-        return Err(TriviumError::DimensionMismatch {
-            expected: mt.dim(),
-            got: query_vector.len(),
-        });
-    }
     crate::vector::validate_query_vector(&query_vector, mt.dim())?;
+    Ok(query_vector)
+}
+
+fn rank_rows_by_node<T: VectorType, R, F: Fn(&R) -> &HashMap<String, Node<T>>>(
+    rows: Vec<R>,
+    rank: &RankClause,
+    query_vector: &[T],
+    mt: &MemTable<T>,
+    bindings: F,
+) -> Result<Vec<R>, TriviumError> {
     let mut canonical = BTreeMap::<NodeId, (Vec<NodeId>, R)>::new();
     for row in rows {
         let nodes = bindings(&row);
@@ -3018,7 +3141,7 @@ fn rank_rows_by_node<T: VectorType, R, F: Fn(&R) -> &HashMap<String, Node<T>>>(
         let vector = mt.get_vector(anchor_id).ok_or_else(|| {
             TriviumError::QueryExecution(format!("RANK anchor {anchor_id} 缺少向量"))
         })?;
-        let score = T::similarity(&query_vector, vector);
+        let score = T::similarity(query_vector, vector);
         if score.is_finite() {
             ranked.push((score, anchor_id, row));
         }
@@ -3044,7 +3167,11 @@ fn execute_find<T: VectorType>(
     row_limit: usize,
     control: Option<&QueryControl>,
     memory: &QueryMemory,
+    values_only: bool,
 ) -> Result<(TqlResult<T>, bool), TriviumError> {
+    if row_limit == 0 || query.limit == Some(0) {
+        return Ok((Vec::new(), false));
+    }
     let mut results = Vec::new();
     let cursor = find_ordered_field(query).and_then(|(field, desc)| {
         let bound = super::planner::ordered_range(filter)
@@ -3074,14 +3201,23 @@ fn execute_find<T: VectorType>(
             Box::new(plan.candidates.into_iter())
         }
     };
+    let fields = match &query.returns {
+        ReturnClause::Expressions(items)
+            if values_only
+                && query.rank.is_none()
+                && items
+                    .iter()
+                    .all(|item| matches!(&item.kind, ReturnExprKind::Property(..))) =>
+        {
+            Some(items)
+        }
+        _ => None,
+    };
     for (scanned, id) in candidate_ids.enumerate() {
         if scanned & 0xff == 0
             && let Some(control) = control
         {
             control.check()?;
-        }
-        if results.len() >= row_limit {
-            break;
         }
 
         let _decode = memory.temporary(mt.payload_query_peak(id)?)?;
@@ -3102,15 +3238,51 @@ fn execute_find<T: VectorType>(
             continue;
         }
 
-        memory.retain(memory::node_bytes(id, mt)?)?;
-        let node = match build_node_with_payload(id, payload, mt) {
-            Some(node) => node,
-            None => continue,
+        let node = if let Some(fields) = fields {
+            let projected = if query.order_by.is_empty() {
+                memory.retain(256)?;
+                let mut selected = serde_json::Map::new();
+                for item in fields {
+                    if let ReturnExprKind::Property(var, field) = &item.kind
+                        && var == "_"
+                        && field != "id"
+                        && !selected.contains_key(field)
+                        && let Some(value) = payload.get(field)
+                    {
+                        memory.retain(field.len().saturating_add(128).saturating_add(
+                            crate::storage::payload_store::query_clone_peak(value),
+                        ))?;
+                        selected.insert(field.clone(), value.clone());
+                    }
+                }
+                serde_json::Value::Object(selected)
+            } else {
+                // 排序可以读取未投影字段和别名对象。
+                memory.retain(
+                    crate::storage::payload_store::query_clone_peak(&payload).saturating_add(256),
+                )?;
+                (*payload).clone()
+            };
+            Node {
+                id,
+                payload: projected,
+                vector: Vec::new(),
+                edges: Vec::new(),
+            }
+        } else {
+            memory.retain(memory::node_bytes(id, mt)?)?;
+            let Some(node) = build_node_with_payload(id, payload, mt) else {
+                continue;
+            };
+            node
         };
 
         // FIND 的节点身份固定绑定到 _，返回列和聚合分别从同一个输入求值。
         let row = HashMap::from([("_".to_owned(), node)]);
         results.push(row);
+        if results.len() >= row_limit {
+            break;
+        }
     }
 
     Ok((results, ordered_output))
@@ -3188,6 +3360,9 @@ fn execute_match<T: VectorType>(
     limits: &ExecutionContext,
     memory: &QueryMemory,
 ) -> Result<TqlResult<T>, TriviumError> {
+    if query.limit == Some(0) || row_limit == 0 {
+        return Ok(Vec::new());
+    }
     // 建立变量映射
     let mut var_map: HashMap<String, usize> = HashMap::new();
     for node_pat in &pattern.nodes {
@@ -3229,23 +3404,15 @@ fn execute_match<T: VectorType>(
         MAX_BUDGET
     };
 
-    let bytes = matching::workspace_bytes(planned_pattern, graph.node_count())?;
-    if limits.memory_limit > 0 && bytes > limits.memory_limit {
-        return Err(TriviumError::ResourceBudgetExceeded {
-            resource: "query_memory_bytes",
-            requested: bytes,
-            used: 0,
-            limit: limits.memory_limit,
-        });
-    }
-    let _workspace = mt.resource_runtime().reserve_workspace(bytes)?;
+    let _workspace = memory.temporary(matching::workspace_bytes(
+        planned_pattern,
+        graph.node_count(),
+    )?)?;
     let mut budget = matching::WorkBudget::new(step_budget, limits.query_control.as_ref());
     for start_id in start_candidates {
         limits.check_cancelled()?;
-        if planned_pattern.nodes[0]
-            .filter
-            .as_ref()
-            .is_some_and(|filter| !matches_filter_with_id(filter, start_id, mt))
+        if let Some(filter) = &planned_pattern.nodes[0].filter
+            && !matches_filter_with_id(filter, start_id, mt, memory)?
         {
             continue;
         }
@@ -3350,46 +3517,35 @@ fn eval_predicate_env<T: VectorType>(
     env: &[Option<u64>],
     var_map: &HashMap<String, usize>,
     mt: &MemTable<T>,
-) -> bool {
-    match pred {
+    memory: &QueryMemory,
+) -> crate::Result<bool> {
+    Ok(match pred {
         Predicate::Compare { left, op, right } => {
-            let lval = eval_tql_expr(left, env, var_map, mt);
-            let rval = eval_tql_expr(right, env, var_map, mt);
-            compare_runtime(&lval, op, &rval)
+            let mut values = Vec::new();
+            let lhs = eval_tql_expr(left, env, var_map, mt, memory, &mut values)?;
+            let rhs = eval_tql_expr(right, env, var_map, mt, memory, &mut values)?;
+            compare_runtime(&lhs, op, &rhs)
         }
-
         Predicate::DocFilter { var, filter } => {
             let id = match var {
-                Some(v) => {
-                    if let Some(&idx) = var_map.get(v) {
-                        env[idx]
-                    } else {
-                        None
-                    }
-                }
-                None => {
-                    // 无变量绑定，尝试用第一个非空变量
-                    env.iter().find(|o| o.is_some()).copied().flatten()
-                }
+                Some(name) => var_map.get(name).and_then(|&slot| env[slot]),
+                None => env.iter().copied().flatten().next(),
             };
-
             match id {
-                Some(nid) => match mt.get_payload(nid) {
-                    Some(payload) => filter.matches(&payload),
-                    None => false,
-                },
+                Some(id) => mt.matches_payload_filter(id, filter)?,
                 None => false,
             }
         }
-
         Predicate::And(a, b) => {
-            eval_predicate_env(a, env, var_map, mt) && eval_predicate_env(b, env, var_map, mt)
+            eval_predicate_env(a, env, var_map, mt, memory)?
+                && eval_predicate_env(b, env, var_map, mt, memory)?
         }
         Predicate::Or(a, b) => {
-            eval_predicate_env(a, env, var_map, mt) || eval_predicate_env(b, env, var_map, mt)
+            eval_predicate_env(a, env, var_map, mt, memory)?
+                || eval_predicate_env(b, env, var_map, mt, memory)?
         }
-        Predicate::Not(inner) => !eval_predicate_env(inner, env, var_map, mt),
-    }
+        Predicate::Not(inner) => !eval_predicate_env(inner, env, var_map, mt, memory)?,
+    })
 }
 
 /// 在单节点上下文中评估谓词（FIND / SEARCH 场景）
@@ -3461,13 +3617,15 @@ fn runtime_property<T: VectorType>(
     }
 }
 
-fn eval_tql_expr<T: VectorType>(
+fn eval_tql_expr<'a, T: VectorType>(
     expr: &TqlExpr,
     env: &[Option<u64>],
     var_map: &HashMap<String, usize>,
     mt: &MemTable<T>,
-) -> RuntimeValue {
-    match expr {
+    memory: &'a QueryMemory<'a>,
+    retained: &mut Vec<memory::Temporary<'a>>,
+) -> crate::Result<RuntimeValue> {
+    Ok(match expr {
         TqlExpr::Variable(var) => var_map
             .get(var)
             .and_then(|index| env.get(*index))
@@ -3476,17 +3634,24 @@ fn eval_tql_expr<T: VectorType>(
             .map_or(RuntimeValue::Null, RuntimeValue::Node),
         TqlExpr::Parameter(_) => RuntimeValue::Null,
         TqlExpr::Binary { left, op, right } => eval_binary(
-            eval_tql_expr(left, env, var_map, mt),
+            eval_tql_expr(left, env, var_map, mt, memory, retained)?,
             *op,
-            eval_tql_expr(right, env, var_map, mt),
+            eval_tql_expr(right, env, var_map, mt, memory, retained)?,
         ),
-        TqlExpr::Coalesce(values) => values
-            .iter()
-            .map(|value| eval_tql_expr(value, env, var_map, mt))
-            .find(|value| !matches!(value, RuntimeValue::Null))
-            .unwrap_or(RuntimeValue::Null),
+        TqlExpr::Coalesce(values) => {
+            for expr in values {
+                let value = eval_tql_expr(expr, env, var_map, mt, memory, retained)?;
+                if !matches!(value, RuntimeValue::Null) {
+                    return Ok(value);
+                }
+            }
+            RuntimeValue::Null
+        }
         TqlExpr::IsNull { expr, negated } => RuntimeValue::Bool(
-            matches!(eval_tql_expr(expr, env, var_map, mt), RuntimeValue::Null) != *negated,
+            matches!(
+                eval_tql_expr(expr, env, var_map, mt, memory, retained)?,
+                RuntimeValue::Null
+            ) != *negated,
         ),
         TqlExpr::Path { .. }
         | TqlExpr::PathLength { .. }
@@ -3504,22 +3669,28 @@ fn eval_tql_expr<T: VectorType>(
         | TqlExpr::Depth { .. }
         | TqlExpr::PathStrength { .. }
         | TqlExpr::PathCount { .. }
+        | TqlExpr::PathTruncated { .. }
         | TqlExpr::Community { .. } => RuntimeValue::Null,
         TqlExpr::Property { var, field } => {
             if let Some(&idx) = var_map.get(var)
                 && let Some(id) = env[idx]
             {
                 if field == "id" {
-                    return runtime_u64(id);
+                    return Ok(runtime_u64(id));
                 }
-                if let Some(payload) = mt.get_payload(id) {
-                    return json_to_runtime(&payload[field]);
+                let decoding = memory.temporary(mt.payload_query_peak(id)?)?;
+                if let Some(payload) = mt.try_get_payload(id)? {
+                    let value = json_to_runtime(&payload[field]);
+                    if matches!(value, RuntimeValue::Json(_) | RuntimeValue::Str(_)) {
+                        retained.push(decoding);
+                    }
+                    return Ok(value);
                 }
             }
             RuntimeValue::Null
         }
         TqlExpr::Literal(lit) => lit_to_runtime(lit),
-    }
+    })
 }
 
 fn eval_tql_expr_single(expr: &TqlExpr, id: NodeId, payload: &serde_json::Value) -> RuntimeValue {
@@ -3551,6 +3722,7 @@ fn eval_tql_expr_single(expr: &TqlExpr, id: NodeId, payload: &serde_json::Value)
         | TqlExpr::Depth { .. }
         | TqlExpr::PathStrength { .. }
         | TqlExpr::PathCount { .. }
+        | TqlExpr::PathTruncated { .. }
         | TqlExpr::Community { .. }
         | TqlExpr::Path { .. }
         | TqlExpr::PathLength { .. }
@@ -3724,19 +3896,22 @@ fn compare_runtime(lhs: &RuntimeValue, op: &TqlCompOp, rhs: &RuntimeValue) -> bo
                 _ => false,
             }
         }
-        (RuntimeValue::Json(a), RuntimeValue::Json(b)) => match op {
-            TqlCompOp::Eq => compare_json(a, b).is_eq(),
-            TqlCompOp::Ne => !compare_json(a, b).is_eq(),
-            _ => false,
-        },
+        (RuntimeValue::Json(a), RuntimeValue::Json(b))
+            if std::mem::discriminant(a) == std::mem::discriminant(b) =>
+        {
+            match op {
+                TqlCompOp::Eq => compare_json(a, b).is_eq(),
+                TqlCompOp::Ne => !compare_json(a, b).is_eq(),
+                _ => false,
+            }
+        }
         (RuntimeValue::Str(a), RuntimeValue::Str(b)) => cmp_ord(a, op, b),
         (RuntimeValue::Bool(a), RuntimeValue::Bool(b)) => match op {
             TqlCompOp::Eq => a == b,
             TqlCompOp::Ne => a != b,
             _ => false,
         },
-        (RuntimeValue::Null, _) | (_, RuntimeValue::Null) => false,
-        _ => matches!(op, TqlCompOp::Ne),
+        _ => false,
     }
 }
 
@@ -3760,23 +3935,28 @@ fn matches_filter_with_id<T: VectorType>(
     filter: &Filter,
     node_id: NodeId,
     mt: &MemTable<T>,
-) -> bool {
+    memory: &QueryMemory,
+) -> crate::Result<bool> {
     if filter.field_name() == Some("id") {
-        return filter.matches(&serde_json::json!({"id":node_id}));
+        return Ok(filter.matches(&serde_json::json!({"id":node_id})));
     }
     match filter {
-        // 逻辑组合：递归处理
-        Filter::And(filters) => filters
-            .iter()
-            .all(|f| matches_filter_with_id(f, node_id, mt)),
-        Filter::Or(filters) => filters
-            .iter()
-            .any(|f| matches_filter_with_id(f, node_id, mt)),
-        // 其他操作符：回退到标准 payload 匹配
-        _ => match mt.get_payload(node_id) {
-            Some(payload) => filter.matches(&payload),
-            None => false,
-        },
+        Filter::And(filters) | Filter::Or(filters) => {
+            let conjunction = matches!(filter, Filter::And(_));
+            for child in filters {
+                let matched = matches_filter_with_id(child, node_id, mt, memory)?;
+                if matched != conjunction {
+                    return Ok(matched);
+                }
+            }
+            Ok(conjunction)
+        }
+        _ => {
+            let _decode = memory.temporary(mt.payload_query_peak(node_id)?)?;
+            Ok(mt
+                .try_get_payload(node_id)?
+                .is_some_and(|payload| filter.matches(&payload)))
+        }
     }
 }
 
@@ -3798,6 +3978,7 @@ fn extract_order_key<T>(expr: &TqlExpr, row: &HashMap<String, Node<T>>) -> Runti
         | TqlExpr::Depth { .. }
         | TqlExpr::PathStrength { .. }
         | TqlExpr::PathCount { .. }
+        | TqlExpr::PathTruncated { .. }
         | TqlExpr::Community { .. }
         | TqlExpr::Path { .. }
         | TqlExpr::PathLength { .. }
@@ -3921,6 +4102,7 @@ fn expr_first_var(expr: &TqlExpr) -> Option<&String> {
         | TqlExpr::Depth { var }
         | TqlExpr::PathStrength { var }
         | TqlExpr::PathCount { var }
+        | TqlExpr::PathTruncated { var }
         | TqlExpr::Community { var }
         | TqlExpr::Path { var }
         | TqlExpr::PathLength { var }
@@ -3963,6 +4145,7 @@ fn collect_vars_from_kind(kind: &ReturnExprKind, out: &mut Vec<String>) {
                 | TqlExpr::Depth { var }
                 | TqlExpr::PathStrength { var }
                 | TqlExpr::PathCount { var }
+                | TqlExpr::PathTruncated { var }
                 | TqlExpr::Community { var }
                 | TqlExpr::Path { var }
                 | TqlExpr::PathLength { var }
@@ -4431,7 +4614,7 @@ fn generate_explain_plan<T: VectorType>(
                 "estimated_memo_bytes".into(),
                 serde_json::json!(profile.plan.estimated_memo_bytes),
             );
-            let stages = profile
+            let mut stages = profile
                 .metrics
                 .iter()
                 .enumerate()
@@ -4461,6 +4644,7 @@ fn generate_explain_plan<T: VectorType>(
                     })
                 })
                 .collect::<Vec<_>>();
+            stages.extend(profile.return_actuals);
             plan.insert("pipeline_stage_actuals".into(), serde_json::json!(stages));
         }
     } else {
@@ -4537,6 +4721,7 @@ fn format_tql_expr(expr: &TqlExpr) -> String {
         TqlExpr::Depth { var } => format!("depth({var})"),
         TqlExpr::PathStrength { var } => format!("path_strength({var})"),
         TqlExpr::PathCount { var } => format!("path_count({var})"),
+        TqlExpr::PathTruncated { var } => format!("path_truncated({var})"),
         TqlExpr::Community { var } => format!("community({var})"),
         TqlExpr::Path { var } => format!("path({var})"),
         TqlExpr::PathLength { var } => format!("path_length({var})"),
@@ -4746,20 +4931,21 @@ pub(crate) fn execute_tql_mutation_with_source<T: VectorType>(
     max_operations: Option<usize>,
     source: Option<Arc<TqlSource>>,
 ) -> Result<Vec<MutationOp<T>>, TriviumError> {
-    let context = ExecutionContext {
+    let mut context = ExecutionContext {
         graph: None,
         limits: limits.with_request(),
         source,
         focus: None,
     };
-    let mut context = context;
     context.row_overflow = crate::database::RowOverflowPolicy::Throw;
-    context.max_query_rows = Some(0);
     let result = match max_operations {
         Some(budget) => {
             execute_tql_mutation_with_operation_budget(mutation, mt, context.clone(), budget)
         }
-        None => execute_tql_mutation_planned(mutation, mt, context.clone()),
+        None => {
+            context.max_query_rows = Some(0);
+            execute_tql_mutation_planned(mutation, mt, context.clone())
+        }
     };
     result.map_err(|error| context.error(error, QueryErrorStage::Plan, SourceSelector::Action))
 }
@@ -4772,7 +4958,20 @@ fn execute_tql_mutation_with_operation_budget<T: VectorType>(
     max_operations: usize,
 ) -> Result<Vec<MutationOp<T>>, TriviumError> {
     let per_match = match &mutation.action {
-        MutationAction::Create(create) => create.nodes.len().saturating_add(create.edges.len()),
+        MutationAction::Create(create) => {
+            let bound = mutation
+                .source
+                .iter()
+                .flat_map(|source| &source.pattern.nodes)
+                .filter_map(|node| node.var.as_deref())
+                .collect::<HashSet<_>>();
+            create
+                .nodes
+                .iter()
+                .filter(|node| node.var.as_deref().is_none_or(|var| !bound.contains(var)))
+                .count()
+                .saturating_add(create.edges.len())
+        }
         MutationAction::Set(assignments) => assignments.len(),
         MutationAction::SetVector { .. } => 1,
         MutationAction::Delete { vars, .. } => vars.len(),
@@ -4786,8 +4985,13 @@ fn execute_tql_mutation_with_operation_budget<T: VectorType>(
             limit: max_operations,
         });
     }
-    limits.row_overflow = crate::database::RowOverflowPolicy::Throw;
-    limits.max_query_rows = Some(max_operations / per_match);
+    let write_rows = max_operations / per_match;
+    limits.max_query_rows = Some(
+        limits
+            .max_query_rows
+            .filter(|&rows| rows > 0)
+            .map_or(write_rows, |rows| rows.min(write_rows)),
+    );
     execute_tql_mutation_planned(mutation, mt, limits)
 }
 

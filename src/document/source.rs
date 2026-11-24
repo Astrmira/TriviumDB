@@ -260,7 +260,7 @@ impl DocumentSource {
         }
         Ok(bytes)
     }
-    pub(crate) fn spans(
+    fn unlocated_spans(
         &self,
         parsed: &str,
         start: usize,
@@ -272,12 +272,9 @@ impl DocumentSource {
         }
         let source = self.text(parsed);
         let mut spans = Vec::new();
-        let mut boundaries = std::collections::BTreeSet::new();
         for (entry, text, range) in self.selected_ranges(start, end) {
             crate::request::check_current()?;
             let (source_start, source_end) = (range.start, range.end);
-            boundaries.insert(source_start);
-            boundaries.insert(source_end);
             spans.push(DocumentSourceSpan {
                 text_start: text.start,
                 text_end: text.end,
@@ -298,13 +295,34 @@ impl DocumentSource {
                 location: entry.location.clone(),
             });
         }
+        Ok(spans)
+    }
+}
+
+impl DocumentSnapshot {
+    // 一个修订的所有命中及上下文窗口共享一次原文坐标扫描。
+    pub(crate) fn locate_source_spans<'a>(
+        &self,
+        spans: impl Iterator<Item = &'a mut DocumentSourceSpan>,
+    ) -> Result<()> {
+        let Some(map) = &self.source else {
+            return Ok(());
+        };
+        let source = map.text(&self.content);
+        let spans: Vec<_> = spans.collect();
+        let mut boundaries = std::collections::BTreeSet::new();
+        for span in &spans {
+            crate::request::check_current()?;
+            boundaries.insert(span.source_start);
+            boundaries.insert(span.source_end);
+        }
         let boundaries = boundaries.into_iter().collect::<Vec<_>>();
         let locations = crate::error::QuerySpan::at_many(source, &boundaries)?;
         let locations = boundaries
             .into_iter()
             .zip(locations)
             .collect::<std::collections::BTreeMap<_, _>>();
-        for span in &mut spans {
+        for span in spans {
             let first = locations[&span.source_start];
             let last = locations[&span.source_end];
             span.line = first.line;
@@ -312,15 +330,17 @@ impl DocumentSource {
             span.end_line = last.line;
             span.end_column = last.column;
         }
-        Ok(spans)
+        Ok(())
     }
-}
 
-impl DocumentSnapshot {
-    pub(crate) fn source_spans(&self, start: usize, end: usize) -> Result<Vec<DocumentSourceSpan>> {
+    pub(crate) fn unlocated_source_spans(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<DocumentSourceSpan>> {
         self.source
             .as_ref()
-            .map(|source| source.spans(&self.content, start, end))
+            .map(|source| source.unlocated_spans(&self.content, start, end))
             .transpose()
             .map(Option::unwrap_or_default)
     }

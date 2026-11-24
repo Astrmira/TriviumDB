@@ -29,7 +29,14 @@ pub fn shortest_path_bidirectional<T: VectorType>(
     label_filter: Option<&str>,
     budget: &TraversalBudget,
 ) -> Result<ShortestPathOutput> {
-    shortest_path_bidirectional_view(mt, src, dst, label_filter, budget)
+    shortest_path_bidirectional_view(
+        mt,
+        src,
+        dst,
+        label_filter,
+        budget,
+        TraversalMetrics::default(),
+    )
 }
 
 pub(crate) fn shortest_path_bidirectional_view<T: VectorType>(
@@ -38,58 +45,61 @@ pub(crate) fn shortest_path_bidirectional_view<T: VectorType>(
     dst: NodeId,
     label_filter: Option<&str>,
     budget: &TraversalBudget,
+    mut metrics: TraversalMetrics,
 ) -> Result<ShortestPathOutput> {
     let control = crate::request::control().unwrap_or_default();
     control.check()?;
     budget.validate()?;
+    mt.ensure_readable()?;
     if !mt.contains(src) {
         return Err(crate::error::TriviumError::NodeNotFound(src));
     }
     if !mt.contains(dst) {
         return Err(crate::error::TriviumError::NodeNotFound(dst));
     }
+    if metrics.visited_nodes >= budget.max_visited_nodes {
+        return Ok(ShortestPathOutput {
+            path: None,
+            metrics,
+            truncated: exhausted(budget, BudgetDimension::VisitedNodes, metrics)?,
+            bidirectional: true,
+        });
+    }
+    metrics.visited_nodes += 1;
+    metrics.peak_frontier_size = metrics.peak_frontier_size.max(1);
     if src == dst {
+        let _workspace = mt.facts().reserve_instance_workspace(size_of::<NodeId>())?;
         return Ok(ShortestPathOutput {
             path: Some(vec![src]),
-            metrics: TraversalMetrics {
-                visited_nodes: 1,
-                peak_frontier_size: 1,
-                ..Default::default()
-            },
+            metrics,
             truncated: false,
             bidirectional: true,
         });
     }
-
-    let initial_metrics = TraversalMetrics {
-        visited_nodes: 1,
-        peak_frontier_size: 1,
-        ..Default::default()
-    };
-    let initial_exhaustion = if budget.max_visited_nodes < 2 {
+    let exhausted_dimension = if metrics.visited_nodes >= budget.max_visited_nodes {
         Some(BudgetDimension::VisitedNodes)
     } else if budget.max_frontier_size < 2 {
         Some(BudgetDimension::FrontierSize)
     } else {
         None
     };
-    if let Some(dimension) = initial_exhaustion {
+    if let Some(dimension) = exhausted_dimension {
         return Ok(ShortestPathOutput {
             path: None,
-            metrics: initial_metrics,
-            truncated: exhausted(budget, dimension, initial_metrics)?,
+            metrics,
+            truncated: exhausted(budget, dimension, metrics)?,
             bidirectional: true,
         });
     }
+    let mut workspace = mt
+        .facts()
+        .reserve_instance_workspace(path_workspace_bytes(2))?;
     let mut forward = HashMap::from([(src, (0usize, None))]);
     let mut backward = HashMap::from([(dst, (0usize, None))]);
     let mut forward_frontier = vec![src];
     let mut backward_frontier = vec![dst];
-    let mut metrics = TraversalMetrics {
-        visited_nodes: 2,
-        peak_frontier_size: 2,
-        ..Default::default()
-    };
+    metrics.visited_nodes += 1;
+    metrics.peak_frontier_size = metrics.peak_frontier_size.max(2);
     let mut truncated = false;
     let mut best_meeting: Option<(usize, NodeId)> = None;
 
@@ -135,6 +145,7 @@ pub(crate) fn shortest_path_bidirectional_view<T: VectorType>(
                             .map(move |edge| (*source, edge))
                     }))
                 };
+            let mut neighbor_space = mt.facts().reserve_instance_workspace(0)?;
             let mut neighbors = Vec::new();
             for (neighbor, edge) in edges {
                 crate::graph::budget::check_control(&control)?;
@@ -146,6 +157,13 @@ pub(crate) fn shortest_path_bidirectional_view<T: VectorType>(
                 if (expand_forward || edge.target_id == current)
                     && label_filter.is_none_or(|label| edge.label == label)
                 {
+                    if neighbors.len() == neighbors.capacity() {
+                        let capacity = neighbors.len().saturating_mul(2).max(4);
+                        mt.facts().resize_instance_workspace(
+                            &mut neighbor_space,
+                            capacity.saturating_mul(size_of::<NodeId>()),
+                        )?;
+                    }
                     neighbors.push(neighbor);
                 }
             }
@@ -158,7 +176,7 @@ pub(crate) fn shortest_path_bidirectional_view<T: VectorType>(
                 } else {
                     (&mut backward, &forward)
                 };
-                if let std::collections::hash_map::Entry::Vacant(entry) = own.entry(neighbor) {
+                if !own.contains_key(&neighbor) {
                     let newly_visited = !other.contains_key(&neighbor);
                     if newly_visited && metrics.visited_nodes >= budget.max_visited_nodes {
                         if exhausted(budget, BudgetDimension::VisitedNodes, metrics)? {
@@ -179,7 +197,8 @@ pub(crate) fn shortest_path_bidirectional_view<T: VectorType>(
                         truncated = exhausted(budget, BudgetDimension::FrontierSize, metrics)?;
                         break;
                     }
-                    entry.insert((current_depth + 1, Some(current)));
+                    admit_path_nodes(mt.facts(), &mut workspace, own.len() + other.len() + 1)?;
+                    own.insert(neighbor, (current_depth + 1, Some(current)));
                     metrics.visited_nodes += usize::from(newly_visited);
                     metrics.depth_reached = metrics.depth_reached.max(current_depth + 1);
                     next_frontier.push(neighbor);
@@ -258,13 +277,34 @@ pub fn shortest_path<T: VectorType>(
     .unwrap_or_else(|never| match never {})
 }
 
+// 父节点哈希表、双前沿和回溯路径按扩容峰值预留。邻接临时表另行计量。
+fn path_workspace_bytes(nodes: usize) -> usize {
+    nodes
+        .max(4)
+        .checked_next_power_of_two()
+        .unwrap_or(usize::MAX)
+        .saturating_mul(4 * size_of::<(NodeId, usize, Option<NodeId>)>() + 4 * size_of::<NodeId>())
+}
+
+pub(crate) fn admit_path_nodes<T: VectorType>(
+    mt: &MemTable<T>,
+    lease: &mut crate::resources::RequestWorkspace,
+    nodes: usize,
+) -> Result<()> {
+    let bytes = path_workspace_bytes(nodes);
+    if nodes > 0 && bytes > lease.bytes() {
+        mt.resize_instance_workspace(lease, bytes)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn shortest_path_checked<T: VectorType, E>(
     mt: &impl GraphRead<T>,
     src: NodeId,
     dst: NodeId,
     max_depth: usize,
     label_filter: Option<&str>,
-    check: impl Fn(usize, usize) -> std::result::Result<(), E>,
+    mut check: impl FnMut(usize, usize) -> std::result::Result<(), E>,
 ) -> std::result::Result<Option<Path>, E> {
     let mut scanned = 0usize;
     check(0, 0)?;
@@ -290,11 +330,11 @@ pub(crate) fn shortest_path_checked<T: VectorType, E>(
             }
             let next = edge.target_id;
             let next_count = parents.len() + 1;
-            let std::collections::hash_map::Entry::Vacant(slot) = parents.entry(next) else {
+            if parents.contains_key(&next) {
                 continue;
-            };
+            }
             check(next_count, scanned)?;
-            slot.insert(id);
+            parents.insert(next, id);
             if next == dst {
                 let mut path = vec![dst];
                 let mut current = dst;
@@ -406,7 +446,7 @@ pub fn bounded_all_paths<T: VectorType>(
     config: &BoundedPathConfig,
     budget: &TraversalBudget,
 ) -> Result<BoundedPathsOutput> {
-    bounded_all_paths_view(mt, src, dst, config, budget)
+    bounded_all_paths_view(mt, src, dst, config, budget, TraversalMetrics::default())
 }
 
 pub(crate) fn bounded_all_paths_view<T: VectorType>(
@@ -415,10 +455,12 @@ pub(crate) fn bounded_all_paths_view<T: VectorType>(
     dst: NodeId,
     config: &BoundedPathConfig,
     budget: &TraversalBudget,
+    mut metrics: TraversalMetrics,
 ) -> Result<BoundedPathsOutput> {
     let control = crate::request::control().unwrap_or_default();
     control.check()?;
     budget.validate()?;
+    mt.ensure_readable()?;
     if !mt.contains(src) {
         return Err(crate::error::TriviumError::NodeNotFound(src));
     }
@@ -433,21 +475,26 @@ pub(crate) fn bounded_all_paths_view<T: VectorType>(
     if config.forbidden_nodes.contains(&src) || config.forbidden_nodes.contains(&dst) {
         return Ok(BoundedPathsOutput {
             paths: Vec::new(),
-            metrics: TraversalMetrics::default(),
+            metrics,
             truncated: false,
         });
     }
+    if metrics.visited_nodes >= budget.max_visited_nodes {
+        return Ok(BoundedPathsOutput {
+            paths: Vec::new(),
+            metrics,
+            truncated: exhausted(budget, BudgetDimension::VisitedNodes, metrics)?,
+        });
+    }
+    metrics.visited_nodes += 1;
+    metrics.peak_frontier_size = metrics.peak_frontier_size.max(1);
     let mut state = BoundedPathState {
         results: Vec::new(),
         visited: HashSet::from([src]),
         nodes: vec![src],
         weights: Vec::new(),
         labels: Vec::new(),
-        metrics: TraversalMetrics {
-            visited_nodes: 1,
-            peak_frontier_size: 1,
-            ..Default::default()
-        },
+        metrics,
         truncated: false,
     };
     let mut stack = vec![path_frame(mt, src, dst, config, budget, &mut state)?.iter()];

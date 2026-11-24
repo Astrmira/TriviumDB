@@ -529,7 +529,8 @@ fn 文档压缩取消归还组合额度并保持原文与重试结果() {
             .search_documents_vector(&query, &direction::<f32>(1.), &options())
             .unwrap();
         let baseline = db.quiver_stats().unwrap().unwrap().reserved_bytes;
-        let global = db.resource_stats().reserved_workspace_bytes;
+        let workspace = super::workspace::Workspace::capture(&db);
+        let instance = db.estimated_memory();
         let context = triviumdb::sdk::RequestContext::new(
             "document-compressed-cancel",
             Default::default(),
@@ -554,9 +555,11 @@ fn 文档压缩取消归还组合额度并保持原文与重试结果() {
         });
         gate.wait_until_arrived();
         // 外层文档工作区在Reader局部账本组合计量，在共享Runtime中取得一次额度。
+        let active_workspace = workspace.held(&db);
+        assert_eq!(db.estimated_memory() - instance, active_workspace);
         assert_eq!(
             db.quiver_stats().unwrap().unwrap().reserved_bytes - baseline,
-            db.resource_stats().reserved_workspace_bytes - global
+            active_workspace
         );
         context.cancel();
         drop(gate);
@@ -565,7 +568,7 @@ fn 文档压缩取消归还组合额度并保持原文与重试结果() {
             "TDB_QUERY_CANCELLED"
         );
         assert_eq!(db.quiver_stats().unwrap().unwrap().reserved_bytes, baseline);
-        assert_eq!(db.resource_stats().reserved_workspace_bytes, global);
+        workspace.released(&db);
         assert_eq!(
             db.search_documents_vector(&query, &direction::<f32>(1.), &options())
                 .unwrap(),
@@ -597,7 +600,7 @@ fn 文档压缩读取失败归还额度且完整重试保留证据() {
     db.search_documents_vector(&query, &query_vector::<f32>(), &options())
         .unwrap();
     let local = db.quiver_stats().unwrap().unwrap().reserved_bytes;
-    let global = db.resource_stats().reserved_workspace_bytes;
+    let workspace = super::workspace::Workspace::capture(&db);
     let failure = triviumdb::test_hooks::fail_io_at(triviumdb::test_hooks::IoPoint::QuiverColdRead);
     let error = db
         .search_documents_vector(&query, &query_vector::<f32>(), &options())
@@ -605,7 +608,7 @@ fn 文档压缩读取失败归还额度且完整重试保留证据() {
     drop(failure);
     assert_eq!(error.code(), "TDB_IO");
     assert_eq!(db.quiver_stats().unwrap().unwrap().reserved_bytes, local);
-    assert_eq!(db.resource_stats().reserved_workspace_bytes, global);
+    workspace.released(&db);
     let result = db
         .search_documents_vector(&query, &query_vector::<f32>(), &options())
         .unwrap();

@@ -7,6 +7,7 @@ fn scalar_literal(value: &RefScalar) -> String {
         RefScalar::Null => "null".into(),
         RefScalar::Bool(value) => value.to_string(),
         RefScalar::Integer(value) => value.to_string(),
+        RefScalar::Float(bits) => format!("{:?}", f64::from_bits(*bits)),
         RefScalar::String(value) => format!("\"{}\"", value.replace('"', "\\\"")),
     }
 }

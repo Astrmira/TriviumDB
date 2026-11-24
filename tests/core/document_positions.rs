@@ -177,15 +177,7 @@ fn roundtrip<T: VectorType + Serialize + DeserializeOwned>() {
     }
 }
 
-fn files(path: &std::path::Path) -> std::collections::BTreeMap<std::ffi::OsString, Vec<u8>> {
-    std::fs::read_dir(path)
-        .unwrap()
-        .map(|entry| {
-            let entry = entry.unwrap();
-            (entry.file_name(), std::fs::read(entry.path()).unwrap())
-        })
-        .collect()
-}
+use crate::physical_files::files;
 
 #[test]
 fn 三种dtype两种存储模式的短语邻近与Unicode原文契约() {

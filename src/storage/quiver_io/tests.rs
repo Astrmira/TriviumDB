@@ -222,6 +222,8 @@ fn iocp_batch_drains_valid_reads_alongside_a_short_read_and_reuses_slots() {
         let meter = Arc::new(IoMeter::default());
         (
             Some(fixed::Read::new(Job {
+                #[cfg(feature = "test-hooks")]
+                request_id: None,
                 offset: offset as u64,
                 bytes: vec![0; 19],
                 complete,

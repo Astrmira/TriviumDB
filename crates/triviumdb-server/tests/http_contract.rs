@@ -416,6 +416,51 @@ async fn text(response: axum::response::Response) -> String {
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
+/// 按请求的传输格式逐行核对独立预期，同时返回同一查询的 profile。
+async fn assert_query_response(
+    response: axum::response::Response,
+    media_type: &str,
+    columns: &Value,
+    expected_rows: &[Value],
+) -> Value {
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next(),
+        Some(media_type)
+    );
+    if media_type == "application/json" {
+        let body = json(response).await;
+        assert_eq!(&body["columns"], columns);
+        assert_eq!(body["rows"].as_array().unwrap(), expected_rows);
+        return body["profile"].clone();
+    }
+    assert_eq!(media_type, "application/x-ndjson");
+    let body = text(response).await;
+    let mut frames = body
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap());
+    let meta = frames.next().expect("缺少 meta");
+    assert_eq!(meta["type"], "meta");
+    assert_eq!(&meta["columns"], columns);
+    for row in expected_rows {
+        let frame = frames.next().expect("缺少数据行");
+        assert_eq!(frame["type"], "row");
+        assert_eq!(frame.get("row"), Some(row));
+    }
+    let summary = frames.next().expect("缺少 summary");
+    assert_eq!(summary["type"], "summary");
+    assert_eq!(
+        summary["rowCount"].as_u64(),
+        Some(expected_rows.len() as u64)
+    );
+    assert!(frames.next().is_none(), "summary 后有多余帧");
+    summary["profile"].clone()
+}
+
 async fn request(
     app: axum::Router,
     method: &str,
@@ -861,6 +906,11 @@ async fn 节点级occ允许无关节点更新并拒绝过期版本() {
     .await;
     assert_eq!(update1.status(), StatusCode::OK);
 
+    let new_node2 = request(app.clone(), "GET", "/v1/nodes/2", None, &[]).await;
+    assert_ne!(
+        new_node2.headers()[header::ETAG].to_str().unwrap(),
+        node2_etag
+    );
     let unrelated = request(
         app.clone(),
         "POST",
@@ -1533,39 +1583,62 @@ async fn prepared_cache参数绑定profile和淘汰契约完整() {
 #[tokio::test]
 async fn ndjson分块协议包含meta_rows_summary与profile() {
     let (app, _directory) = app("ndjson").await;
-    request(
+    for (accept, status) in [
+        (
+            "application/x-ndjson;q=0, application/*;q=0.8",
+            StatusCode::OK,
+        ),
+        (
+            "application/json;q=0, application/x-ndjson;q=0",
+            StatusCode::NOT_ACCEPTABLE,
+        ),
+    ] {
+        let response = request(
+            app.clone(),
+            "POST",
+            "/v1/tql",
+            Some(serde_json::json!({"query": r#"FIND {kind: "stream"} RETURN _.id AS id"#})),
+            &[("accept", accept)],
+        )
+        .await;
+        assert_eq!(response.status(), status);
+        if status == StatusCode::OK {
+            assert_eq!(response.headers()[header::VARY], "accept");
+            assert!(
+                response.headers()[header::CONTENT_TYPE]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("application/json")
+            );
+            assert_eq!(json(response).await["rows"], serde_json::json!([]));
+        } else {
+            assert_eq!(json(response).await["code"], "TDB_HTTP_NOT_ACCEPTABLE");
+        }
+    }
+    let inserted = raw_request(
         app.clone(),
         "POST",
-        "/v1/tql",
-        Some(serde_json::json!({"query": "CREATE ({kind: \"stream\"})", "mutation": true})),
+        "/v1/import/nodes",
+        br#"{"id":1,"vector":[1,0],"payload":{"kind":"stream"}}"#.to_vec(),
         &[],
     )
     .await;
+    assert_eq!(inserted.status(), StatusCode::OK);
     let response = request(
         app,
         "POST",
         "/v1/tql",
         Some(serde_json::json!({"query": "FIND {kind: \"stream\"} RETURN *", "profile": true})),
-        &[("accept", "application/x-ndjson")],
+        &[(
+            "accept",
+            "application/json;q=0.4, application/x-ndjson;q=1.0",
+        )],
     )
     .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert!(
-        response.headers()[header::CONTENT_TYPE]
-            .to_str()
-            .unwrap()
-            .starts_with("application/x-ndjson")
-    );
-    let lines = text(response).await;
-    let frames = lines
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(frames[0]["type"], "meta");
-    assert_eq!(frames[0]["columns"][0]["kind"], "node");
-    assert_eq!(frames[1]["type"], "row");
-    assert_eq!(frames[2]["type"], "summary");
-    assert_eq!(frames[2]["profile"]["preparedCacheHit"], false);
+    let profile = assert_query_response(response, "application/x-ndjson",
+        &serde_json::json!([{"name":"_","kind":"node"}]),
+        &[serde_json::json!({"_":{"type":"node","id":"1","vector":[1.0,0.0],"payload":{"kind":"stream"},"edges":[]}})]).await;
+    assert_eq!(profile["preparedCacheHit"], false);
 }
 
 #[tokio::test]
@@ -1665,24 +1738,45 @@ async fn 投影列类型与行顺序和传输编码无关() {
             .status(),
         StatusCode::OK
     );
-    for direction in ["ASC", "DESC"] {
-        let query = format!("FIND {{k:1}} RETURN _.v AS v ORDER BY _.id {direction}");
-        for accept in ["application/json", "application/x-ndjson"] {
-            let response = request(
-                app.clone(),
-                "POST",
-                "/v1/tql",
-                Some(serde_json::json!({"query":query})),
-                &[("accept", accept)],
-            )
-            .await;
-            assert_eq!(response.status(), StatusCode::OK);
-            let body = text(response).await;
-            let meta: Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
-            assert_eq!(
-                meta["columns"],
-                serde_json::json!([{"name":"v","kind":"mixed"}])
-            );
+    let number = serde_json::json!({"v":{"type":"int","value":42}});
+    let word = serde_json::json!({"v":{"type":"string","value":"word"}});
+    for (direction, expected) in [
+        ("ASC", [number.clone(), word.clone()]),
+        ("DESC", [word, number]),
+    ] {
+        let input = serde_json::json!({"query": format!("FIND {{k:1}} RETURN _.v AS v ORDER BY _.id {direction}")});
+        let prepared = request(
+            app.clone(),
+            "POST",
+            "/v1/prepared",
+            Some(input.clone()),
+            &[],
+        )
+        .await;
+        assert_eq!(prepared.status(), StatusCode::OK);
+        let prepared = json(prepared).await;
+        let route = format!(
+            "/v1/prepared/{}/execute",
+            prepared["preparedId"].as_str().unwrap()
+        );
+        for (route, input) in [("/v1/tql", input), (route.as_str(), serde_json::json!({}))] {
+            for accept in ["application/json", "application/x-ndjson"] {
+                let response = request(
+                    app.clone(),
+                    "POST",
+                    route,
+                    Some(input.clone()),
+                    &[("accept", accept)],
+                )
+                .await;
+                assert_query_response(
+                    response,
+                    accept,
+                    &serde_json::json!([{"name":"v","kind":"mixed"}]),
+                    &expected,
+                )
+                .await;
+            }
         }
     }
 }
@@ -1824,7 +1918,7 @@ async fn 图探索端点批量返回真实节点边和路径() {
         Some(serde_json::json!({"operations": [
             {"op":"insert","id":1,"vector":[1.0,0.0],"payload":{"name":"a"}},
             {"op":"insert","id":2,"vector":[0.0,1.0],"payload":{"name":"b"}},
-            {"op":"insert","id":3,"vector":[0.5,0.5],"payload":{"name":"c"}},
+            {"op":"insert","id":3,"vector":[0.5,0.5],"payload":{"name":"c","type":"keep"}},
             {"op":"link","source":1,"target":2,"label":"knows","weight":1.0},
             {"op":"link","source":2,"target":3,"label":"knows","weight":0.5}
         ]})),
@@ -1847,6 +1941,21 @@ async fn 图探索端点批量返回真实节点边和路径() {
     assert_eq!(neighbors["nodes"].as_array().unwrap().len(), 3);
     assert_eq!(neighbors["edges"].as_array().unwrap().len(), 2);
     assert_eq!(neighbors["truncated"], false);
+    for (limit, ids, truncated) in [(1, vec!["1"], true), (2, vec!["1", "3"], false)] {
+        let url = format!("/v1/nodes/1/neighbors?depth=2&direction=out&types=keep&limit={limit}");
+        let filtered = json(request(app.clone(), "GET", &url, None, &[]).await).await;
+        assert_eq!(
+            filtered["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|node| node["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert_eq!(filtered["truncated"], truncated);
+        assert_eq!(filtered["edges"], serde_json::json!([]));
+    }
 
     let edges = json(
         request(
@@ -1893,6 +2002,22 @@ async fn 图探索端点批量返回真实节点边和路径() {
         serde_json::json!(["1", "2", "3"])
     );
     assert_eq!(paths["paths"][0]["edges"][0]["label"], "knows");
+    let self_path = json(
+        request(
+            app.clone(),
+            "GET",
+            "/v1/nodes/1/paths/to/1?maxHops=1",
+            None,
+            &[],
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        self_path["paths"],
+        serde_json::json!([{"nodes":["1"],"edges":[]}])
+    );
+    assert_eq!(self_path["truncated"], false);
 
     let tql = json(
         request(
@@ -1958,6 +2083,8 @@ async fn 搜索参数受服务端硬上限和有限值约束() {
         "/v1/search/vector?top_k=10001",
         "/v1/search/vector?top_k=1&recall_k=100001",
         "/v1/search/vector?top_k=1&rerank_k=100001",
+        "/v1/search/vector?top_k=1&ann_rerank_limit=0",
+        "/v1/search/vector?top_k=1&ann_rerank_limit=100001",
     ] {
         let response = raw_request(
             app.clone(),
@@ -1998,6 +2125,58 @@ async fn ndjson导入失败保持事务原子性() {
 }
 
 #[tokio::test]
+async fn 向量和批量节点响应按编码后字节数拒绝超限结果() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("response-limit.tdb");
+    let config = Config {
+        dim: 2,
+        auto_build_quiver: false,
+        ..Default::default()
+    };
+    {
+        let mut db =
+            triviumdb::Database::<f32>::open_with_config(path.to_str().unwrap(), config).unwrap();
+        // 三个节点的 JSON 字符串转义后各占 6 MiB，任一节点均符合单条写入上限。
+        let payload = serde_json::json!("\n".repeat(3 * 1024 * 1024));
+        for id in 1..=3 {
+            db.insert_with_id(id, &[1., 0.], payload.clone()).unwrap();
+        }
+        db.close().unwrap();
+    }
+    let (app, shutdown) = triviumdb_server::build_app_with_shutdown(ServerConfig {
+        database_path: path,
+        database: config,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let vector = [1.0f32.to_le_bytes(), 0.0f32.to_le_bytes()].concat();
+    for response in [
+        raw_request(
+            app.clone(),
+            "POST",
+            "/v1/search/vector?top_k=3&force_brute_force=true",
+            vector,
+            &[("content-type", "application/vnd.triviumdb.vector+f32")],
+        )
+        .await,
+        request(
+            app.clone(),
+            "POST",
+            "/v1/nodes/batch-get",
+            Some(serde_json::json!({"ids":["1","1","1"]})),
+            &[],
+        )
+        .await,
+    ] {
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let error = json(response).await;
+        assert_eq!(error["code"], "TDB_HTTP_RESPONSE_TOO_LARGE");
+    }
+    shutdown.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn 二进制f32向量检索与边界校验() {
     let (app, _directory) = app("binary_vector").await;
     request(
@@ -2005,7 +2184,11 @@ async fn 二进制f32向量检索与边界校验() {
         "POST",
         "/v1/transactions",
         Some(serde_json::json!({
-            "operations": [{"op": "insert", "id": 1, "vector": [1.0, 0.0], "payload": {"name": "near"}}]
+            "operations": [
+                {"op": "insert", "id": 1, "vector": [1.0, 0.0], "payload": {"name": "near"}},
+                {"op": "insert", "id": 2, "vector": [0.0, 1.0], "payload": {}},
+                {"op": "link", "source": 1, "target": 2, "label": "edge", "weight": 1.0}
+            ]
         })),
         &[],
     )
@@ -2014,13 +2197,16 @@ async fn 二进制f32向量检索与边界校验() {
     let response = raw_request(
         app.clone(),
         "POST",
-        "/v1/search/vector?top_k=1",
+        "/v1/search/vector?top_k=2&min_score=0.9&force_brute_force=true",
         bytes,
         &[("content-type", "application/vnd.triviumdb.vector+f32")],
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(json(response).await["hits"][0]["id"], "1");
+    assert_eq!(
+        json(response).await["hits"],
+        serde_json::json!([{"id":"1", "score":1.0, "payload":{"name":"near"}}])
+    );
 
     let invalid = raw_request(
         app.clone(),
@@ -2266,21 +2452,23 @@ async fn http_preserves_large_node_ids_across_writes_reads_and_projections() {
     });
     let query =
         Some(serde_json::json!({"query":"MATCH (n) RETURN n.id AS ident, n.signed AS signed"}));
-    let normal = request(app.clone(), "POST", "/v1/tql", query.clone(), &[]).await;
-    assert_eq!(normal.status(), StatusCode::OK);
-    assert_eq!(json(normal).await["rows"], serde_json::json!([expected]));
-    let streamed = request(
-        app,
-        "POST",
-        "/v1/tql",
-        query,
-        &[("accept", "application/x-ndjson")],
-    )
-    .await;
-    assert_eq!(streamed.status(), StatusCode::OK);
-    let line = text(streamed).await;
-    let row: Value = serde_json::from_str(line.lines().nth(1).unwrap()).unwrap();
-    assert_eq!(row["row"], expected);
+    for accept in ["application/json", "application/x-ndjson"] {
+        let response = request(
+            app.clone(),
+            "POST",
+            "/v1/tql",
+            query.clone(),
+            &[("accept", accept)],
+        )
+        .await;
+        assert_query_response(
+            response,
+            accept,
+            &serde_json::json!([{"name":"ident","kind":"int"},{"name":"signed","kind":"int"}]),
+            std::slice::from_ref(&expected),
+        )
+        .await;
+    }
 }
 
 #[tokio::test]
@@ -2303,34 +2491,23 @@ async fn empty_projection_and_crlf_diagnostics_preserve_source() {
         ("/v1/tql".to_owned(), query),
         (format!("/v1/prepared/{id}/execute"), serde_json::json!({})),
     ] {
-        let normal = request(app.clone(), "POST", &route, Some(input.clone()), &[]).await;
-        assert_eq!(normal.status(), StatusCode::OK);
-        let body = json(normal).await;
-        assert_eq!(
-            body["columns"],
-            serde_json::json!([{"name":"field","kind":"null"}])
-        );
-        assert_eq!(body["rows"], serde_json::json!([]));
-        let streamed = request(
-            app.clone(),
-            "POST",
-            &route,
-            Some(input),
-            &[("accept", "application/x-ndjson")],
-        )
-        .await;
-        assert_eq!(streamed.status(), StatusCode::OK);
-        let body = text(streamed).await;
-        let frames: Vec<Value> = body
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(frames.len(), 2);
-        assert_eq!(
-            frames[0]["columns"],
-            serde_json::json!([{"name":"field","kind":"null"}])
-        );
-        assert_eq!(frames[1]["rowCount"], 0);
+        for accept in ["application/json", "application/x-ndjson"] {
+            let response = request(
+                app.clone(),
+                "POST",
+                &route,
+                Some(input.clone()),
+                &[("accept", accept)],
+            )
+            .await;
+            assert_query_response(
+                response,
+                accept,
+                &serde_json::json!([{"name":"field","kind":"null"}]),
+                &[],
+            )
+            .await;
+        }
     }
     for route in ["/v1/tql", "/v1/prepared"] {
         let response = request(

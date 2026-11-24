@@ -6,6 +6,7 @@ from types import MappingProxyType
 from functools import partial
 import math
 import triviumdb
+from input_errors import check_input_error
 
 READ_QUERY = "MATCH (n) RETURN $x AS value"
 WRITE_QUERY = "MATCH (n) SET VECTOR(n) == [0, 1]"
@@ -33,16 +34,6 @@ def check_context(result, score):
 def check_hybrid(result, _score):
     assert [(hit.id, hit.payload) for hit in result] == [(7, PAYLOAD)]
     assert all(math.isfinite(hit.score) for hit in result)
-
-
-def check_input_error(error, field, write=None):
-    assert error.schema_version == 1
-    assert error.code == "TDB_INVALID_INPUT"
-    assert error.target == {"field": field}
-    assert error.stage is None
-    assert error.write == write
-    assert list(error.details) == ["reason"]
-    assert isinstance(error.details["reason"], str) and error.details["reason"]
 
 
 def run_query_arguments(root):
