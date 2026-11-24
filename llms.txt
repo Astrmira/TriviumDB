@@ -45,7 +45,7 @@ In the standalone Pelorus benchmark on MERU-1M (one million 512-dimensional nati
 - [Document retrieval](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/documents.md) and [named graphs](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/named-graphs.md) describe evidence spans and graph membership.
 - [Features](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/features.md) and [best practices](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/best-practices.md) cover the data model and application design.
 - [Resource runtime](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/resource-runtime.md) and [lifecycle and snapshots](https://raw.githubusercontent.com/Astrmira/TriviumDB/master/docs/lifecycle-snapshots.md) cover budgets, shutdown, backup, and restore.
-- [0.9.4-beta.1 prerelease notes](https://raw.githubusercontent.com/Astrmira/TriviumDB/v0.9.4-beta.1/docs/changes/0.9.4-beta.1.md) cover batch inputs, memory budgets, and upgrades from [stable 0.9.3](https://github.com/Astrmira/TriviumDB/releases/tag/v0.9.3).
+- [0.9.4-beta.2 prerelease notes](https://raw.githubusercontent.com/Astrmira/TriviumDB/v0.9.4-beta.2/docs/changes/0.9.4-beta.2.md) cover ID-only search, QuIVer rerank budgets, deterministic graph queries, WAL durability, and upgrades from [stable 0.9.3](https://github.com/Astrmira/TriviumDB/releases/tag/v0.9.3).
 
 ## Packages
 
