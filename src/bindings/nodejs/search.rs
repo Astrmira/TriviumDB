@@ -6,7 +6,7 @@ use super::arguments::{
 };
 use super::database::{DbBackend, TriviumDB};
 use super::errors::to_napi_error;
-use super::options::{parse_payload_filter, parse_search_config};
+use super::options::{parse_id_search_config, parse_payload_filter, parse_search_config};
 use super::types::{
     JsGroupedSearchResult, JsHookContext, JsSearchHit, JsSearchWithContextResult, search_hit_to_js,
 };
@@ -280,6 +280,36 @@ impl TriviumDB {
         })
     }
 
+    /// 只返回向量检索命中的 ID。
+    #[napi]
+    pub fn search_ids(
+        &self,
+        env: Env,
+        query_vector: JsUnknown,
+        config: Option<JsUnknown>,
+    ) -> napi::Result<Vec<f64>> {
+        let vector = read_vector(env, query_vector, "queryVector", &self.dtype)?;
+        let config = parse_id_search_config(env, config)?;
+        let ids = match &self.inner {
+            DbBackend::F32(db) => {
+                let vector: Vec<f32> = vector.iter().map(|&value| value as f32).collect();
+                db.search_ids(&vector, &config)
+            }
+            DbBackend::F16(db) => {
+                let vector: Vec<half::f16> = vector
+                    .iter()
+                    .map(|&value| half::f16::from_f64_component(value))
+                    .collect();
+                db.search_ids(&vector, &config)
+            }
+            DbBackend::U64(db) => db.search_ids(&parse_u64_vector(env, &vector)?, &config),
+        }
+        .map_err(|error| to_napi_error(env, error))?;
+        ids.into_iter()
+            .map(|id| super::arguments::node_id_to_js(env, id))
+            .collect()
+    }
+
     /// 认知检索引擎：完全参数化暴露的高级功能 (FISTA, DPP, SA-PPR)
     #[napi]
     pub fn search_advanced(
@@ -330,6 +360,7 @@ impl TriviumDB {
         hybrid_alpha: Option<JsUnknown>,
         payload_filter: Option<JsUnknown>,
         exact: Option<JsUnknown>,
+        ann_rerank_limit: Option<Either<f64, JsUnknown>>,
     ) -> napi::Result<Vec<JsSearchHit>> {
         let query_vector = read_vector(env, query_vector, "queryVector", &self.dtype)?;
         let payload_filter = payload_filter
@@ -343,6 +374,9 @@ impl TriviumDB {
         let alpha = optional_number(env, hybrid_alpha, 0.7, "hybridAlpha")?;
         let payload_filter = parse_payload_filter(env, payload_filter)?;
         let core_config = crate::database::SearchConfig {
+            ann_rerank_limit: ann_rerank_limit
+                .map(|value| parse_search_usize(env, Some(value), 0., "annRerankLimit", true))
+                .transpose()?,
             top_k,
             expand_depth,
             min_score,

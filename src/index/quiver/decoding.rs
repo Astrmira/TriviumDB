@@ -169,12 +169,15 @@ impl QuIVer {
                 "Tombstone 数据不完整 (Tombstone data incomplete)",
             ));
         }
-        if bytes[off..tomb_end].iter().any(|&byte| byte > 1) {
-            return Err(invalid(
-                "QuIVer墓碑编码无效 (Invalid QuIVer tombstone encoding)",
-            ));
-        }
-        let tombstones: Vec<bool> = bytes[off..tomb_end].iter().map(|&b| b != 0).collect();
+        let tombstone_count = bytes[off..tomb_end]
+            .iter()
+            .try_fold(0usize, |count, &flag| match flag {
+                0 | 1 => Ok(count + usize::from(flag)),
+                _ => Err(invalid(
+                    "QuIVer墓碑编码无效 (Invalid QuIVer tombstone encoding)",
+                )),
+            })?;
+        let tombstones: Vec<bool> = bytes[off..tomb_end].iter().map(|&flag| flag != 0).collect();
         off = tomb_end;
 
         // IDs
@@ -341,6 +344,7 @@ impl QuIVer {
             entry_point,
             max_level,
             tombstones,
+            tombstone_count,
             dirty_count,
             prefilter_slot_cache: Mutex::new(PrefilterSlotCacheState::default()),
             visited: Bitset::new(n),
@@ -377,7 +381,7 @@ impl QuIVer {
             n,
             dim,
             max_level,
-            index.tombstones.iter().filter(|&&t| t).count()
+            index.tombstone_count
         );
         Ok(index)
     }

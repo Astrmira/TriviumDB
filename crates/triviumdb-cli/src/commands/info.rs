@@ -26,6 +26,7 @@ pub fn print_info(handle: &DbHandle, path: &str, format: OutputFormat) -> CliRes
     let wal_path = format!("{path}.wal");
     let vec_size = file_size(&vec_path);
     let wal_size = file_size(&wal_path);
+    let wal_pending = triviumdb::storage::wal::Wal::needs_recovery(path);
     let quiver_exists = handle.has_persisted_quiver()?;
 
     let node_count = handle.node_count()?;
@@ -46,6 +47,7 @@ pub fn print_info(handle: &DbHandle, path: &str, format: OutputFormat) -> CliRes
                     "tdb_bytes": tdb_size,
                     "vec_bytes": vec_size,
                     "wal_bytes": wal_size,
+                    "wal_pending": wal_pending,
                     "quiver_present": quiver_exists,
                 },
             });
@@ -64,7 +66,7 @@ pub fn print_info(handle: &DbHandle, path: &str, format: OutputFormat) -> CliRes
             let wal_str = format!(
                 "{}{}",
                 human_bytes_opt(wal_size),
-                if wal_size.unwrap_or(0) > 0 {
+                if wal_pending {
                     "（待处理 / pending）"
                 } else {
                     ""

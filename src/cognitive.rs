@@ -11,6 +11,19 @@
 // 辅助函数：SIMD 友好的向量/矩阵运算
 // ============================================================================
 
+pub(crate) fn validate_dtype<T: crate::VectorType>() -> crate::Result<()> {
+    if crate::vector::is_binary_vector::<T>() {
+        return Err(crate::TriviumError::InvalidInput("浮点认知算子要求 f16 或 f32 向量 (Floating-point cognitive operators require f16 or f32 vectors)".into()));
+    }
+    Ok(())
+}
+
+pub(crate) fn checkpoint(control: &crate::query::tql_executor::QueryControl) -> crate::Result<()> {
+    #[cfg(feature = "test-hooks")]
+    crate::test_hooks::hit(crate::test_hooks::ConcurrencyPoint::CognitiveStep);
+    control.check()
+}
+
 /// 点积 (利用 Rust 编译器自动向量化)
 #[inline]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
@@ -21,7 +34,7 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// L2 范数
 #[inline]
 pub fn l2_norm(v: &[f32]) -> f32 {
-    v.iter().map(|&x| x * x).sum::<f32>().sqrt()
+    v.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>().sqrt() as f32
 }
 
 /// 向量减法: a - b
@@ -87,84 +100,101 @@ pub fn fista_solve(
     lambda: f32,
     max_iter: usize,
 ) -> (Vec<f32>, Vec<f32>, f32) {
+    let (weights, residual) = fista_wide(query, entities, lambda, max_iter, || {
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .unwrap_or_else(|never| match never {});
+    let norm = residual.iter().map(|v| v * v).sum::<f64>().sqrt();
+    (
+        weights.into_iter().map(|v| v as f32).collect(),
+        residual.into_iter().map(|v| v as f32).collect(),
+        norm as f32,
+    )
+}
+
+/// 余弦召回只需要残差方向。先用宽精度比较绝对阈值，再缩放到可表示的方向。
+pub(crate) fn fista_recall_direction(
+    query: &[f32],
+    entities: &[Vec<f32>],
+    lambda: f32,
+    iterations: usize,
+    threshold: f32,
+    control: &crate::query::tql_executor::QueryControl,
+) -> crate::Result<Option<Vec<f32>>> {
+    let (_, residual) = fista_wide(query, entities, lambda, iterations, || checkpoint(control))?;
+    let norm = residual.iter().map(|v| v * v).sum::<f64>().sqrt();
+    Ok((norm > f64::from(threshold))
+        .then(|| residual.into_iter().map(|v| (v / norm) as f32).collect()))
+}
+
+fn fista_wide<E>(
+    query: &[f32],
+    entities: &[Vec<f32>],
+    lambda: f32,
+    max_iter: usize,
+    check: impl Fn() -> Result<(), E>,
+) -> Result<(Vec<f64>, Vec<f64>), E> {
+    check()?;
     let m = entities.len();
-    let d = query.len();
-
+    let mut residual_wide: Vec<_> = query.iter().copied().map(f64::from).collect();
     if m == 0 {
-        return (vec![], query.to_vec(), l2_norm(query));
+        return Ok((Vec::new(), residual_wide));
     }
 
-    // 预计算 Gram 矩阵 EtE (m×m) — 密集矩阵, SIMD 友好
-    let mut ete = vec![0.0f32; m * m];
+    // 先扩宽分量再相乘，使极大和极小的有限输入共用同一个求解过程。
+    let wide_dot = |left: &[f32], right: &[f32]| -> f64 {
+        left.iter()
+            .zip(right)
+            .map(|(&x, &y)| f64::from(x) * f64::from(y))
+            .sum()
+    };
+    let mut gram = vec![0.0; m * m];
     for i in 0..m {
+        check()?;
         for j in i..m {
-            let val = dot(&entities[i], &entities[j]);
-            ete[i * m + j] = val;
-            ete[j * m + i] = val; // 对称
+            let value = wide_dot(&entities[i], &entities[j]);
+            gram[i * m + j] = value;
+            gram[j * m + i] = value;
         }
     }
-
-    // 预计算 Etq (m,) = E @ q
-    let etq: Vec<f32> = entities.iter().map(|e| dot(e, query)).collect();
-
-    // Lipschitz 常数 = ‖EᵀE‖₂ (谱范数上界)
-    // 快速近似: Gershgorin 圆盘定理上界 = max_i Σ_j |EtE[i,j]|
-    let mut lip = 0.0f32;
-    for i in 0..m {
-        let row_sum: f32 = (0..m).map(|j| ete[i * m + j].abs()).sum();
-        if row_sum > lip {
-            lip = row_sum;
-        }
+    let lip = gram
+        .chunks_exact(m)
+        .map(|row| row.iter().map(|value| value.abs()).sum::<f64>())
+        .fold(0.0, f64::max);
+    if lip == 0.0 {
+        return Ok((vec![0.0; m], residual_wide));
     }
-    if lip < 1e-10 {
-        return (vec![0.0; m], query.to_vec(), l2_norm(query));
-    }
-
-    let step = 1.0 / lip;
-
-    // FISTA 主循环
-    let mut alpha = vec![0.0f32; m];
-    let mut y = vec![0.0f32; m];
-    let mut t = 1.0f32;
-
+    let target: Vec<_> = entities
+        .iter()
+        .map(|entity| wide_dot(entity, query))
+        .collect();
+    let threshold = f64::from(lambda) / lip;
+    let mut alpha = vec![0.0; m];
+    let mut next = vec![0.0; m];
+    let mut y = vec![0.0; m];
+    let mut t = 1.0_f64;
     for _ in 0..max_iter {
-        // grad = EtE @ y - Etq
-        let ete_y = mat_vec_mul(&ete, m, m, &y);
-        let grad = vec_sub(&ete_y, &etq);
-
-        // 近端步: soft_threshold(y - step * grad, lambda * step)
-        let step_grad = vec_scale(&grad, step);
-        let y_minus_sg = vec_sub(&y, &step_grad);
-        let alpha_new = soft_threshold(&y_minus_sg, lambda * step);
-
-        // FISTA 动量更新加速
-        let t_new = (1.0 + (1.0 + 4.0 * t * t).sqrt()) / 2.0;
-        let momentum = (t - 1.0) / t_new;
-
-        // y = alpha_new + momentum * (alpha_new - alpha)
-        let diff = vec_sub(&alpha_new, &alpha);
-        let scaled_diff = vec_scale(&diff, momentum);
-        y = vec_add(&alpha_new, &scaled_diff);
-
-        alpha = alpha_new;
-        t = t_new;
+        check()?;
+        for (i, row) in gram.chunks_exact(m).enumerate() {
+            let projected: f64 = row.iter().zip(&y).map(|(g, v)| g * v).sum();
+            let step = y[i] + (target[i] - projected) / lip;
+            next[i] = (step.abs() - threshold).max(0.0).copysign(step);
+        }
+        let next_t = (1.0 + (1.0 + 4.0 * t * t).sqrt()) / 2.0;
+        for i in 0..m {
+            y[i] = next[i] + (t - 1.0) / next_t * (next[i] - alpha[i]);
+        }
+        std::mem::swap(&mut alpha, &mut next);
+        t = next_t;
     }
 
-    // 残差: r = q - Eᵀ @ α
-    // Eᵀ @ α = Σ_i α_i * e_i
-    let mut reconstruction = vec![0.0f32; d];
-    for (i, &a) in alpha.iter().enumerate() {
-        if a.abs() > 1e-10 {
-            for (j, &e_val) in entities[i].iter().enumerate() {
-                reconstruction[j] += a * e_val;
-            }
+    for (&weight, entity) in alpha.iter().zip(entities) {
+        check()?;
+        for (value, &component) in residual_wide.iter_mut().zip(entity) {
+            *value -= weight * f64::from(component);
         }
     }
-
-    let residual = vec_sub(query, &reconstruction);
-    let residual_norm = l2_norm(&residual);
-
-    (alpha, residual, residual_norm)
+    Ok((alpha, residual_wide))
 }
 
 // ============================================================================
@@ -185,34 +215,40 @@ pub fn dpp_greedy(
         .iter()
         .map(|&score| f64::from(score))
         .collect::<Vec<_>>();
-    dpp_greedy_wide(vecs, &scores, k, quality_weight)
+    dpp_greedy_wide(vecs, &scores, k, quality_weight, || {
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .unwrap_or_else(|never| match never {})
 }
 
-pub(crate) fn dpp_greedy_wide(
+pub(crate) fn dpp_greedy_wide<E>(
     vecs: &[Vec<f32>],
     scores: &[f64],
     k: usize,
     quality_weight: f32,
-) -> Vec<usize> {
+    check: impl Fn() -> Result<(), E>,
+) -> Result<Vec<usize>, E> {
+    check()?;
     let n = scores.len();
-    if n <= k {
-        return (0..n).collect();
+    let k = k.min(n);
+    if k == 0 {
+        return Ok(Vec::new());
     }
 
     // L2 归一化，用于计算余弦相似度核
     let normed: Vec<Vec<f32>> = vecs
         .iter()
         .map(|v| {
-            let norm = v
-                .iter()
-                .map(|&x| f64::from(x).powi(2))
-                .sum::<f64>()
-                .sqrt()
-                .max(1e-10);
-            let inv = 1.0 / norm;
-            v.iter().map(|&x| (f64::from(x) * inv) as f32).collect()
+            check()?;
+            let norm = v.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>().sqrt();
+            // 空切片表示零方向，其自内积和与任何方向的内积均为零。
+            if norm == 0.0 {
+                return Ok(Vec::new());
+            }
+            let inv = norm.recip();
+            Ok(v.iter().map(|&x| (f64::from(x) * inv) as f32).collect())
         })
-        .collect();
+        .collect::<Result<_, E>>()?;
 
     // 在对数域统一缩放核与正则项，保留行列式排序并限制所有质量因子的上界。
     let log_q: Vec<f64> = scores
@@ -228,7 +264,18 @@ pub(crate) fn dpp_greedy_wide(
     let stopping_variance = ((1e-10f64).ln() - 2.0 * log_scale).exp();
 
     // d[i] 保存缩放后的条件方差，正则项与质量核使用同一比例。
-    let mut diag: Vec<f64> = q.iter().map(|&qi| qi * qi + regularization).collect();
+    let mut diag: Vec<f64> = q
+        .iter()
+        .zip(&normed)
+        .map(|(&qi, vector)| {
+            // 非零方向归一化后的自内积精确为一，避免分量舍入改变同质量排序。
+            if vector.is_empty() {
+                regularization
+            } else {
+                qi * qi + regularization
+            }
+        })
+        .collect();
 
     // Cholesky 增量列: O(nk^2)
     let mut c = vec![vec![0.0f64; n]; k];
@@ -236,6 +283,7 @@ pub(crate) fn dpp_greedy_wide(
     let mut selected = Vec::with_capacity(k);
 
     for j in 0..k {
+        check()?;
         // 找条件方差 d[i] 最大的（即边际极大化行列式的）
         let mut best = None;
         let mut best_val = f64::NEG_INFINITY;
@@ -260,18 +308,20 @@ pub(crate) fn dpp_greedy_wide(
         // 惰性求值构建 L 矩阵
         let l_best_row: Vec<f64> = (0..n)
             .map(|i| {
+                check()?;
                 let similarity = normed[best]
                     .iter()
                     .zip(&normed[i])
                     .map(|(&a, &b)| f64::from(a) * f64::from(b))
                     .sum::<f64>();
-                q[best] * similarity * q[i]
+                Ok(q[best] * similarity * q[i])
             })
-            .collect();
+            .collect::<Result<_, E>>()?;
 
         // 增量消元: c[j, :] = L[best, :] - Σ_{i<j} c[i, best] * c[i, :]
         let mut cj = l_best_row;
         for i in 0..j {
+            check()?;
             let c_i_best = c[i][best];
             for idx in 0..n {
                 cj[idx] -= c_i_best * c[i][idx];
@@ -294,7 +344,7 @@ pub(crate) fn dpp_greedy_wide(
         c[j] = cj;
     }
 
-    selected
+    Ok(selected)
 }
 
 // ============================================================================
@@ -314,7 +364,34 @@ pub fn nmf_multiplicative_update(
     k: usize,
     max_iter: usize,
     tol: f32,
-) -> (Vec<f32>, Vec<f32>) {
+) -> crate::Result<(Vec<f32>, Vec<f32>)> {
+    let control = crate::request::control().unwrap_or_default();
+    nmf_checked(v_flat, m, d, k, max_iter, tol, &control)
+}
+
+pub(crate) fn nmf_checked(
+    v_flat: &[f32],
+    m: usize,
+    d: usize,
+    k: usize,
+    max_iter: usize,
+    tol: f32,
+    control: &crate::query::tql_executor::QueryControl,
+) -> crate::Result<(Vec<f32>, Vec<f32>)> {
+    checkpoint(control)?;
+    if m == 0
+        || d == 0
+        || k == 0
+        || m.checked_mul(d) != Some(v_flat.len())
+        || [(m, d), (m, k), (k, d), (k, k)].iter().any(|&(a, b)| {
+            a.checked_mul(b)
+                .is_none_or(|n| n > isize::MAX as usize / size_of::<f64>())
+        })
+    {
+        return Err(crate::TriviumError::InvalidInput(
+            "NMF 矩阵形状与元素数量无效 (Invalid NMF matrix shape or element count)".into(),
+        ));
+    }
     let eps = 1e-10f64;
 
     // 绝对值截断保证非负
@@ -342,6 +419,7 @@ pub fn nmf_multiplicative_update(
         // --- 1. 更新隐特征 H ---
         let mut wtv = vec![0.0f64; k * d];
         for ki in 0..k {
+            checkpoint(control)?;
             for di in 0..d {
                 let mut sum = 0.0f64;
                 for mi in 0..m {
@@ -353,6 +431,7 @@ pub fn nmf_multiplicative_update(
 
         let mut wtw = vec![0.0f64; k * k];
         for i in 0..k {
+            checkpoint(control)?;
             for j in i..k {
                 let mut sum = 0.0f64;
                 for mi in 0..m {
@@ -365,6 +444,7 @@ pub fn nmf_multiplicative_update(
 
         let mut wtwh = vec![0.0f64; k * d];
         for i in 0..k {
+            checkpoint(control)?;
             for di in 0..d {
                 let mut sum = 0.0f64;
                 for j in 0..k {
@@ -382,7 +462,9 @@ pub fn nmf_multiplicative_update(
         // --- 2. 更新权重基 W ---
         let mut vht = vec![0.0f64; m * k];
         for mi in 0..m {
+            checkpoint(control)?;
             for ki in 0..k {
+                checkpoint(control)?;
                 let mut sum = 0.0f64;
                 for di in 0..d {
                     sum += v_abs[mi * d + di] * h[ki * d + di];
@@ -393,6 +475,7 @@ pub fn nmf_multiplicative_update(
 
         let mut hht = vec![0.0f64; k * k];
         for i in 0..k {
+            checkpoint(control)?;
             for j in i..k {
                 let mut sum = 0.0f64;
                 for di in 0..d {
@@ -405,7 +488,9 @@ pub fn nmf_multiplicative_update(
 
         let mut whht = vec![0.0f64; m * k];
         for mi in 0..m {
+            checkpoint(control)?;
             for ki in 0..k {
+                checkpoint(control)?;
                 let mut sum = 0.0f64;
                 for j in 0..k {
                     sum += w[mi * k + j] * hht[j * k + ki];
@@ -424,6 +509,7 @@ pub fn nmf_multiplicative_update(
             let mut res_sq = 0.0f64;
             let mut v_sq = 0.0f64;
             for mi in 0..m {
+                checkpoint(control)?;
                 for di in 0..d {
                     let mut wh = 0.0f64;
                     for ki in 0..k {
@@ -440,10 +526,10 @@ pub fn nmf_multiplicative_update(
         }
     }
 
-    (
+    Ok((
         w.into_iter().map(|value| value as f32).collect(),
         h.into_iter().map(|value| value as f32).collect(),
-    )
+    ))
 }
 
 /// NMF 查询深度分析：评估原意图中的不均衡性与新领域
@@ -455,19 +541,21 @@ pub fn nmf_analyze_query(
     k: usize,
     d: usize,
 ) -> (f32, usize, f32, Vec<f32>) {
-    let q_abs: Vec<f32> = query.iter().map(|&x| x.abs()).collect();
-
-    // 投影主题 q @ H.T -> (k,)
-    let mut raw_scores = vec![0.0f32; k];
-    for ki in 0..k {
-        raw_scores[ki] = dot(&q_abs, &h_flat[ki * d..(ki + 1) * d]);
+    let q_abs: Vec<f64> = query.iter().map(|&x| f64::from(x).abs()).collect();
+    let mut raw_scores = vec![0.0f64; k];
+    for (ki, score) in raw_scores.iter_mut().enumerate() {
+        *score = q_abs
+            .iter()
+            .zip(&h_flat[ki * d..(ki + 1) * d])
+            .map(|(q, &h)| q * f64::from(h))
+            .sum();
     }
-
-    // 主题权重 Softmax 操作
-    let max_s = raw_scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let exp_scores: Vec<f32> = raw_scores.iter().map(|&s| (s - max_s).exp()).collect();
-    let sum_exp: f32 = exp_scores.iter().sum();
-    let q_topics: Vec<f32> = exp_scores.iter().map(|&e| e / (sum_exp + 1e-10)).collect();
+    let max_s = raw_scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    for s in &mut raw_scores {
+        *s = (*s - max_s).exp();
+    }
+    let sum_exp: f64 = raw_scores.iter().sum();
+    let q_topics: Vec<f32> = raw_scores.iter().map(|s| (s / sum_exp) as f32).collect();
 
     // 1. 语义聚焦深度 = 1 - 归一化信息熵 (完全均匀发布意味着毫无深度)
     let entropy: f32 = q_topics
@@ -482,19 +570,27 @@ pub fn nmf_analyze_query(
     let topic_coverage = q_topics.iter().filter(|&&p| p > threshold).count();
 
     // 3. 意图新颖脱轨程度: 当 H 矩阵重构不出 Query 的真实全貌，即代表有未被索引的“新颖逻辑”
-    let mut q_recon = vec![0.0f32; d];
+    let mut q_recon = vec![0.0f64; d];
     for ki in 0..k {
         let w = q_topics[ki];
         if w > 1e-10 {
             for di in 0..d {
-                q_recon[di] += w * h_flat[ki * d + di];
+                q_recon[di] += f64::from(w) * f64::from(h_flat[ki * d + di]);
             }
         }
     }
-    let diff = vec_sub(&q_abs, &q_recon);
-    let q_norm = l2_norm(&q_abs).max(1e-10);
-    // 约束到 0..=1 内部
-    let novelty = (l2_norm(&diff) / q_norm).min(1.0);
+    let diff = q_abs
+        .iter()
+        .zip(q_recon)
+        .map(|(q, r)| (q - r).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let q_norm = q_abs.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let novelty = if q_norm > 0.0 {
+        (diff / q_norm).min(1.0) as f32
+    } else {
+        f32::from(diff > 0.0)
+    };
 
     (semantic_depth, topic_coverage, novelty, q_topics)
 }

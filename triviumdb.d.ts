@@ -179,15 +179,12 @@ export interface JsNodeView<T = any> {
   numEdges: number;
 }
 
-/**
- * Cypher 查询的一行结果
- * 键名为 MATCH 语句中你定义的绑定变量（如 a, b），值为匹配到的节点视图摘要
- */
-export type QueryRow = Record<string, {
-  id: number;
-  payload: any;
-  numEdges: number;
-}>;
+/** TQL 中节点、边的端点和路径节点均使用十进制字符串 ID。 */
+type QueryData<Wide extends bigint = never> = null | boolean | number | string | Wide | QueryData<Wide>[] | { [key: string]: QueryData<Wide> };
+export type QueryNode = { id: string; payload: QueryData<bigint>; numEdges: number };
+export type QueryEdge = { type: 'edge'; source: string; target: string; label: string; weight: number; metadata: QueryData<bigint>; graph_id?: string };
+export type QueryValue = QueryData | QueryNode | QueryEdge | string[];
+export type QueryRow = Record<string, QueryValue>;
 
 // ==========================================
 // MongoDB 风格的 Filter 定义
@@ -225,7 +222,9 @@ export interface JsSearchConfig {
   recallK?: number;
   /** SA-PPR/FISTA/DPP前候选池；0表示自动 */
   rerankK?: number;
-  /** 图谱扩散跳数 (默认 2) */
+  /** QuIVer 内部精排候选数。导航宽度至少覆盖此预算。 */
+  annRerankLimit?: number;
+  /** 图谱扩散跳数。searchWithContext 默认 0，searchAdvanced 默认 2。 */
   expandDepth?: number;
   /** 余弦相似度下限 (默认 0.0) */
   minScore?: number;
@@ -279,6 +278,9 @@ export interface JsSearchConfig {
   /** 图扩散方向，默认 out */
   edgeDirection?: 'out' | 'in' | 'both';
 }
+
+export type JsIdSearchConfig = Pick<JsSearchConfig,
+  'topK' | 'recallK' | 'annRerankLimit' | 'minScore' | 'payloadFilter' | 'exact'>;
 
 export interface JsClusterResult {
   /** 节点到簇的扁平映射 [nodeId1, clusterId1, nodeId2, clusterId2...] */
@@ -872,6 +874,8 @@ export class TriviumDB {
    * @param config      管线配置（所有字段均可选，有安全默认值）
    */
   searchAdvanced(queryVector: Vector, config?: JsSearchConfig | null): JsSearchHit[];
+  searchIds(queryVector: Vector, config?: JsIdSearchConfig | null): number[];
+  searchIdsBatch(queryVectors: VectorBatch, config?: JsIdSearchConfig | null, parallelism?: number | null): Promise<number[][]>;
 
   /**
    * 向量 + 文本双路混合检索：带图扩散的双路检索入口
@@ -882,7 +886,7 @@ export class TriviumDB {
    * @param minScore    最小分数
    * @param hybridAlpha 向量排名权重 [0, 1]，文本排名权重为 1 - hybridAlpha。默认 0.7
    */
-  searchHybrid(queryVector: Vector, queryText: string, topK?: number | null, expandDepth?: number | null, minScore?: number | null, hybridAlpha?: number | null, payloadFilter?: Record<string, unknown> | null, exact?: boolean | null): JsSearchHit[];
+  searchHybrid(queryVector: Vector, queryText: string, topK?: number | null, expandDepth?: number | null, minScore?: number | null, hybridAlpha?: number | null, payloadFilter?: Record<string, unknown> | null, exact?: boolean | null, annRerankLimit?: number | null): JsSearchHit[];
 
   /**
    * 替换节点的 BM25 正文；空文本清除正文，关键词保持不变
@@ -959,7 +963,7 @@ export class TriviumDB {
    * ```
    * DOCUMENTS来源支持文档读取配置，GRAPH前缀选择图作用域，命名边结果携带graph_id。
    */
-  tql(query: string): any[];
+  tql(query: string): QueryRow[];
 
   /** 同步执行 Console v1 JSON 请求；节点 ID 与 u64 向量分量使用十进制字符串。 */
   consoleRequest(session: ConsoleSession, requestJson: string): string;
@@ -983,7 +987,7 @@ export class TriviumDB {
   /** 命名图、共享成员、独立边及显式联合查询的Core JSON入口。 */
   graphRequest(requestJson: string): string;
   prepareTql(query: string): PreparedTql;
-  executePreparedTql(prepared: PreparedTql, parameters: Record<string, string | number | boolean | null>): any[];
+  executePreparedTql(prepared: PreparedTql, parameters: Record<string, string | number | bigint | boolean | null>): QueryRow[];
 
   /**
    * 执行 TQL 写操作（CREATE / SET / DELETE / DETACH DELETE）

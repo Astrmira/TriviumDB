@@ -110,6 +110,16 @@ pub(crate) struct PelorusState {
 }
 
 impl PelorusState {
+    pub(crate) fn for_new_dimension(config: PelorusConfig, dim: usize) -> Result<Self> {
+        config.validate(dim)?;
+        Ok(Self {
+            config,
+            index: None,
+            ssd: None,
+            changed: Default::default(),
+        })
+    }
+
     pub fn build(
         config: PelorusConfig,
         dim: usize,

@@ -345,10 +345,10 @@ impl Filter {
                                     Filter::Exists(field.to_string(), b)
                                 }
                                 "$size" => {
-                                    let n = op_val
-                                        .as_u64()
-                                        .ok_or_else(|| "$size 需要正整数".to_string())?
-                                        as usize;
+                                    let n = op_val.as_u64().ok_or_else(|| {
+                                        "$size 需要非负整数 (Expected unsigned length)".to_string()
+                                    })?;
+                                    let n = usize::try_from(n).map_err(|_| "$size 超出平台范围 (Array length exceeds platform range)".to_string())?;
                                     Filter::Size(field.to_string(), n)
                                 }
                                 "$all" => {

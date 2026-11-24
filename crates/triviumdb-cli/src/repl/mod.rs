@@ -40,8 +40,10 @@ pub fn run(mut handle: DbHandle, path: &str, format: OutputFormat) -> CliResult 
                 }
                 let _ = rl.add_history_entry(input);
                 if input.starts_with('.') {
-                    if handle_meta(input, &mut handle, path, &mut current_format) {
-                        break;
+                    match handle_meta(input, &mut handle, path, &mut current_format) {
+                        Ok(true) => break,
+                        Ok(false) => {}
+                        Err(error) => eprintln!("{} {error}", "错误 / Error:".red()),
                     }
                 } else {
                     run_tql(input, &mut handle, current_format);
@@ -135,16 +137,21 @@ fn run_tql(input: &str, handle: &mut DbHandle, format: OutputFormat) {
 }
 
 /// 处理点号元命令，返回 `true` 表示请求退出。
-fn handle_meta(input: &str, handle: &mut DbHandle, path: &str, format: &mut OutputFormat) -> bool {
+fn handle_meta(
+    input: &str,
+    handle: &mut DbHandle,
+    path: &str,
+    format: &mut OutputFormat,
+) -> Result<bool, Box<dyn std::error::Error>> {
     let mut parts = input.splitn(2, char::is_whitespace);
     let cmd = parts.next().unwrap_or("");
     let arg = parts.next().unwrap_or("").trim();
 
     match cmd {
-        ".quit" | ".exit" | ".q" => return true,
+        ".quit" | ".exit" | ".q" => return Ok(true),
         ".help" | ".h" | ".?" => print_help(),
         ".info" => {
-            let _ = commands::info::print_info(handle, path, *format);
+            commands::info::print_info(handle, path, *format)?;
         }
         ".stats" => print_stats(handle),
         ".flush" => match handle.flush() {
@@ -152,13 +159,13 @@ fn handle_meta(input: &str, handle: &mut DbHandle, path: &str, format: &mut Outp
             Err(e) => eprintln!("{} {e}", "错误 / Error:".red()),
         },
         ".compact" => {
-            let _ = commands::compact::run(handle);
+            commands::compact::run(handle)?;
         }
         ".export" => {
             if arg.is_empty() {
                 eprintln!("用法 / Usage: .export <file.jsonl>");
             } else {
-                let _ = commands::export::run(handle, path, arg);
+                commands::export::run(handle, path, arg)?;
             }
         }
         ".format" => match OutputFormat::parse(arg) {
@@ -173,7 +180,42 @@ fn handle_meta(input: &str, handle: &mut DbHandle, path: &str, format: &mut Outp
             "未知命令 / Unknown command: {other}（输入 .help 查看帮助 / Enter .help for help）"
         ),
     }
-    false
+    Ok(false)
+}
+
+#[cfg(test)]
+#[test]
+fn 导出命令传递拒绝且数据库仍可导出() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.tdb");
+    let path = path.to_str().unwrap();
+    let mut db = DbHandle::open(path, 1, crate::db_handle::DType::F32).unwrap();
+    db.insert_f32(&[1.], serde_json::json!({"kind":"sample"}))
+        .unwrap();
+    db.flush().unwrap();
+    let mut format = OutputFormat::Json;
+    let error =
+        handle_meta(&format!(".export {path}.wal"), &mut db, path, &mut format).unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<triviumdb::TriviumError>()
+            .unwrap()
+            .code(),
+        "TDB_INVALID_INPUT"
+    );
+    let output = dir.path().join("nodes.jsonl");
+    assert!(
+        !handle_meta(
+            &format!(".export {}", output.display()),
+            &mut db,
+            path,
+            &mut format
+        )
+        .unwrap()
+    );
+    let row: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    assert_eq!(row["id"], 1);
+    assert_eq!(row["payload"], serde_json::json!({"kind":"sample"}));
 }
 
 fn print_help() {

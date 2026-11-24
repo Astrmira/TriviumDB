@@ -80,10 +80,14 @@ pub(super) fn parse_search_config(
         top_k: parse_search_usize(env, object.get("topK")?, 5.0, "topK", true)?,
         recall_k: parse_search_usize(env, object.get("recallK")?, 0.0, "recallK", false)?,
         rerank_k: parse_search_usize(env, object.get("rerankK")?, 0.0, "rerankK", false)?,
+        ann_rerank_limit: object
+            .get("annRerankLimit")?
+            .map(|value| parse_search_usize(env, Some(value), 0.0, "annRerankLimit", true))
+            .transpose()?,
         expand_depth: parse_search_usize(
             env,
             object.get("expandDepth")?,
-            2.0,
+            if advanced { 2.0 } else { 0.0 },
             "expandDepth",
             false,
         )?,
@@ -173,6 +177,24 @@ pub(super) fn parse_search_config(
         .map(|value| read_string(env, value, "customQueryText"))
         .transpose()?;
     Ok((config, query_text))
+}
+
+pub(super) fn parse_id_search_config(
+    env: Env,
+    value: Option<JsUnknown>,
+) -> napi::Result<crate::database::SearchConfig> {
+    let (config, _) = parse_search_config(env, value, false)?;
+    Ok(crate::database::SearchConfig {
+        top_k: config.top_k,
+        recall_k: config.recall_k,
+        ann_rerank_limit: config.ann_rerank_limit,
+        min_score: config.min_score,
+        payload_filter: config.payload_filter,
+        expand_depth: 0,
+        enable_advanced_pipeline: false,
+        force_brute_force: config.force_brute_force,
+        ..Default::default()
+    })
 }
 
 pub(super) fn parse_row_overflow(

@@ -6,7 +6,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const fixture = require('../contracts/retrieval_fields.json')
 const text = require('../contracts/index_maintenance_cases.json')
-const { invalid } = require('./query_arguments')
+const { invalid } = require('./input_errors')
 const validation = { phase: 'validation', outcome: 'not_committed' }
 
 function rejectReentry(db) {

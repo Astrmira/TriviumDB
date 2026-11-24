@@ -103,10 +103,7 @@ fn verified_property_matches<T: VectorType>(
     let mut ids = Vec::new();
     for id in candidates {
         crate::request::check_current()?;
-        if mt
-            .try_get_payload(id)?
-            .is_some_and(|payload| matches(&payload))
-        {
+        if mt.payload_matches(id, &matches)? {
             if ids.len() == max_results {
                 return Err(TriviumError::QueryRowBudgetExceeded {
                     budget: max_results,
@@ -117,6 +114,14 @@ fn verified_property_matches<T: VectorType>(
     }
     ids.sort_unstable();
     Ok(ids)
+}
+
+fn edge_clone_bytes(edges: &[crate::node::Edge]) -> usize {
+    edges
+        .iter()
+        .fold(std::mem::size_of_val(edges), |total, edge| {
+            total.saturating_add(edge.clone_heap_bytes())
+        })
 }
 
 fn normalized_database_path(path: &str) -> Result<PathBuf> {
@@ -389,9 +394,20 @@ pub(crate) fn reject_hook_reentrant_access<T: VectorType>(
 // 3. QuIVer 构建注册表不得在持有 MemTable guard 时等待 Condvar。
 // 禁止反向获取，避免 stateful/MemTable/WAL 之间形成 ABBA 死锁。
 
+pub(crate) type QuiverBuilds = Arc<(
+    Mutex<std::collections::HashMap<u64, Arc<QuiverFlight>>>,
+    Condvar,
+)>;
+
+pub(crate) struct QuiverFlight {
+    config: crate::index::quiver::QuIVerConfig,
+    published: AtomicBool,
+}
+
 pub(crate) struct QuiverBuildGuard {
+    flight: Arc<QuiverFlight>,
     generation: u64,
-    state: Arc<(Mutex<std::collections::HashSet<u64>>, std::sync::Condvar)>,
+    state: QuiverBuilds,
 }
 
 impl Drop for QuiverBuildGuard {
@@ -403,14 +419,21 @@ impl Drop for QuiverBuildGuard {
 }
 
 pub(crate) fn try_start_quiver_build(
-    state: &Arc<(Mutex<std::collections::HashSet<u64>>, std::sync::Condvar)>,
+    state: &QuiverBuilds,
     generation: u64,
-) -> Option<QuiverBuildGuard> {
+    config: &crate::index::quiver::QuIVerConfig,
+) -> std::result::Result<QuiverBuildGuard, Arc<QuiverFlight>> {
     let mut building = lock_or_recover(&state.0);
-    if !building.insert(generation) {
-        return None;
+    if let Some(flight) = building.get(&generation) {
+        return Err(Arc::clone(flight));
     }
-    Some(QuiverBuildGuard {
+    let flight = Arc::new(QuiverFlight {
+        config: *config,
+        published: AtomicBool::new(false),
+    });
+    building.insert(generation, Arc::clone(&flight));
+    Ok(QuiverBuildGuard {
+        flight,
         generation,
         state: Arc::clone(state),
     })
@@ -422,9 +445,9 @@ pub struct PreparedQuiverBuild<T: VectorType> {
     config: crate::index::quiver::QuIVerConfig,
     memtable: Arc<RwLock<MemTable<T>>>,
     wal: Arc<Mutex<Wal>>,
-    _build_guard: QuiverBuildGuard,
-    _operation_guard: OperationGuard,
     _workspace: crate::resources::RequestWorkspace,
+    build_guard: QuiverBuildGuard,
+    _operation_guard: OperationGuard,
     resource_runtime: crate::resources::ResourceRuntime,
     /// 必须晚于存储、操作与工作区析构，防止原 Database 丢弃后提前释放文件锁。
     _file_lock: Arc<Mutex<Option<std::fs::File>>>,
@@ -454,7 +477,12 @@ impl<T: VectorType> PreparedQuiverBuild<T> {
             mt.ensure_readable()?;
             let wal = lock_or_recover(&self.wal);
             wal.ensure_writable()?;
-            Ok(mt.publish_quiver_if_current(source_generation, index))
+            let published = mt.publish_quiver_if_current(source_generation, index);
+            self.build_guard
+                .flight
+                .published
+                .store(published, Ordering::Release);
+            Ok(published)
         })
     }
 }
@@ -465,7 +493,7 @@ pub struct QuiverBuildHandle<T: VectorType> {
     memtable: Arc<RwLock<MemTable<T>>>,
     wal: Arc<Mutex<Wal>>,
     resource_runtime: crate::resources::ResourceRuntime,
-    quiver_builds: Arc<(Mutex<std::collections::HashSet<u64>>, Condvar)>,
+    quiver_builds: QuiverBuilds,
     lifecycle: Arc<(Mutex<LifecycleState>, Condvar)>,
     access_mode: AccessMode,
     /// 与真实存储共同持有租约；显式关闭通过共享槽统一释放。
@@ -502,7 +530,7 @@ impl<T: VectorType> QuiverBuildHandle<T> {
                 }
             };
             let config = crate::index::quiver::QuIVerConfig::default();
-            let (snapshot, workspace) = {
+            let (snapshot, workspace, build_guard) = {
                 let mt = read_or_recover(&self.memtable);
                 mt.ensure_readable()?;
                 lock_or_recover(&self.wal).ensure_writable()?;
@@ -510,18 +538,16 @@ impl<T: VectorType> QuiverBuildHandle<T> {
                 if !mt.auto_quiver_build_needed() {
                     return Ok(None);
                 }
-                let workspace = mt.reserve_request_workspace(
-                    mt.reserved_database_bytes(),
-                    mt.quiver_build_peak_bytes(&config),
-                )?;
-                (mt.quiver_build_snapshot(), workspace)
+                let Ok(build_guard) =
+                    try_start_quiver_build(&self.quiver_builds, mt.vector_generation(), &config)
+                else {
+                    return Ok(None);
+                };
+                let workspace =
+                    mt.reserve_instance_workspace(mt.quiver_build_peak_bytes(&config))?;
+                (mt.quiver_build_snapshot(), workspace, build_guard)
             };
             let Some(snapshot) = snapshot else {
-                return Ok(None);
-            };
-            let Some(build_guard) =
-                try_start_quiver_build(&self.quiver_builds, snapshot.generation)
-            else {
                 return Ok(None);
             };
             Ok(Some(PreparedQuiverBuild {
@@ -529,7 +555,7 @@ impl<T: VectorType> QuiverBuildHandle<T> {
                 config,
                 memtable: Arc::clone(&self.memtable),
                 wal: Arc::clone(&self.wal),
-                _build_guard: build_guard,
+                build_guard,
                 _operation_guard: operation_guard,
                 _workspace: workspace,
                 resource_runtime: self.resource_runtime.clone(),
@@ -658,7 +684,7 @@ pub struct Database<T: VectorType> {
     /// 有状态 fatigue 查询保持数据库级顺序语义。
     stateful_search: Arc<Mutex<()>>,
     /// 正在锁外构建的 QuIVer 向量代际，避免重复构建。
-    quiver_builds: Arc<(Mutex<std::collections::HashSet<u64>>, std::sync::Condvar)>,
+    quiver_builds: QuiverBuilds,
     /// 生命周期和已进入操作计数；Closing 阻止新操作并等待现有操作退出。
     lifecycle: Arc<(Mutex<LifecycleState>, Condvar)>,
     access_mode: AccessMode,
@@ -671,10 +697,9 @@ pub(crate) struct SearchHandle<T: VectorType> {
     db_path: String,
     storage_mode: StorageMode,
     access_mode: AccessMode,
-    memory_limit: usize,
     resource_runtime: crate::resources::ResourceRuntime,
     hook: HookSlot,
-    quiver_builds: Arc<(Mutex<std::collections::HashSet<u64>>, Condvar)>,
+    quiver_builds: QuiverBuilds,
     lifecycle: Arc<(Mutex<LifecycleState>, Condvar)>,
     /// 最后释放租约，覆盖排队任务和已进入的查询。
     _file_lock: Arc<Mutex<Option<std::fs::File>>>,
@@ -688,7 +713,6 @@ impl<T: VectorType> Clone for SearchHandle<T> {
             db_path: self.db_path.clone(),
             storage_mode: self.storage_mode,
             access_mode: self.access_mode,
-            memory_limit: self.memory_limit,
             resource_runtime: self.resource_runtime.clone(),
             hook: Arc::clone(&self.hook),
             quiver_builds: Arc::clone(&self.quiver_builds),
@@ -742,15 +766,34 @@ impl<T: VectorType> SearchHandle<T> {
         search_config: &SearchConfig,
         batch_config: &BatchSearchConfig,
     ) -> Result<(Vec<Vec<SearchHit>>, crate::resources::RequestWorkspace)> {
+        self.search_batch_projected(query_vectors, search_config, batch_config, true, |hits| {
+            hits
+        })
+    }
+
+    pub(crate) fn search_ids_batch_with_workspace(
+        &self,
+        query_vectors: &[Vec<T>],
+        search_config: &SearchConfig,
+        batch_config: &BatchSearchConfig,
+    ) -> Result<(Vec<Vec<NodeId>>, crate::resources::RequestWorkspace)> {
+        self.search_batch_projected(query_vectors, search_config, batch_config, false, |hits| {
+            hits.iter().map(|hit| hit.id).collect()
+        })
+    }
+
+    fn search_batch_projected<R: Send>(
+        &self,
+        query_vectors: &[Vec<T>],
+        search_config: &SearchConfig,
+        batch_config: &BatchSearchConfig,
+        include_payload: bool,
+        project: impl Fn(Vec<SearchHit>) -> Vec<R> + Sync,
+    ) -> Result<(Vec<Vec<R>>, crate::resources::RequestWorkspace)> {
         let _operation = self.enter_operation()?;
         if search_config.enable_refractory_fatigue {
             return Err(TriviumError::InvalidInput(
                 "批量并行查询不支持 enable_refractory_fatigue".into(),
-            ));
-        }
-        if search_config.top_k == 0 {
-            return Err(TriviumError::InvalidInput(
-                "批量查询 top_k 必须大于 0".into(),
             ));
         }
         if batch_config.parallelism > 64 {
@@ -758,17 +801,18 @@ impl<T: VectorType> SearchHandle<T> {
                 "批量查询 parallelism 不得超过 64".into(),
             ));
         }
-        let dim = read_or_recover(&self.memtable).dim();
+        let (dim, memory_limit) = {
+            let mt = read_or_recover(&self.memtable);
+            (mt.dim(), mt.instance_memory_limit())
+        };
         pipeline::validate_config::<T>(search_config, dim)?;
         for query in query_vectors {
             crate::vector::validate_query_vector(query, dim)?;
         }
 
         let response = read_or_recover(&self.memtable).reserve_request_workspace(
-            self.memory_limit,
-            query_vectors
-                .len()
-                .saturating_mul(size_of::<Vec<SearchHit>>()),
+            memory_limit,
+            query_vectors.len().saturating_mul(size_of::<Vec<R>>()),
         )?;
         if query_vectors.is_empty() {
             return Ok((Vec::new(), response));
@@ -781,46 +825,34 @@ impl<T: VectorType> SearchHandle<T> {
                 &self.db_path,
                 self.storage_mode,
                 self.access_mode,
-                self.memory_limit,
+                memory_limit,
                 false,
             )?;
         }
 
         let request = crate::request::current();
-        let search_one = |query: &Vec<T>| -> Result<Vec<SearchHit>> {
+        let search_one = |query: &Vec<T>| -> Result<Vec<R>> {
             let _context = request
                 .as_ref()
                 .map(crate::request::RequestContext::enter)
                 .transpose()?;
             crate::request::check_current()?;
-            let mut ctx = HookContext::new();
             let hits = pipeline::execute_pipeline_with_limit(
                 &self.memtable,
                 &self.quiver_builds,
-                self.memory_limit,
+                memory_limit,
                 &self.hook(),
                 None,
                 Some(query),
                 search_config,
-                &mut ctx,
                 None,
-            )?
-            .combined_hits;
-            let bytes = hits.iter().fold(
-                hits.capacity().saturating_mul(size_of::<SearchHit>()),
-                |total, hit| {
-                    total.saturating_add(crate::storage::payload_store::query_clone_peak(
-                        &hit.payload,
-                    ))
-                },
-            );
-            let resident = if self.memory_limit == 0 {
-                0
-            } else {
-                read_or_recover(&self.memtable).resident_memory_bytes()
-            };
-            lock_or_recover(&response).grow_by(resident, self.memory_limit, bytes)?;
-            Ok(hits)
+                None,
+                include_payload,
+            )?;
+            if let Some(ticket) = hits.result_workspace {
+                lock_or_recover(&response).absorb(ticket);
+            }
+            Ok(project(hits.combined_hits))
         };
         let mut results = Vec::with_capacity(query_vectors.len());
         results.push(search_one(&query_vectors[0])?);
@@ -966,7 +998,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         runtime: crate::resources::ResourceRuntime,
         reservation: crate::resources::DatabaseReservation,
     ) -> Result<Self> {
-        Self::open_reserved_with_lock(path, config, runtime, reservation, None)
+        Self::open_reserved_with_lock(path, config, runtime, reservation, None, None)
     }
 
     fn open_reserved_with_lock(
@@ -975,6 +1007,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         runtime: crate::resources::ResourceRuntime,
         reservation: crate::resources::DatabaseReservation,
         reserved_lock: Option<std::fs::File>,
+        declared: Option<crate::storage::snapshot::GenerationManifest>,
     ) -> Result<Self> {
         let dim = config.dim;
 
@@ -1047,7 +1080,19 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         crate::storage::format::admit(path)?;
 
         if config.access_mode == AccessMode::Immutable {
-            crate::storage::snapshot::validate_manifest(path, std::any::type_name::<T>(), dim)?;
+            match declared {
+                Some(manifest) => crate::storage::snapshot::validate_declared_manifest(
+                    path,
+                    std::any::type_name::<T>(),
+                    dim,
+                    manifest,
+                )?,
+                None => crate::storage::snapshot::validate_manifest(
+                    path,
+                    std::any::type_name::<T>(),
+                    dim,
+                )?,
+            };
         }
         let mut memtable = if std::path::Path::new(path).exists() {
             file_format::load_with_memory_limit(
@@ -1069,7 +1114,6 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                 got: dim,
             });
         }
-        memtable.set_text_memory_limit(config.memory_limit);
         memtable.pelorus_policy = config.missing_index_policy;
         // 恢复必须从第一条记录开始使用调用方预算，避免先填充默认解析缓存再淘汰。
         memtable.begin_loading(config.memory_limit);
@@ -1109,14 +1153,14 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                 path,
                 config.memory_limit,
                 &restored_bytes,
-                |entry| {
+                |entry, held_bytes| {
                     if !base_seen {
                         base_seen = matches!(&entry, WalEntry::Checkpoint { token } if Some(*token) == checkpoint_token);
                         if !base_seen {
                             return Ok(());
                         }
                     }
-                    transaction::replay_entry(&mut memtable, entry)?;
+                    transaction::replay_entry(&mut memtable, entry, held_bytes)?;
                     memtable.check_load_allocation(0)?;
                     restored_bytes.set(memtable.estimated_memory_bytes());
                     entry_count = entry_count.saturating_add(1);
@@ -1235,7 +1279,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
             hook: Arc::new(RwLock::new(Arc::new(NoopHook))),
             stateful_search: Arc::new(Mutex::new(())),
             quiver_builds: Arc::new((
-                Mutex::new(std::collections::HashSet::new()),
+                Mutex::new(std::collections::HashMap::new()),
                 std::sync::Condvar::new(),
             )),
             lifecycle: Arc::new((
@@ -1266,6 +1310,30 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                 auto_build_quiver: false,
                 ..Default::default()
             },
+        )
+    }
+
+    pub(crate) fn open_declared_generation(
+        path: &str,
+        dim: usize,
+        declared: crate::storage::snapshot::GenerationManifest,
+    ) -> Result<Self> {
+        let config = Config {
+            dim,
+            access_mode: AccessMode::Immutable,
+            auto_build_quiver: false,
+            ..Default::default()
+        };
+        let runtime = crate::resources::ResourceRuntime::shared_default();
+        let _task = runtime.enter_task()?;
+        let reservation = runtime.reserve_database(config.memory_limit)?;
+        Self::open_reserved_with_lock(
+            path,
+            config,
+            runtime.clone(),
+            reservation,
+            None,
+            Some(declared),
         )
     }
 
@@ -1493,7 +1561,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                 return Err(TriviumError::InvalidInput("u64 使用汉明精确检索，QuIVer 构建支持浮点向量 (u64 uses exact Hamming retrieval; QuIVer construction supports floating-point vectors)".into()));
             }
             let cfg = config.unwrap_or_default();
-            let (_workspace, snapshot) = {
+            let (build_guard, _workspace, snapshot) = {
                 let mt = read_or_recover(&self.memtable);
                 mt.ensure_readable()?;
                 lock_or_recover(&self.wal).ensure_writable()?;
@@ -1504,32 +1572,51 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                         mt.dim()
                     )));
                 }
-                let workspace = mt.reserve_request_workspace(
-                    self.memory_limit,
-                    mt.quiver_build_peak_bytes(&cfg),
-                )?;
-                (workspace, mt.quiver_build_snapshot())
+                let source_generation = mt.vector_generation();
+                #[cfg(feature = "test-hooks")]
+                crate::test_hooks::hit(crate::test_hooks::ConcurrencyPoint::BeforeQuiverBuildClaim);
+                let build_guard = match try_start_quiver_build(
+                    &self.quiver_builds,
+                    source_generation,
+                    &cfg,
+                ) {
+                    Ok(owner) => owner,
+                    Err(flight) => {
+                        drop(mt);
+                        #[cfg(feature = "test-hooks")]
+                        crate::test_hooks::hit(
+                            crate::test_hooks::ConcurrencyPoint::QuiverBuildFollowerWaiting,
+                        );
+                        let (building, changed) = &*self.quiver_builds;
+                        let mut active = lock_or_recover(building);
+                        while active
+                            .get(&source_generation)
+                            .is_some_and(|current| Arc::ptr_eq(current, &flight))
+                        {
+                            active = changed
+                                .wait(active)
+                                .unwrap_or_else(|poison| poison.into_inner());
+                        }
+                        drop(active);
+                        let mt = read_or_recover(&self.memtable);
+                        mt.ensure_readable()?;
+                        if flight.published.load(Ordering::Acquire)
+                            && flight.config == cfg
+                            && mt.vector_generation() == source_generation
+                            && mt
+                                .quiver()
+                                .is_some_and(|index| index.matches_build_config(&cfg))
+                        {
+                            return Ok(());
+                        }
+                        return Err(TriviumError::InvalidInput("等待的 QuIVer 索引未发布，请重试 (Awaited QuIVer index was not published; retry)".into()));
+                    }
+                };
+                let workspace = mt.reserve_instance_workspace(mt.quiver_build_peak_bytes(&cfg))?;
+                (build_guard, workspace, mt.quiver_build_snapshot())
             };
             if let Some(snapshot) = snapshot {
                 let source_generation = snapshot.generation;
-                #[cfg(feature = "test-hooks")]
-                crate::test_hooks::hit(crate::test_hooks::ConcurrencyPoint::BeforeQuiverBuildClaim);
-                let Some(_build_guard) =
-                    try_start_quiver_build(&self.quiver_builds, source_generation)
-                else {
-                    #[cfg(feature = "test-hooks")]
-                    crate::test_hooks::hit(
-                        crate::test_hooks::ConcurrencyPoint::QuiverBuildFollowerWaiting,
-                    );
-                    let (building, changed) = &*self.quiver_builds;
-                    let mut active = lock_or_recover(building);
-                    while active.contains(&source_generation) {
-                        active = changed
-                            .wait(active)
-                            .unwrap_or_else(|poison| poison.into_inner());
-                    }
-                    return Ok(());
-                };
                 let index = self
                     .resource_runtime
                     .pool(self.resource_runtime.parallelism())?
@@ -1540,7 +1627,12 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                 mt.ensure_readable()?;
                 let wal = lock_or_recover(&self.wal);
                 wal.ensure_writable()?;
-                if !mt.publish_quiver_if_current(source_generation, index) {
+                let published = mt.publish_quiver_if_current(source_generation, index);
+                build_guard
+                    .flight
+                    .published
+                    .store(published, Ordering::Release);
+                if !published {
                     return Err(TriviumError::InvalidInput(
                         "QuIVer 构建期间向量数据已变化，请重试".into(),
                     ));
@@ -1668,7 +1760,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                 active.database_memory_limit = bytes;
             }
             self.tql_limits.memory_limit = bytes;
-            mt.set_text_memory_limit(bytes);
+            mt.set_instance_memory_limit(bytes);
             Ok(())
         })
     }
@@ -2088,10 +2180,14 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         label: &str,
     ) -> Result<Option<crate::node::Edge>> {
         self.read_operation(|| {
-            read_or_recover(&self.memtable)
-                .get_edge(src, dst, label)
-                .cloned()
-        })
+            let mt = read_or_recover(&self.memtable);
+            let Some(edge) = mt.get_edge(src, dst, label) else {
+                return Ok(None);
+            };
+            let _workspace =
+                mt.reserve_instance_workspace(edge_clone_bytes(std::slice::from_ref(edge)))?;
+            Ok(Some(edge.clone()))
+        })?
     }
 
     pub fn shortest_path(
@@ -2102,13 +2198,19 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         label: Option<&str>,
     ) -> Result<Option<Vec<NodeId>>> {
         self.read_operation(|| {
+            let mt = read_or_recover(&self.memtable);
+            mt.ensure_readable()?;
+            let mut workspace = mt.reserve_instance_workspace(0)?;
             crate::graph::pathfinding::shortest_path_checked(
-                &*read_or_recover(&self.memtable),
+                &*mt,
                 source,
                 target,
                 max_depth,
                 label,
-                |_, _| crate::request::check_current(),
+                |nodes, _| {
+                    crate::request::check_current()?;
+                    crate::graph::pathfinding::admit_path_nodes(&mt, &mut workspace, nodes)
+                },
             )
         })?
     }
@@ -2120,14 +2222,15 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         label: Option<&str>,
         budget: &crate::graph::budget::TraversalBudget,
     ) -> Result<crate::graph::pathfinding::ShortestPathOutput> {
-        let _operation = self.enter_operation()?;
-        crate::graph::pathfinding::shortest_path_bidirectional(
-            &read_or_recover(&self.memtable),
-            source,
-            target,
-            label,
-            budget,
-        )
+        self.read_operation(|| {
+            crate::graph::pathfinding::shortest_path_bidirectional(
+                &read_or_recover(&self.memtable),
+                source,
+                target,
+                label,
+                budget,
+            )
+        })?
     }
 
     pub fn graph_stats(&self) -> Result<crate::storage::memtable::GraphStats> {
@@ -2233,16 +2336,18 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
             reject_hook_reentrant_access(&self.memtable)?;
             let mut mt = write_or_recover(&self.memtable);
             mt.validate_update_payload(id)?;
-            let mut payload = mt
-                .get_payload(id)
-                .map(|payload| (*payload).clone())
+            let mut workspace = mt.reserve_instance_workspace(mt.payload_query_peak(id)?)?;
+            let previous = mt
+                .try_get_payload(id)?
                 .ok_or(TriviumError::NodeNotFound(id))?;
-            if !payload
+            if !previous
                 .get(field)
                 .is_some_and(|actual| cas_value_matches(actual, expected))
             {
                 return Err(TriviumError::ConditionalUpdateNotMatched { id });
             }
+            let mut payload = (*previous).clone();
+            drop(previous);
             let object = payload.as_object_mut().ok_or_else(|| {
                 TriviumError::InvalidInput(
                 "条件更新要求 Payload 为 JSON 对象 (Conditional update requires an object payload)"
@@ -2254,7 +2359,10 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
             let additional = encoded.saturating_mul(2).saturating_add(
                 crate::storage::payload_store::estimate_json_memory(&payload),
             );
-            let current_bytes = mt.estimated_memory_bytes();
+            // 解码可能新增常驻缓存。即使写阶段所需凭证更小，也要以当前常驻量重新准入。
+            let current_bytes = mt
+                .estimated_memory_bytes()
+                .saturating_sub(workspace.bytes());
             if self.memory_limit > 0 && current_bytes.saturating_add(additional) > self.memory_limit
             {
                 return Err(TriviumError::CapacityReservationRejected {
@@ -2264,6 +2372,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                     memory_limit: self.memory_limit,
                 });
             }
+            mt.resize_instance_workspace(&mut workspace, additional)?;
             let payload_str = payload.to_string();
             if payload_str.len() > 8 * 1024 * 1024 {
                 return Err(TriviumError::PayloadTooLarge {
@@ -2468,8 +2577,6 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
     /// db.patch_payload(id, serde_json::json!({"$inc": {"visits": 1}}))?;
     /// // 删除字段
     /// db.patch_payload(id, serde_json::json!({"$unset": {"old_field": true}}))?;
-    /// // 简写模式（等价于 $set）
-    /// db.patch_payload(id, serde_json::json!({"name": "Bob"}))?;
     /// ```
     pub fn patch_payload(&mut self, id: NodeId, patch: serde_json::Value) -> Result<()> {
         Self::write_operation(|write| {
@@ -2669,8 +2776,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
             lock_or_recover(&self.wal).ensure_writable()?;
             write.phase = WritePhase::Validation;
             let mut mt = write_or_recover(&self.memtable);
-            mt.prepare_text_index()?;
-            mt.try_build_text_index()
+            mt.build_text_index()
         })
     }
 
@@ -2691,6 +2797,10 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
     pub fn get_payload(&self, id: NodeId) -> Result<Option<serde_json::Value>> {
         self.read_operation(|| {
             let mt = read_or_recover(&self.memtable);
+            if !mt.contains(id) {
+                return Ok(None);
+            }
+            let _workspace = mt.reserve_instance_workspace(mt.payload_query_peak(id)?)?;
             mt.try_get_payload(id)
                 .map(|payload| payload.map(|payload| (*payload).clone()))
         })?
@@ -2699,8 +2809,13 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
     pub fn get_edges(&self, id: NodeId) -> Result<Vec<crate::node::Edge>> {
         self.read_operation(|| {
             let mt = read_or_recover(&self.memtable);
-            mt.get_edges(id).map(|e| e.to_vec()).unwrap_or_default()
-        })
+            let edges = mt.get_edges(id).unwrap_or_default();
+            if edges.is_empty() {
+                return Ok(Vec::new());
+            }
+            let _workspace = mt.reserve_instance_workspace(edge_clone_bytes(edges))?;
+            Ok(edges.to_vec())
+        })?
     }
 
     /// 在同一读视图中按来源、目标、标签分页，仅为返回页复制边元数据。
@@ -2720,6 +2835,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         }
         let mut page = Vec::new();
         let mut total = 0usize;
+        let mut workspace = mt.reserve_instance_workspace(0)?;
         let mut visit = |source, outgoing: bool| -> Result<()> {
             crate::request::check_current()?;
             let edges = mt.get_edges(source).unwrap_or_default();
@@ -2737,6 +2853,11 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                     continue;
                 }
                 if total >= offset && page.len() < limit {
+                    let bytes = workspace
+                        .bytes()
+                        .saturating_add(std::mem::size_of::<SubgraphEdge>() * 4)
+                        .saturating_add(edge.clone_heap_bytes());
+                    mt.resize_instance_workspace(&mut workspace, bytes)?;
                     page.push(SubgraphEdge {
                         source_id: source,
                         target_id: edge.target_id,
@@ -2774,14 +2895,28 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         id: NodeId,
         label: Option<&str>,
     ) -> Result<Vec<crate::node::IncomingEdge>> {
-        self.read_operation(|| read_or_recover(&self.memtable).get_incoming_edges(id, label))
+        self.read_operation(|| {
+            let mt = read_or_recover(&self.memtable);
+            let bytes = mt
+                .incoming_edge_refs(id, label)
+                .try_fold(0usize, |total, (_, edge)| {
+                    crate::request::check_current()?;
+                    Ok::<_, TriviumError>(
+                        total
+                            .saturating_add(std::mem::size_of::<crate::node::IncomingEdge>() * 2)
+                            .saturating_add(edge.clone_heap_bytes()),
+                    )
+                })?;
+            if bytes == 0 {
+                return Ok(Vec::new());
+            }
+            let _workspace = mt.reserve_instance_workspace(bytes)?;
+            Ok(mt.get_incoming_edges(id, label))
+        })?
     }
 
     pub fn get_all_ids(&self) -> Result<Vec<NodeId>> {
-        self.read_operation(|| {
-            let mt = read_or_recover(&self.memtable);
-            mt.get_all_ids()
-        })
+        self.all_node_ids()
     }
 
     // ════════════════════════════════════════════════════════
@@ -2835,13 +2970,38 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
             db_path: self.db_path.clone(),
             storage_mode: self.storage_mode,
             access_mode: self.access_mode,
-            memory_limit: self.memory_limit,
             resource_runtime: self.resource_runtime.clone(),
             hook: Arc::clone(&self.hook),
             quiver_builds: Arc::clone(&self.quiver_builds),
             lifecycle: Arc::clone(&self.lifecycle),
             _file_lock: Arc::clone(&self._lock_file),
         }
+    }
+
+    /// 批量返回命中 ID，保持查询顺序及每条查询的排序。
+    pub fn search_ids_batch(
+        &self,
+        query_vectors: &[Vec<T>],
+        search_config: &SearchConfig,
+        batch_config: &BatchSearchConfig,
+    ) -> Result<Vec<Vec<NodeId>>> {
+        self.search_ids_batch_with_workspace(query_vectors, search_config, batch_config)
+            .map(|(ids, _)| ids)
+    }
+
+    pub(crate) fn search_ids_batch_with_workspace(
+        &self,
+        query_vectors: &[Vec<T>],
+        search_config: &SearchConfig,
+        batch_config: &BatchSearchConfig,
+    ) -> Result<(Vec<Vec<NodeId>>, crate::resources::RequestWorkspace)> {
+        let _operation = self.enter_operation()?;
+        self.require_reader_determinism(search_config)?;
+        self.search_handle().search_ids_batch_with_workspace(
+            query_vectors,
+            search_config,
+            batch_config,
+        )
     }
 
     pub fn search_exact(&self, query_vector: &[T], top_k: usize) -> Result<Vec<SearchHit>> {
@@ -2856,6 +3016,12 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
     ) -> Result<Vec<SearchHit>> {
         let _operation = self.enter_operation()?;
         self.search_hybrid(None, Some(query_vector), config)
+    }
+
+    /// 只返回命中 ID。纯向量路径可跳过结果 Payload 的读取。
+    pub fn search_ids(&self, query_vector: &[T], config: &SearchConfig) -> Result<Vec<NodeId>> {
+        self.search_hybrid_impl(None, Some(query_vector), config, None, false)
+            .map(|hits| hits.into_iter().map(|hit| hit.id).collect())
     }
 
     fn prepare_hybrid_search(
@@ -2908,8 +3074,9 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
             query_text,
             query_vector,
             config,
-            &mut ctx,
+            Some(&mut ctx),
             None,
+            true,
         )?;
         Ok((results.combined_hits, ctx))
     }
@@ -2924,7 +3091,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         query_vector: Option<&[T]>,
         config: &SearchConfig,
     ) -> Result<Vec<SearchHit>> {
-        self.search_hybrid_impl(query_text, query_vector, config, None)
+        self.search_hybrid_impl(query_text, query_vector, config, None, true)
     }
 
     /// 以 alpha 和 1-alpha 融合向量与文本排名。端点只使用对应的召回来源。
@@ -2943,7 +3110,13 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         }
         let mut config = config.clone();
         config.enable_text_hybrid_search = alpha < 1.0;
-        self.search_hybrid_impl(Some(query_text), Some(query_vector), &config, Some(alpha))
+        self.search_hybrid_impl(
+            Some(query_text),
+            Some(query_vector),
+            &config,
+            Some(alpha),
+            true,
+        )
     }
 
     fn search_hybrid_impl(
@@ -2952,6 +3125,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         query_vector: Option<&[T]>,
         config: &SearchConfig,
         alpha: Option<f64>,
+        include_payload: bool,
     ) -> Result<Vec<SearchHit>> {
         self.require_reader_determinism(config)?;
         let _operation = self.enter_operation()?;
@@ -2967,7 +3141,6 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         if _stateful_guard.is_some() {
             crate::test_hooks::hit(crate::test_hooks::ConcurrencyPoint::StatefulSearchEntered);
         }
-        let mut ctx = HookContext::new();
         pipeline::execute_pipeline_with_limit(
             &self.memtable,
             &self.quiver_builds,
@@ -2976,8 +3149,9 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
             query_text,
             query_vector,
             config,
-            &mut ctx,
+            None,
             alpha,
+            include_payload,
         )
         .map(|output| output.combined_hits)
     }
@@ -2994,7 +3168,6 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         let _stateful_guard = config
             .enable_refractory_fatigue
             .then(|| lock_or_recover(&self.stateful_search));
-        let mut ctx = HookContext::new();
         pipeline::execute_pipeline_with_limit(
             &self.memtable,
             &self.quiver_builds,
@@ -3003,11 +3176,12 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
             query_text,
             query_vector,
             config,
-            &mut ctx,
             None,
+            None,
+            true,
         )
         .map(|output| crate::node::GroupedSearchResult {
-            semantic_hits: output.semantic_hits,
+            semantic_hits: output.semantic_hits.unwrap_or(output.combined_hits),
             graph_hits: output.graph_hits,
         })
     }
@@ -3019,6 +3193,15 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
     pub fn get(&self, id: NodeId) -> Result<Option<crate::node::NodeView<T>>> {
         self.read_operation(|| {
             let mt = read_or_recover(&self.memtable);
+            if !mt.contains(id) {
+                return Ok(None);
+            }
+            let edges = mt.get_edges(id).unwrap_or_default();
+            let bytes = mt
+                .payload_query_peak(id)?
+                .saturating_add(mt.dim().saturating_mul(std::mem::size_of::<T>()))
+                .saturating_add(edge_clone_bytes(edges));
+            let _workspace = mt.reserve_instance_workspace(bytes)?;
             let Some(payload) = mt.try_get_payload(id)? else {
                 return Ok(None);
             };
@@ -3028,7 +3211,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                     TriviumError::CorruptedFile("节点缺少向量 (Node vector is missing)".into())
                 })?
                 .to_vec();
-            let edges = mt.get_edges(id).unwrap_or(&[]).to_vec();
+            let edges = edges.to_vec();
             Ok(Some(crate::node::NodeView {
                 id,
                 vector,
@@ -3057,47 +3240,53 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                     reason: "邻域工作区估算溢出 (Neighborhood workspace estimate overflowed)"
                         .into(),
                 })?;
-            let mut workspace = mt.resource_runtime().reserve_workspace(bytes)?;
+            let mut workspace = mt.reserve_instance_workspace(bytes)?;
+            let resident = if self.memory_limit == 0 { 0 } else { mt.resident_memory_bytes() };
             let mut distances = HashMap::new();
             let mut queue = VecDeque::new();
             distances.insert(id, 0usize);
             queue.push_back(id);
             while let Some(current) = queue.pop_front() {
+                crate::request::check_current()?;
                 let current_depth = distances[&current];
                 if current_depth >= depth {
                     continue;
                 }
                 if let Some(edges) = mt.get_edges(current) {
+                    #[cfg(feature="test-hooks")]
+                    crate::test_hooks::hit(crate::test_hooks::ConcurrencyPoint::NeighborhoodEdges);
                     for edge in edges {
+                        crate::request::check_current()?;
                         if labels.is_some_and(|allowed| {
                             !allowed.iter().any(|label| label == &edge.label)
                         }) {
                             continue;
                         }
-                        let projected = distances.len().saturating_add(1).max(4);
-                        if let std::collections::hash_map::Entry::Vacant(entry) =
-                            distances.entry(edge.target_id)
-                        {
-                            let bytes = projected
-                                .checked_mul(192)
-                                .and_then(|bytes| bytes.checked_add(256))
-                                .ok_or_else(|| TriviumError::CapacityAllocationFailed {
-                                    reason: "邻域工作区估算溢出 (Neighborhood workspace estimate overflowed)"
-                                        .into(),
-                                })?;
-                            workspace.resize(bytes)?;
-                            entry.insert(current_depth + 1);
-                            queue.push_back(edge.target_id);
+                        if distances.contains_key(&edge.target_id) {
+                            continue;
                         }
+                        // 取得新增节点额度后才允许哈希表扩容。
+                        let bytes = distances.len().saturating_add(1).max(4)
+                            .checked_mul(192)
+                            .and_then(|bytes| bytes.checked_add(256))
+                            .ok_or_else(|| TriviumError::CapacityAllocationFailed {
+                                reason: "邻域工作区估算溢出 (Neighborhood workspace estimate overflowed)"
+                                    .into(),
+                            })?;
+                        workspace.resize_result(bytes, resident, self.memory_limit)?;
+                        distances.insert(edge.target_id, current_depth + 1);
+                        queue.push_back(edge.target_id);
                     }
                 }
             }
+            crate::request::check_current()?;
             distances.remove(&id);
             let mut result: Vec<(usize, NodeId)> = distances
                 .into_iter()
                 .map(|(node_id, distance)| (distance, node_id))
                 .collect();
             result.sort_unstable();
+            crate::request::check_current()?;
             Ok(result.into_iter().map(|(_, node_id)| node_id).collect())
         })?
     }
@@ -3122,6 +3311,24 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
     ) -> Result<crate::graph::reachability::ReachabilityOutput> {
         let _operation = self.enter_operation()?;
         crate::graph::reachability::traverse_detailed(&read_or_recover(&self.memtable), id, config)
+    }
+
+    /// 在默认图沿出边查找到目标的最短路径，保留逐跳边事实。
+    pub fn shortest_path_detailed(
+        &self,
+        source: NodeId,
+        target: NodeId,
+        max_depth: usize,
+        label: Option<String>,
+    ) -> Result<crate::graph::reachability::ReachabilityOutput> {
+        let _operation = self.enter_operation()?;
+        crate::graph::reachability::shortest_detailed(
+            &read_or_recover(&self.memtable),
+            source,
+            target,
+            max_depth,
+            label,
+        )
     }
 
     pub fn query_subgraph(
@@ -3504,7 +3711,23 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
             .map(|suffix| {
                 (
                     suffix.to_owned(),
-                    std::path::Path::new(&format!("{}{}", self.db_path, suffix)).exists(),
+                    if suffix == ".pld" && self.storage_mode == StorageMode::Mmap {
+                        crate::storage::file_format::read_marker_generation(&format!(
+                            "{}.flush_ok",
+                            self.db_path
+                        ))
+                        .is_some_and(|generation| {
+                            std::path::Path::new(
+                                &crate::storage::file_format::payload_path_for_generation(
+                                    &self.db_path,
+                                    generation,
+                                ),
+                            )
+                            .is_file()
+                        })
+                    } else {
+                        std::path::Path::new(&format!("{}{}", self.db_path, suffix)).exists()
+                    },
                 )
             })
             .collect();
@@ -3913,16 +4136,23 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         WriteErrorInfo::capture_destination(|write| {
             let _operation = self.enter_maintenance_operation()?;
             self.require_write_access("publish_generation_manifest")?;
-            lock_or_recover(&self.wal).ensure_writable()?;
+            reject_hook_reentrant_access(&self.memtable)?;
+            let mut mt = write_or_recover(&self.memtable);
+            mt.ensure_readable()?;
+            let mut wal = lock_or_recover(&self.wal);
+            wal.ensure_writable()?;
             write.phase = WritePhase::Validation;
             crate::storage::snapshot::validate_generation_id(generation_id)?;
-            self.flush()?;
+            file_format::checkpoint(&mut mt, &mut wal, &self.db_path, self.storage_mode, false)?;
+            // 保持事实锁直到摘要、清单与目录同步完成，避免后台检查点跨代。
+            drop(wal);
+            mt.advise_cold_vectors_dontneed();
             crate::storage::snapshot::write_manifest_with_write_info(
                 &self.db_path,
                 generation_id,
                 std::any::type_name::<T>(),
-                self.dim(),
-                self.node_count()?,
+                mt.dim(),
+                mt.node_count(),
                 write,
             )
         })
@@ -4092,7 +4322,12 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
 
     /// 获取所有活跃节点的 ID 列表
     pub fn all_node_ids(&self) -> Result<Vec<NodeId>> {
-        self.read_operation(|| read_or_recover(&self.memtable).all_node_ids())
+        self.read_operation(|| {
+            let mt = read_or_recover(&self.memtable);
+            let _workspace =
+                mt.reserve_instance_workspace(mt.node_count().saturating_mul(size_of::<NodeId>()))?;
+            Ok(mt.all_node_ids())
+        })?
     }
 
     // ════════════════════════════════════════════════════════
@@ -4170,6 +4405,171 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Database::open(&dir.join("test.tdb").to_string_lossy(), 3).unwrap()
+    }
+
+    #[test]
+    fn 已捕获的批量句柄在执行时读取最新实例额度() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("batch.tdb");
+        let mut db = Database::<f32>::open(path.to_str().unwrap(), 1).unwrap();
+        db.insert_with_id(1, &[1.], json!(1)).unwrap();
+        let handle = db.search_handle();
+        let query = super::SearchConfig {
+            top_k: 1,
+            expand_depth: 0,
+            force_brute_force: true,
+            ..Default::default()
+        };
+        db.set_memory_limit(db.estimated_memory() + 1).unwrap();
+        assert_eq!(
+            handle
+                .search_batch(&[vec![1.]], &query, &Default::default())
+                .unwrap_err()
+                .code(),
+            "TDB_CAPACITY_RESERVATION_REJECTED"
+        );
+        db.set_memory_limit(0).unwrap();
+        let batches = handle
+            .search_batch(&[vec![1.]], &query, &Default::default())
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0]
+                .iter()
+                .map(|hit| (hit.id, &hit.payload))
+                .collect::<Vec<_>>(),
+            [(1, &json!(1))]
+        );
+    }
+
+    #[test]
+    fn 事务失效退化索引并由独立预算准入重建() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("maintenance.tdb");
+        let cfg = super::Config {
+            dim: 1,
+            auto_build_quiver: false,
+            ..Default::default()
+        };
+        let mut db = Database::<f32>::open_with_config(path.to_str().unwrap(), cfg).unwrap();
+        let mut tx = db.begin_tx();
+        for id in 1..=96 {
+            tx.insert_with_id(id, &[1.], json!(id));
+        }
+        tx.commit().unwrap();
+        db.build_quiver_index(None).unwrap();
+        db.set_memory_limit(db.estimated_memory() + 4096).unwrap();
+        assert_eq!(
+            db.build_quiver_index(None).unwrap_err().code(),
+            "TDB_CAPACITY_RESERVATION_REJECTED"
+        );
+        let mut tx = db.begin_tx();
+        for id in 1..=32 {
+            tx.delete(id);
+        }
+        tx.commit().unwrap();
+        assert!(super::read_or_recover(&db.memtable).quiver().is_none());
+        db.set_memory_limit(0).unwrap();
+        db.build_quiver_index(None).unwrap();
+        db.close().unwrap();
+        let db = Database::<f32>::open_with_config(path.to_str().unwrap(), cfg).unwrap();
+        assert_eq!(
+            db.search_exact(&[1.], 96)
+                .unwrap()
+                .iter()
+                .map(|hit| hit.id)
+                .collect::<Vec<_>>(),
+            (33..=96).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn 窄导航在有限共享工作区内返回真实命中() {
+        use crate::{ResourceLimits, ResourceRuntime, SearchConfig};
+        let root = tempfile::tempdir().unwrap();
+        let runtime = ResourceRuntime::new(ResourceLimits {
+            memory_limit: 64 << 20,
+            max_threads: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut db = Database::<f32>::open_with_runtime(
+            root.path().join("beam.tdb").to_str().unwrap(),
+            super::Config {
+                dim: 2,
+                memory_limit: 16 << 20,
+                auto_build_quiver: false,
+                ..Default::default()
+            },
+            runtime.clone(),
+        )
+        .unwrap();
+        let mut tx = super::TxBuilder::new();
+        for id in 1..=1024 {
+            tx.insert_with_id(id, &[1., 0.], json!(id));
+        }
+        db.commit_tx(tx).unwrap();
+        db.build_quiver_index(None).unwrap();
+        let config = SearchConfig {
+            top_k: 1,
+            expand_depth: 0,
+            min_score: 0.99,
+            ..Default::default()
+        };
+        let held = runtime
+            .reserve_workspace(runtime.stats().available_foreground_bytes.unwrap() - 32 * 1024)
+            .unwrap();
+        let hits = db.search_ids(&[1., 0.], &config).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!((1..=1024).contains(&hits[0]));
+        drop(held);
+        let node = db.get(hits[0]).unwrap().unwrap();
+        assert_eq!(node.vector, [1., 0.]);
+        assert_eq!(node.payload, json!(hits[0]));
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn 代际摘要期间阻止已捕获索引的并发发布() {
+        let mut db = open_db(&format!("manifest-build-{}", std::process::id()));
+        let path = db.db_path.clone();
+        let count = crate::storage::memtable::auto_quiver_node_threshold(3);
+        let mut tx = super::TxBuilder::new();
+        for id in 1..=count as u64 {
+            tx.insert_with_id(id, &[1., 2., 3.], json!(id));
+        }
+        db.commit_tx(tx).unwrap();
+        let build = db.prepare_auto_quiver_build().unwrap().unwrap();
+        let facts = db.memtable.clone();
+        let gate = crate::test_hooks::pause_at_path(
+            crate::test_hooks::ConcurrencyPoint::GenerationManifestHashing,
+            &path,
+        );
+        let publish = std::thread::spawn(move || {
+            let manifest = db.publish_generation_manifest("stable").unwrap();
+            (db, manifest)
+        });
+        gate.wait_until_arrived();
+        // 屏障位于摘要读取之前，构建和压实都必须取得同一把写锁。
+        assert!(matches!(
+            facts.try_write(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        let build = std::thread::spawn(move || build.execute());
+        gate.release();
+        let (mut db, manifest) = publish.join().unwrap();
+        assert!(build.join().unwrap().unwrap());
+        let verified = crate::storage::snapshot::validate_manifest(&path, "f32", 3).unwrap();
+        assert_eq!(
+            (verified.node_count, verified.generation_id.as_str()),
+            (count, "stable")
+        );
+        assert_eq!(
+            serde_json::to_value(verified.files).unwrap(),
+            serde_json::to_value(manifest.files).unwrap()
+        );
+        assert_eq!(db.get_payload(count as u64).unwrap(), Some(json!(count)));
+        db.close().unwrap();
     }
 
     #[cfg(feature = "test-hooks")]

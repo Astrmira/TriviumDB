@@ -3,6 +3,9 @@
 //! 需要用户预先提供向量文件，不属于普通 `cargo test` 或稳定 CI 套件。报告同时包含
 //! exact ground truth、Recall@K、构建成本和查询延迟，禁止在缺少数据时伪造结果。
 
+#[path = "support/recall.rs"]
+mod recall;
+
 use rayon::prelude::*;
 use serde::Serialize;
 use std::fs::File;
@@ -527,20 +530,18 @@ fn main() {
             };
 
             let t_search = Instant::now();
-            let hits: usize = (0..n_test)
+            let answers: Vec<_> = (0..n_test)
                 .into_par_iter()
                 .map(|i| {
                     let q = &test_data[i * dim..(i + 1) * dim];
-                    let res = index.search_flat(q, train_data, &search_cfg);
-                    let gt_set = &eval_gts[i];
-
-                    res.iter().filter(|&&(id, _)| gt_set.contains(&id)).count()
+                    index.search_flat(q, train_data, &search_cfg)
                 })
-                .sum();
-            let total = n_test * top_k;
+                .collect();
             let elapsed = t_search.elapsed().as_secs_f64();
             let qps = n_test as f64 / elapsed;
-            let recall = hits as f64 / total as f64;
+            let recall = recall::at_k(&answers, &eval_gts, top_k, 0..=n_train as u64 - 1, |hit| {
+                *hit
+            });
             let lat_ms = elapsed / n_test as f64 * 1000.0;
             let speedup = qps / exact_single_qps;
 

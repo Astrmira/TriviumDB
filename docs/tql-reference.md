@@ -1,6 +1,6 @@
 # TQL (Trivium Query Language) 完整参考
 
-> 本文介绍 `0.9.4-beta.1` 的 TQL 语法与执行语义，涵盖文档来源、命名图、属性过滤、向量检索和统一查询管线。TQL 使用 Rust 实现，版本记录见[变更说明](changes/0.9.4-beta.1.md)。
+> 本文介绍 `0.9.4-beta.2` 的 TQL 语法与执行语义，涵盖文档来源、命名图、属性过滤、向量检索和统一查询管线。TQL 使用 Rust 实现，版本记录见[变更说明](changes/0.9.4-beta.2.md)。
 
 ---
 
@@ -266,7 +266,9 @@ Rust 直接构造 `TqlQuery` 时需提供 `graph_scope`，直接构造 `EdgeView
 
 `FIND` 入口对全库节点的 JSON Payload 进行条件过滤，功能完全覆盖旧的 `db.filter()` 和 `db.filter_where()` API。无可用属性索引时，Planner 在 `EXPLAIN` 中标记 `cold_payload_scan`；执行器按 Payload 目录顺序访问冷数据，并受 lookup/parse 工作预算约束。高频字段应建立 Hash、Ordered ART、Composite ART、Bitmap 或 N-gram 索引，先缩小 NodeId 候选再执行必要的 residual predicate。
 
-管线的 Payload lookup 和实际解析字节按本次查询执行计量，工作线程继承所属查询的账本。PROFILE 中的 Payload 用量记录当前查询的累计值，实例统计维护独立的累计口径。复用执行上下文时重新建立本次账本和阶段统计。
+浮点认知阶段 `RESIDUAL`、`DIVERSIFY`、`TOPICS` 支持 f16 和 f32。u64 指纹使用汉明检索，请求浮点认知阶段返回 `TDB_INVALID_INPUT`。DPP 使用归一化向量的 Gram 核和对角正则项，零向量的质量核对角贡献为零。
+
+管线的 Payload lookup 和实际解析字节按本次查询执行计量，工作线程继承所属查询的账本。每次读取已有 Payload 均按原始 JSON 长度扣除解析字节预算，冷读与缓存命中使用相同额度。PROFILE 仅在实际解码时记录解析字节。PROFILE 中的 Payload 用量记录当前查询的累计值，实例统计维护独立的累计口径。复用执行上下文时重新建立本次账本和阶段统计。最终投影与排序沿用本次查询的 Payload 额度。`EXPLAIN ANALYZE` 在 `pipeline_stage_actuals` 的 `return` 阶段显示对应的读取次数和解析字节。
 
 ### 基础语法
 
@@ -437,7 +439,7 @@ MATCH (a)-[:knows|works_with*1..2]->(b) RETURN b
 
 每段可变长路径按简单路径展开，visited 随回溯恢复；零跳范围返回当前节点。有边 MATCH 的节点、边扫描、展开与回溯共享 100,000 步预算，包含达到最小跳数前的探索，每步检查 QueryControl 的取消和期限。显式栈与 visited 集合在展开前预留工作区。
 
-DETACH DELETE 在同一事务中删除去重后的匹配节点集合，并由事务删除清理关联边。集合内部的相互连边、平行边、自环与集合外入边均按这一流程处理。
+`DELETE` 和 `DETACH DELETE` 都在同一事务中删除去重后的匹配节点集合，并由事务删除清理关联边。集合内部的相互连边、平行边、自环与集合外入边均按这一流程处理。
 
 ### WHERE 条件
 
@@ -706,7 +708,11 @@ LIMIT 10 OFFSET 20    -- 跳过前 20 条，返回 10 条
 
 RETURN 别名在 ORDER BY 中可用，也可参与排序算术；WHERE 与 RETURN 表达式使用各自的输入作用域。WITH 承接实例的 `max_query_rows`、`row_overflow`、内存预算与取消控制。显式 LIMIT 可覆盖默认行数上限，OFFSET + LIMIT 继续接受内存准入；聚合、去重与完整排序要求完整输入。管线工作区在执行前按候选规模保守预留。
 
-`ORDER BY picked.rank` 在 `RETURN _.nested AS picked` 下读取投影对象的 `rank`。规划器按作用域核对索引等价性，投影排序完成后执行分页。排序键相等时，节点行按完整绑定名称和 NodeId、边行按图身份与端点和标签、管线行按节点与绑定及路径身份稳定比较；聚合行按分组键比较。该最终比较保持升序，`DESC` 作用于显式排序键。
+`ORDER BY picked.rank` 在 `RETURN _.nested AS picked` 下读取投影对象的 `rank`。规划器按作用域核对索引等价性，投影排序完成后执行分页。排序键相等时，节点行按模式中节点出现的顺序比较 NodeId、具名边行先按图身份、源 ID、目标 ID 和标签、管线行按节点与绑定及路径身份稳定比较；聚合行按分组键比较。该最终比较保持升序，`DESC` 作用于显式排序键。
+
+普通 MATCH 分组按上述实体顺序向聚合函数提供输入。`COLLECT` 的列表顺序和数值相等时 `MIN`、`MAX` 返回的原始类型在切换索引后保持一致。
+
+TQL 字符串支持 JSON 转义，包括 `\r`、`\uXXXX` 和表示补充平面字符的 UTF-16 代理对。单引号字符串还支持 `\'`。无效转义在解析时返回错误。
 
 有序索引键无法保留完整的数值顺序时，范围索引仍可筛选候选，执行器按原始值精确排序后再执行 `OFFSET` 和 `LIMIT`。
 
@@ -773,7 +779,7 @@ ORDER BY score DESC
 | `AC` | 使用 Aho-Corasick 关键词命中召回 |
 | `HYBRID` | 将 BM25 与 AC 分数相加，`AC_WEIGHT` 控制 AC 权重 |
 
-可选参数为 `K1`、`B` 和 `AC_WEIGHT`。结果按 `score DESC, NodeId ASC` 确定性排序。查询文本最多 4096 字节、按空白拆分最多 256 个 token；`TOP` 和文本索引规模受管线节点预算约束，越界时 fail-closed。
+可选参数为 `K1`、`B` 和 `AC_WEIGHT`。结果按 `score DESC, NodeId ASC` 确定性排序。查询文本最多 4096 字节、按空白拆分最多 256 个 token；`TOP`、所选正文或关键词索引的节点数，以及混合召回的去重候选数受管线节点预算约束。扫描 posting 期间响应取消和截止期限。
 
 ### DPP 多样化
 
@@ -813,7 +819,7 @@ WITH shadow
 RETURN shadow, residual_score(shadow) AS score
 ```
 
-`RESIDUAL` 用输入候选向量拟合查询向量。残差范数不超过 `THRESHOLD` 时返回空 NodeSet；超过阈值时执行显式第二次精确向量召回。候选最多 512、迭代最多 256；Gram 矩阵在分配前检查溢出和临时内存预算，第二次召回也计入向量读取预算。
+`RESIDUAL` 先校验参数。上游为空时返回空集。存在候选时，算子先计入候选向量的读取量，再用双精度中间值拟合查询向量。残差范数大于 `THRESHOLD` 时才计入全库向量的读取量并执行第二次精确召回，否则返回空集。候选最多 512 个，迭代最多 256 次。Gram 矩阵在分配前检查字节数和临时内存预算。
 
 ### NMF 主题分配
 
@@ -888,7 +894,7 @@ rows = db.execute_prepared_tql(prepared, {"x": 0.2, "y": 0.8, "bonus": 4})
 
 `SEARCH VECTOR` 的方括号内可混合有限数字字面量与 Prepared 数值参数，例如 `[1e-5, $y, -3E-1]`。十进制字面量支持 `e`/`E` 科学计数法以及正负指数；不完整指数和溢出到非有限值的数字会在解析期 fail-closed。参数只在 bind 阶段写入连续向量，绑定完成后复用与字面量完全相同的 QuIVer/精确检索热路径，不增加候选打分开销。
 
-Node 使用 `prepareTql/executePreparedTql`，Rust 使用 `prepare_tql/execute_prepared_tql`。缺参、额外参数、非数值向量参数和非有限数值全部 fail-closed；同一 Prepared 对象可重复绑定执行。
+Node 的整数参数可使用 `bigint` 精确传入 `-2^63` 到 `2^64 - 1`，例如 `{ id: 9007199254740993n }`。Node 使用 `prepareTql/executePreparedTql`，Rust 使用 `prepare_tql/execute_prepared_tql`。缺参、额外参数、非数值向量参数和非有限数值全部 fail-closed；同一 Prepared 对象可重复绑定执行。
 
 直接执行包含未绑定参数的查询返回明确错误。Rust 手工构造 Prepared AST 时，向量参数槽位必须有效且唯一；绑定过程检查槽位边界并保持原始整数精度。
 
@@ -913,6 +919,8 @@ Path 是一等 NodeId 序列，`path_length` 返回边数。`WEIGHTED_PATHS` 使
 集合阶段支持 `UNION/INTERSECT/EXCEPT`。在 `UNION … IDS` 中，左右共有的节点沿用左侧绑定与分数，仅在右侧出现的节点各补入一次。普通 NodeSet 按 NodeId 稳定归一化。路径与集合算法均受节点数、字节和遍历预算约束。
 
 `ALL_PATHS` 的 `DEPTH` 限定查询范围，重复的 `TO` 节点只处理一次。`AVOID` 排除经过指定节点的所有路径，包含起点和终点。`LABELS` 要求边标签依次匹配整个序列。执行预算阻止继续扩展时，TQL 返回 `TDB_TRAVERSAL_BUDGET_EXCEEDED`，Core `bounded_all_paths` 的 Partial 策略通过 `truncated` 标记部分结果。
+
+`path_truncated(r)` 在 `ALL_PATHS` 的任一起终点对还有超出 `PATHS` 上限的路径时返回 true，枚举完整时返回 false。计数、最大值、总和和平均值均基于已枚举路径。批量最短路径和全路径查询的访问节点及扫描边额度由所有起终点对共享。
 
 最短路径、加权最短路径和 Yen 路径查询也按唯一目标执行。全路径强度与计数按同一目标的全部来源计算。平均边权和跨路径聚合精确累加后舍入为 `f32`。乘积聚合返回乘积最大的代表路径，平均边权聚合返回平均边权最大的代表路径。同分按节点序列决胜。TQL 路径聚合分数超出有限表示范围时返回查询错误。
 
@@ -1037,7 +1045,7 @@ TQL 文本
   → TqlValueResult（Node、Edge、标量、Path、List、Object、Null）
 ```
 
-`FIND` 可选择主键、Hash/Ordered/Composite/Bitmap、索引交集或 Fast Tags + 精确校验；`SEARCH` 可选择可用的向量访问路径与 exact fallback；`MATCH`、图算法和路径阶段复用 `.idx` 中的图目录组件或内存图目录。Cascades 在有界计划空间内依据统计信息和成本模型确定执行方案。
+`FIND` 可选择主键、Hash/Ordered/Composite/Bitmap、索引交集或 Fast Tags + 精确校验；`SEARCH` 可选择可用的向量访问路径与 exact fallback；`MATCH`、图算法和路径阶段复用 `.idx` 中的图目录组件或内存图目录。Cascades 在有界计划空间内依据统计信息和成本模型确定执行方案。对于双字段过滤，规划器可以从组合索引键计算联合统计。索引键数量或总字节数超过统计上限时，规划器使用其他可用统计估算成本，查询结果保持一致。
 
 ---
 
@@ -1057,7 +1065,7 @@ TQL 和 `search_advanced()` 共用底层数据、QuIVer、图与预算设施，�
 | 向量访问 | QuIVer / exact fallback | Cascades 选择向量源与重排 |
 | 图能力 | SA-PPR 扩散，组件可开关、顺序固定 | EXPAND、路径、PageRank/WCC/Leiden、参数化 SA-PPR 等自由编排 |
 | 文本/认知 | AC+BM25、FISTA、DPP、Hook 与疲劳不应期，均由 `SearchConfig` 控制 | `TEXT`、`RESIDUAL`、`DIVERSIFY`、`TOPICS`、`SA_PPR_CONFIG` 及一等分数表达式 |
-| 状态性 | 疲劳不应期会更新进程内检索状态 | 普通 TQL 认知算子无状态、可重复；不开放疲劳不应期 |
+| 状态性 | 成功完成的有状态检索更新进程内疲劳状态 | 普通 TQL 认知算子无状态、可重复；不开放疲劳不应期 |
 | 结果 | SearchHit | Node/标量/Path/List/Null 绑定行 |
 
 两者长期共存并共享 BM25、AC、FISTA、DPP、NMF 和图扩散底层实现：固定低开销 RAG 流程优先使用 `search_advanced()`；需要改变算子顺序、保留中间 NodeSet、聚合、路径或图算法组合时使用 TQL。

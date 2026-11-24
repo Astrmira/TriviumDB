@@ -77,7 +77,10 @@ assert_type(triviumdb.init_logger(), None)
 # ── writes ──
 assert_type(db.insert([0.1] * 8, {"name": "Alice"}), int)
 assert_type(db.batch_insert([[0.1] * 8], [{"k": 1}]), list[int])
-assert_type(db.search_advanced((1, 0), min_score=0.0, expand_labels=("route",)), list[SearchHit])
+assert_type(db.search_advanced((1, 0), min_score=0.0, expand_labels=("route",), ann_rerank_limit=128), list[SearchHit])
+db.search_advanced((1, 0), ann_rerank_limit="128")  # type: ignore[arg-type]
+assert_type(db.search_ids((1, 0), ann_rerank_limit=128), list[int])
+assert_type(db.search_ids_batch([(1, 0)]), list[list[int]])
 assert_type(db.index_text(7, "正文"), None)
 assert_type(db.index_keyword(7, "关键词"), None)
 assert_type(db.rebuild_text_index((MappingProxyType({"id": 7, "text": "正文"}),)), None)

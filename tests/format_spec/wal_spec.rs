@@ -45,9 +45,10 @@ fn frame_offsets(bytes: &[u8]) -> Vec<(usize, usize, usize)> {
 }
 
 #[test]
-fn wal头部字段边界与所有帧边界逐字节截断均安全停止() {
+fn wal头部与帧边界变异核对提交内容与安全偏移() {
     let (source, bytes) = wal_fixture("wal_fields");
-    let mut mutations = field_boundary_mutations(WAL_HEADER);
+    let mut mutations = vec![Mutation::TruncateAt(bytes.len())];
+    mutations.extend(field_boundary_mutations(WAL_HEADER));
     mutations.extend(truncation_mutations(bytes.len(), WAL_HEADER));
     for (frame, payload, crc) in frame_offsets(&bytes) {
         mutations.extend([
@@ -70,8 +71,52 @@ fn wal头部字段边界与所有帧边界逐字节截断均安全停止() {
     for (index, mutation) in mutations.into_iter().enumerate() {
         let candidate = path(&format!("wal_field_case_{index}"));
         cleanup(&candidate);
-        std::fs::write(format!("{candidate}.wal"), mutation.apply(&bytes)).unwrap();
-        let _ = Wal::read_entries::<f32>(&candidate);
+        let changed = mutation.apply(&bytes);
+        let wal = format!("{candidate}.wal");
+        std::fs::write(&wal, &changed).unwrap();
+        let result = Wal::read_entries::<f32>(&candidate);
+        if changed == bytes {
+            let (entries, offset) = result.unwrap();
+            assert_eq!(offset, bytes.len() as u64);
+            let [
+                WalEntry::Insert {
+                    id,
+                    vector,
+                    payload,
+                },
+                WalEntry::UpdatePayload {
+                    id: target,
+                    payload: update,
+                },
+            ] = entries.as_slice()
+            else {
+                panic!("完整事务必须按顺序返回插入和更新：{entries:?}");
+            };
+            assert_eq!(
+                (*id, vector.as_slice(), payload.as_str()),
+                (1, &[1f32, 0., 0., 0.][..], r#"{"kind":"a"}"#)
+            );
+            assert_eq!((*target, update.as_str()), (1, r#"{"kind":"b"}"#));
+        } else if matches!(mutation, Mutation::TruncateAt(_)) && changed.len() >= 6 {
+            // 样例只有一个事务，缺少完整提交记录时只能保留文件头。
+            let (entries, offset) = result.unwrap();
+            assert!(entries.is_empty(), "{mutation:?}: {entries:?}");
+            assert_eq!(offset, 6);
+        } else {
+            let error = result.unwrap_err();
+            if matches!(mutation, Mutation::FlipBit { .. }) {
+                assert_eq!(error.code(), "TDB_CORRUPTED_FILE", "{mutation:?}");
+            } else {
+                assert!(
+                    matches!(
+                        error.code(),
+                        "TDB_CORRUPTED_FILE" | "TDB_UNSUPPORTED_WAL_VERSION"
+                    ),
+                    "{mutation:?}: {error}"
+                );
+            }
+        }
+        assert_eq!(std::fs::read(&wal).unwrap(), changed);
         cleanup(&candidate);
     }
     cleanup(&source);
@@ -162,10 +207,12 @@ fn 未提交事务_缺commit与commit后残帧均保持原子恢复() {
     let frames = frame_offsets(&bytes);
     let second_commit_start = frames.last().unwrap().0;
     std::fs::write(format!("{source}.wal"), &bytes[..second_commit_start]).unwrap();
-    let database = Database::<f32>::open(&source, DIM).unwrap();
-    assert!(database.get_payload(1).unwrap().is_some());
-    assert!(database.get_payload(2).unwrap().is_none());
-    drop(database);
+    let expected = serde_json::json!([{"id":1,"vector":[1.0,1.0,1.0,1.0],"payload":{},"edges":[]}]);
+    for _ in 0..2 {
+        let mut database = Database::<f32>::open(&source, DIM).unwrap();
+        assert_eq!(crate::node_facts::nodes(&database), expected);
+        database.close().unwrap();
+    }
     cleanup(&source);
 }
 
@@ -175,8 +222,9 @@ fn wal未知版本只读打开零写拒绝() {
     let mut wal = std::fs::read(format!("{source}.wal")).unwrap();
     wal[4..6].copy_from_slice(&u16::MAX.to_le_bytes());
     std::fs::write(format!("{source}.wal"), wal).unwrap();
-    let before = directory_snapshot(&source);
-    assert!(Database::<f32>::open_read_only(&source, DIM).is_err());
-    assert_eq!(directory_snapshot(&source), before);
+    with_read_only(&source, |result| {
+        let error = result.err().expect("未知 WAL 版本必须拒绝");
+        assert_eq!(error.code(), "TDB_UNSUPPORTED_WAL_VERSION", "{error}");
+    });
     cleanup(&source);
 }

@@ -7,7 +7,7 @@ use crate::index::document::{DocumentHeader, DocumentReadCost, DocumentTextIndex
 use crate::index::text::TEXT_ANALYZER_ID;
 use crate::index::text::analyzer::{AnalyzedToken, visit_tokens};
 use crate::index::text::positions::PositionQuery;
-use crate::resources::WorkspaceReservation;
+use crate::resources::RequestWorkspace;
 use crate::storage::memtable::MemTable;
 use crate::{NodeId, Result, TriviumError, VectorType};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -22,7 +22,7 @@ pub(crate) mod vector;
 pub(super) struct ReadBudget<'a> {
     pub cost: &'a mut DocumentReadCost,
     pub limits: &'a DocumentQueryLimits,
-    pub workspace: &'a mut WorkspaceReservation,
+    pub workspace: &'a mut RequestWorkspace,
     pub base: usize,
     pub memory_limit: usize,
 }
@@ -38,8 +38,7 @@ impl ReadBudget<'_> {
         self.cost.payload_bytes = self.cost.payload_bytes.saturating_add(bytes);
         self.cost.check(self.limits)?;
         self.base = self.base.saturating_add(workspace);
-        mt.ensure_additional_memory(self.memory_limit, self.base)?;
-        self.workspace.resize(self.base)
+        reserve(mt, self.memory_limit, self.workspace, self.base)
     }
     pub fn node<T: VectorType>(&mut self, mt: &MemTable<T>, id: NodeId) -> Result<()> {
         let raw = mt
@@ -52,8 +51,7 @@ impl ReadBudget<'_> {
             .base
             .saturating_add(raw.len().saturating_mul(32))
             .saturating_add(4096);
-        mt.ensure_additional_memory(self.memory_limit, peak)?;
-        self.workspace.resize(peak)
+        reserve(mt, self.memory_limit, self.workspace, peak)
     }
     pub fn edges(&mut self, count: usize) -> Result<()> {
         self.cost.edges = self.cost.edges.saturating_add(count);
@@ -114,18 +112,17 @@ fn scan<T: VectorType>(
 fn reserve<T: VectorType>(
     mt: &MemTable<T>,
     memory_limit: usize,
-    workspace: &mut WorkspaceReservation,
+    workspace: &mut RequestWorkspace,
     bytes: usize,
 ) -> Result<()> {
-    mt.ensure_additional_memory(memory_limit, bytes)?;
-    workspace.resize(bytes)
+    mt.resize_request_workspace(workspace, bytes, memory_limit)
 }
 
 fn build_index<T: VectorType>(
     mt: &MemTable<T>,
     query: &DocumentSearchQuery,
     memory_limit: usize,
-    workspace: &mut WorkspaceReservation,
+    workspace: &mut RequestWorkspace,
 ) -> Result<DocumentTextIndex> {
     let limits = &query.limits;
     let request_work =
@@ -273,7 +270,7 @@ fn add_members<T: VectorType>(
     index: &mut DocumentTextIndex,
     limits: &DocumentQueryLimits,
     memory_limit: usize,
-    workspace: &mut WorkspaceReservation,
+    workspace: &mut RequestWorkspace,
     retained: usize,
 ) -> Result<()> {
     if index.members.is_none() {
@@ -331,7 +328,7 @@ fn add_members<T: VectorType>(
 fn add_unit<T: VectorType>(
     mt: &MemTable<T>,
     memory_limit: usize,
-    workspace: &mut WorkspaceReservation,
+    workspace: &mut RequestWorkspace,
     index: &mut DocumentTextIndex,
     limits: &DocumentQueryLimits,
     unit: DocumentUnit,
@@ -571,7 +568,7 @@ fn group_scores(
 
 struct SearchWorkspace<'a, T: VectorType> {
     mt: &'a MemTable<T>,
-    workspace: &'a mut WorkspaceReservation,
+    workspace: &'a mut RequestWorkspace,
     memory_limit: usize,
     filters: &'a filters::Prepared,
 }
@@ -785,7 +782,9 @@ pub(super) fn evidence(
     start: usize,
     end: usize,
 ) -> Result<DocumentEvidence> {
-    evidence_at(snapshot, start, end, None)
+    let mut evidence = evidence_at(snapshot, start, end, None)?;
+    snapshot.locate_source_spans(evidence.source_spans.iter_mut())?;
+    Ok(evidence)
 }
 
 fn evidence_at(
@@ -825,7 +824,7 @@ fn evidence_at(
         column: first.column,
         end_line: last.line,
         end_column: last.column,
-        source_spans: snapshot.source_spans(start, end)?,
+        source_spans: snapshot.unlocated_source_spans(start, end)?,
     })
 }
 
@@ -1019,7 +1018,7 @@ pub(crate) fn search_locked<T: VectorType>(
     memory_limit: usize,
 ) -> Result<DocumentSearchResult> {
     validate_search(mt, query, recall.as_ref())?;
-    let mut workspace = mt.resource_runtime().reserve_workspace(0)?;
+    let mut workspace = mt.reserve_instance_workspace(0)?;
     let request_work =
         crate::storage::payload_store::serialized_json_len(query)?.saturating_mul(64);
     reserve(mt, memory_limit, &mut workspace, request_work)?;
@@ -1037,8 +1036,14 @@ pub(crate) fn search_locked<T: VectorType>(
             mt.document_index_bytes.store(0, Ordering::Release);
             let built = build_index(mt, query, memory_limit, &mut workspace)?;
             let bytes = built.heap_bytes();
-            mt.ensure_additional_memory(memory_limit, bytes)?;
+            reserve(
+                mt,
+                memory_limit,
+                &mut workspace,
+                bytes.saturating_add(request_work),
+            )?;
             mt.document_index_bytes.store(bytes, Ordering::Release);
+            reserve(mt, memory_limit, &mut workspace, request_work)?;
             *cache = Some(built);
         }
         let index = cache
@@ -1249,6 +1254,13 @@ pub(crate) fn search_locked<T: VectorType>(
                 scores,
             });
         }
+        snapshot.locate_source_spans(hits.iter_mut().flat_map(|hit| {
+            hit.evidence.source_spans.iter_mut().chain(
+                hit.matches
+                    .iter_mut()
+                    .flat_map(|m| m.evidence.source_spans.iter_mut()),
+            )
+        }))?;
         groups.push(DocumentSearchGroup {
             document_id: row.document_id,
             revision: snapshot.revision,

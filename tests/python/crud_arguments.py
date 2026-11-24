@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import triviumdb
+from input_errors import check_input_error
 from read_arguments import node
 from write_outcomes import expect_write
 
@@ -13,10 +14,7 @@ def invalid(action, field):
     try:
         action()
     except (TypeError, ValueError, OverflowError, UnicodeError, IndexError) as error:
-        assert error.code == "TDB_INVALID_INPUT" and error.schema_version == 1, (field, error)
-        assert error.target == {"field": field} and error.stage is None, (field, error.target)
-        assert error.write == {"phase": "validation", "outcome": "not_committed"}
-        assert set(error.details) == {"reason"} and error.details["reason"]
+        check_input_error(error, field, {"phase": "validation", "outcome": "not_committed"})
         return error
     raise AssertionError(f"参数转换必须拒绝 {field}")
 

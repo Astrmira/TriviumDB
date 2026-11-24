@@ -6,18 +6,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const fixture = require('../contracts/constructor_arguments.json')
 
-function invalid(field, write) {
-  return error => {
-    assert.equal(error.schema_version, 1)
-    assert.equal(error.code, 'TDB_INVALID_INPUT')
-    assert.deepEqual(error.target, { field })
-    assert.equal(error.stage, undefined)
-    assert.deepEqual(error.write, write)
-    assert.deepEqual(Object.keys(error.details), ['reason'])
-    assert.ok(error.details.reason)
-    return true
-  }
-}
+const { invalid } = require('./input_errors')
 
 function runConstructorArguments(root, { TriviumDB, ResourceRuntime, ConsoleSession, verifySnapshot, restoreSnapshot }) {
   const parent = path.join(root, 'constructor-rejected')

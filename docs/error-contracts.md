@@ -1,6 +1,6 @@
 # 公共错误与请求完成契约
 
-> 本文记录 `0.9.4-beta.1` 的公共字段、查询控制、写入结果与传输完成点。错误定义见 `src/error.rs`，SDK 职责见[内核 SDK 与存储内核](kernel-sdk.md)，版本记录见[变更说明](changes/0.9.4-beta.1.md)。
+> 本文记录 `0.9.4-beta.2` 的公共字段、查询控制、写入结果与传输完成点。错误定义见 `src/error.rs`，SDK 职责见[内核 SDK 与存储内核](kernel-sdk.md)，版本记录见[变更说明](changes/0.9.4-beta.2.md)。
 
 ---
 
@@ -136,7 +136,7 @@ Node 的本批文本、标签、字段和重建记录字符串严格解码 UTF-1
 
 检索配置的有限性、扩散偏置维度和 min_edge_weight 约束由存储内核验证，错误提供对应字段。批量查询在返回空集合前验证同一配置。混合入口的 hybrid_alpha／hybridAlpha 由共享 SDK 换算，非有限输入或换算溢出提供该字段。Rust 通过 underlying() 匹配原错误类别，并从 info() 读取字段。
 
-Node 的 searchAdvanced／searchWithContext 配置和三个可达性入口的 options 使用非数组对象。省略或 null 使用默认配置，已登记属性沿原型链读取，未知配置属性保留原处理规则。配置成员中的 null 按相应成员类型拒绝。可选位置参数的 null 继续使用既有默认值，必需位置参数沿各自类型规则拒绝。searchBatch 的数组／类型拒绝发生在任务创建前，u64 数值范围与内核执行错误通过 Promise 返回，范围错误保留批次和分量位置。
+Node 的 searchAdvanced／searchWithContext 配置和三个可达性入口的 options 使用非数组对象。省略或 null 使用默认配置，已登记属性沿原型链读取，未知配置属性保留原处理规则。配置成员中的 null 按相应成员类型拒绝。可选位置参数的 null 继续使用既有默认值，必需位置参数沿各自类型规则拒绝。searchBatch 和 searchIdsBatch 在任务创建前同步校验数组和参数类型。资源准入、请求取消、截止期限及执行阶段的错误通过返回的 Promise 交付。u64 范围错误保留批次和分量位置。
 
 文本维护覆盖 index_text／index_keyword、完整重建和构建入口。已知值转换拒绝提供 validation/not_committed，重入或借用争用提供 admission/not_committed，消费字段省略。完整重建记录包含 id、text 和可选 keywords，缺参、未知字段、类型和成员拒绝定位到 `/documents/0/id` 等路径。Python 记录接受声明中的 Mapping，先固定本批记录对象，再在写请求借用内物化映射和提取字段。Node 固定数组下标范围，校验自有可枚举记录键，声明字段沿既有属性读取路径提取。宿主异常和失败的整批转换保留原文本及索引事实。
 
@@ -207,7 +207,7 @@ Rust `Database::commit_tx` 和 `Transaction::commit` 按值取得操作，进入
 
 Node `commitTransaction` 的 Core 拒绝保留相同字段，绑定内已知的构造校验与同步重入拒绝提供相应阶段和 `transaction_consumed=false`。Node 参数数组由调用方继续持有，消费字段描述绑定生成的内核操作缓冲。参数自动提取和宿主自行抛出的异常继续使用各自语言契约。
 
-分组提交在组尾完成同步。组尾失败返回 `group_sync/unknown`，消费字段省略。Server 将该错误逐一送回本组已经成功执行的等待请求，独立操作已返回的校验或执行错误保持原字段。分组准入失败将 `admission/not_committed` 送回尚未执行的请求。
+分组提交在组尾按组内实际写入采用的最高同步强度完成同步。组尾失败返回 `group_sync/unknown`，消费字段省略。Server 将该错误逐一送回本组已经成功执行的等待请求，独立操作已返回的校验或执行错误保持原字段。分组准入失败将 `admission/not_committed` 送回尚未执行的请求。
 
 Server 入队前的关闭、过期和队列满，以及 Worker 明确拒绝的待执行请求，提供 `admission/not_committed`。入队后等待响应超时或响应通道丢失，提供 `response/unknown`。Server 省略这些边界的消费字段，具体事务的执行结果由有效回执或事实对账确认。
 
@@ -284,7 +284,7 @@ Python／Node 的同步模式字符串拒绝、容量预留、MiB 额度、自�
 
 Python Prepared 接受字符串键 `Mapping`，转换值失败时提供 `stage=bind` 与原始 `target.parameter`。映射容器和键错误使用 `target.field=parameters`；映射自身的 `items`、迭代和取值异常沿宿主路径传播。
 
-Node Prepared 在方法内读取原始参数，错误容器提供 `target.field=parameters`。NaN、无穷、undefined、BigInt、Symbol、函数及复合参数值提供 `TDB_INVALID_INPUT`、`stage=bind` 与原始 `target.parameter`，键名保留 NUL 和 Unicode。数组和对象值在标量边界拒绝。容器属性枚举与 getter 抛出的宿主异常保留原对象和 cause，既有属性枚举及标量数值转换继续复用原路径。
+Node Prepared 在方法内读取原始参数，错误容器提供 `target.field=parameters`。NaN、无穷、undefined、超出 64 位整数域的 BigInt、Symbol、函数及复合参数值提供 `TDB_INVALID_INPUT`、`stage=bind` 与原始 `target.parameter`，键名保留 NUL 和 Unicode。数组和对象值在标量边界拒绝。容器属性枚举与 getter 抛出的宿主异常保留原对象和 cause，既有属性枚举及标量数值转换继续复用原路径。
 
 Python 的同步模式与 generation 标识也在请求借用后提取字符串，已覆盖内置类型错误保留原异常继承及规范字段。Node 对这两个字段执行原始字符串校验。manifest 的 SDK 回调拒绝提供 `admission/not_committed`，目标发布结果继续按 Core 文件组完成点描述。
 

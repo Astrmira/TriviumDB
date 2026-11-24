@@ -1,5 +1,6 @@
 //! 文本及索引维护的共享准备、真实调用与事实读取，预期来自独立 JSON。
 
+use crate::node_facts;
 use serde_json::{Value, json};
 use triviumdb::index::text::TextIndexDocument;
 use triviumdb::{Database, Result, VectorType};
@@ -9,12 +10,13 @@ pub fn contract() -> Value {
 }
 
 pub fn seed<T: VectorType + serde::Serialize + serde::de::DeserializeOwned>(db: &mut Database<T>) {
-    for node in contract()["nodes"].as_array().unwrap() {
+    let nodes = node_facts::fixture_nodes::<T>(contract()["nodes"].clone());
+    for node in nodes.as_array().unwrap() {
         let vector: Vec<T> = node["vector"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|value| T::from_f32(value.as_f64().unwrap() as f32))
+            .map(|value| T::from_json_number(value.as_number().unwrap()).unwrap())
             .collect();
         db.insert_with_id(
             node["id"].as_u64().unwrap(),
@@ -103,19 +105,7 @@ pub fn execute<T: VectorType + serde::Serialize + serde::de::DeserializeOwned>(
 pub fn facts<T: VectorType + serde::Serialize + serde::de::DeserializeOwned>(
     db: &Database<T>,
 ) -> Value {
-    let mut ids = db.all_node_ids().unwrap();
-    ids.sort_unstable();
-    let nodes: Vec<Value> = ids.into_iter().map(|id| {
-        let node = db.get(id).unwrap().unwrap();
-        let mut edges = node.edges;
-        edges.sort_by(|a, b| (a.target_id, &a.label).cmp(&(b.target_id, &b.label)));
-        json!({
-            "id":id, "vector":node.vector.iter().map(|value| value.to_f32()).collect::<Vec<_>>(),
-            "payload":node.payload,
-            "edges":edges.iter().map(|edge| json!({"target":edge.target_id,"label":edge.label,
-                "weight":edge.weight,"metadata":edge.metadata})).collect::<Vec<_>>(),
-        })
-    }).collect();
+    let nodes = node_facts::nodes(db);
     let queries: Vec<Value> = contract()["queries"]
         .as_array()
         .unwrap()
@@ -141,7 +131,7 @@ pub fn facts<T: VectorType + serde::Serialize + serde::de::DeserializeOwned>(
     json!({"nodes":nodes,"queries":queries,"indexes":indexes})
 }
 
-pub fn expected(after: bool, indexes: Value) -> Value {
+pub fn expected<T: VectorType>(after: bool, indexes: Value) -> Value {
     let contract = contract();
     let queries: Vec<Value> = contract["queries"]
         .as_array()
@@ -149,5 +139,5 @@ pub fn expected(after: bool, indexes: Value) -> Value {
         .iter()
         .map(|query| query[if after { "after" } else { "before" }].clone())
         .collect();
-    json!({"nodes":contract["nodes"],"queries":queries,"indexes":indexes})
+    json!({"nodes":node_facts::fixture_nodes::<T>(contract["nodes"].clone()),"queries":queries,"indexes":indexes})
 }

@@ -48,7 +48,7 @@ fn execute(database: &Database<f32>, query: &Query) -> Vec<CanonicalRow> {
                 .into_iter()
                 .map(|row| {
                     let node = row.get("_").expect("FIND 必须返回隐式节点");
-                    BTreeMap::from([("id".into(), RefScalar::Integer(node.id as i64))])
+                    BTreeMap::from([("id".into(), RefScalar::Integer(node.id.into()))])
                 })
                 .collect::<Vec<_>>();
             if order.is_empty() {
@@ -63,8 +63,8 @@ fn execute(database: &Database<f32>, query: &Query) -> Vec<CanonicalRow> {
                 .into_iter()
                 .map(|row| {
                     BTreeMap::from([
-                        ("source".into(), RefScalar::Integer(row["a"].id as i64)),
-                        ("target".into(), RefScalar::Integer(row["b"].id as i64)),
+                        ("source".into(), RefScalar::Integer(row["a"].id.into())),
+                        ("target".into(), RefScalar::Integer(row["b"].id.into())),
                     ])
                 })
                 .collect::<Vec<_>>();
@@ -81,7 +81,7 @@ fn execute(database: &Database<f32>, query: &Query) -> Vec<CanonicalRow> {
                     value => panic!("分组值类型错误: {value:?}"),
                 };
                 let count = match &row["total"] {
-                    TqlValue::Int(value) => RefScalar::Integer(*value),
+                    TqlValue::Int(value) => RefScalar::Integer((*value).into()),
                     value => panic!("count 类型错误: {value:?}"),
                 };
                 BTreeMap::from([("group".into(), group), ("count".into(), count)])
@@ -105,24 +105,30 @@ fn run_matrix(mode: StorageMode, indexed: bool) {
     let root = super::support::TestDir::new("differential_matrix");
     let path = root.file(&format!("{mode:?}_{indexed}.tdb"));
     cleanup(&path);
-    let reference = RefDatabase::fixture(48);
+    let mut reference = RefDatabase::fixture(48);
+    for node in reference.nodes.values_mut() {
+        node.payload["serial"] = serde_json::json!(u64::MAX - node.id + 1);
+    }
     let mut database = open(&path, mode);
     seed(&mut database, &reference);
     if indexed {
         database.create_index("kind").unwrap();
         database.create_ordered_index("rank").unwrap();
+        database.create_ordered_index("serial").unwrap();
         database.create_bitmap_index("active").unwrap();
         database
             .create_composite_index(&["kind".into(), "group".into()])
             .unwrap();
     }
     let cases = queries(0xD1FF_EA11, 40);
+    assert_pages(&database, &reference);
     for query in &cases {
         assert_query(&database, &reference, query, "写入后");
     }
     assert_aggregate_differential(&database, &reference);
     assert_projection_distinct_differential(&database, &reference);
     database.flush().unwrap();
+    assert_pages(&database, &reference);
     for query in &cases {
         assert_query(&database, &reference, query, "flush 后");
     }
@@ -131,6 +137,7 @@ fn run_matrix(mode: StorageMode, indexed: bool) {
     database.compact().unwrap();
     drop(database);
     let database = open(&path, mode);
+    assert_pages(&database, &reference);
     for query in &cases {
         assert_query(&database, &reference, query, "compact/reopen 后");
     }
@@ -149,9 +156,7 @@ fn FIND_MATCH_聚合在索引与持久化矩阵下和独立_reference一致() {
     }
 }
 
-#[test]
-fn metamorphic_布尔恒等分页与索引不改变语义() {
-    let reference = RefDatabase::fixture(32);
+fn assert_pages(database: &Database<f32>, reference: &RefDatabase) {
     let base = Predicate::Compare {
         field: "kind".into(),
         operation: CompareOp::Eq,
@@ -163,33 +168,51 @@ fn metamorphic_布尔恒等分页与索引不改变语义() {
         Predicate::Or(Box::new(base.clone()), Box::new(Predicate::False)),
         Predicate::Not(Box::new(Predicate::Not(Box::new(base.clone())))),
     ];
-    let expected = evaluate(
-        &reference,
-        &Query::Find {
-            predicate: base,
-            order: vec![Order {
-                field: "rank".into(),
-                direction: Direction::Ascending,
-            }],
-            offset: 0,
-            limit: Some(100),
-        },
-    );
+    let order = vec![Order {
+        field: "serial".into(),
+        direction: Direction::Ascending,
+    }];
+    let query = |predicate, offset, limit| Query::Find {
+        predicate,
+        order: order.clone(),
+        offset,
+        limit,
+    };
+    let expected = evaluate(reference, &query(base, 0, None));
+    assert!(expected.len() > 5);
     for predicate in variants {
-        let actual = evaluate(
-            &reference,
-            &Query::Find {
-                predicate,
-                order: vec![Order {
-                    field: "rank".into(),
-                    direction: Direction::Ascending,
-                }],
-                offset: 0,
-                limit: Some(100),
-            },
-        );
-        assert_eq!(actual, expected);
+        let mut combined = Vec::new();
+        for offset in (0..expected.len() + 5).step_by(5) {
+            let statement = query(predicate.clone(), offset, Some(5));
+            let actual = execute(database, &statement);
+            assert_eq!(
+                actual,
+                expected
+                    .iter()
+                    .skip(offset)
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                "{}",
+                query_tql(&statement)
+            );
+            combined.extend(actual);
+        }
+        assert_eq!(combined, expected);
     }
+    // 最大整数及其相邻值必须在真实查询、范围索引和参考模型中保持可区分。
+    let exact = query(
+        Predicate::Compare {
+            field: "serial".into(),
+            operation: CompareOp::Eq,
+            value: RefScalar::Integer(u64::MAX.into()),
+        },
+        0,
+        None,
+    );
+    let only = vec![BTreeMap::from([("id".into(), RefScalar::Integer(1))])];
+    assert_eq!(evaluate(reference, &exact), only);
+    assert_eq!(execute(database, &exact), only);
 }
 
 #[test]

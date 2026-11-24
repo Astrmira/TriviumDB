@@ -1,7 +1,7 @@
-//! 向量的标量协议转换与连续二维缓冲快照。
+//! 向量的标量协议转换与连续缓冲快照。
 
 use super::arguments::{
-    float_value, half_value, integer_value, read_sequence, sequence_with_fast_path, write_list,
+    float_value, half_value, integer_value, sequence_items, sequence_with_fast_path, write_list,
 };
 use super::errors::argument_input_error;
 use crate::error::WriteErrorInfo;
@@ -73,11 +73,62 @@ pub(super) fn vector<T: Component>(
     })
 }
 
+fn native_contiguous<T: Component>(view: &Bound<'_, PyMemoryView>) -> PyResult<bool> {
+    let format: String = view.getattr("format")?.extract()?;
+    let native = if cfg!(target_endian = "little") {
+        '<'
+    } else {
+        '>'
+    };
+    let format = format.strip_prefix(['@', '=', native]).unwrap_or(&format);
+    Ok((format == T::FORMAT || (T::FORMAT == "Q" && format == "L"))
+        && view.getattr("itemsize")?.extract::<usize>()? == size_of::<T>()
+        && view.getattr("c_contiguous")?.is_truthy()?)
+}
+
+/// 匹配的单行缓冲只做一次 bytes 快照；其他序列继续按标量协议读取。
+pub(super) fn with_query<T: Component + Sync + Send, R: Send>(
+    py: Python<'_>,
+    value: &Bound<'_, PyAny>,
+    operation: impl FnOnce(&[T]) -> crate::Result<R> + Send,
+) -> PyResult<R> {
+    const FIELD: &str = "query_vector";
+    let argument_error = |error| argument_input_error(error, FIELD, None);
+    let result = if let Ok(view) = value.cast::<PyMemoryView>()
+        && view
+            .getattr("ndim")
+            .and_then(|value| value.extract::<usize>())
+            .map_err(argument_error)?
+            == 1
+        && native_contiguous::<T>(view).map_err(argument_error)?
+    {
+        // bytes 的只读快照独立于宿主可变数组。快照对象留在调用栈，借出的切片只在本次调用使用。
+        let snapshot = view
+            .call_method0("tobytes")
+            .map_err(argument_error)?
+            .cast_into::<PyBytes>()
+            .map_err(|error| argument_error(error.into()))?;
+        let raw = snapshot.as_bytes();
+        match bytemuck::try_cast_slice::<u8, T>(raw) {
+            Ok(query) => py.detach(move || operation(query)),
+            Err(_) => {
+                let query: Vec<T> = bytemuck::allocation::pod_collect_to_vec(raw);
+                py.detach(move || operation(&query))
+            }
+        }
+    } else {
+        let query = vector(value, FIELD, None)?;
+        py.detach(move || operation(&query))
+    };
+    result.map_err(super::errors::to_py_error)
+}
+
 fn snapshot<T: Component>(
     view: &Bound<'_, PyMemoryView>,
     dim: usize,
     field: &str,
     write: Option<WriteErrorInfo>,
+    admit: impl FnOnce(usize, usize) -> PyResult<()>,
 ) -> PyResult<Vec<Vec<T>>> {
     let invalid = || {
         argument_input_error(
@@ -89,27 +140,7 @@ fn snapshot<T: Component>(
         )
     };
     let attribute_error = |error| argument_input_error(error, field, write);
-    let format: String = view
-        .getattr("format")
-        .and_then(|value| value.extract())
-        .map_err(attribute_error)?;
-    let native = if cfg!(target_endian = "little") {
-        '<'
-    } else {
-        '>'
-    };
-    let format = format.strip_prefix(['@', '=', native]).unwrap_or(&format);
-    let itemsize: usize = view
-        .getattr("itemsize")
-        .and_then(|value| value.extract())
-        .map_err(attribute_error)?;
-    if !(format == T::FORMAT || (T::FORMAT == "Q" && format == "L"))
-        || itemsize != size_of::<T>()
-        || !view
-            .getattr("c_contiguous")
-            .and_then(|value| value.is_truthy())
-            .map_err(attribute_error)?
-    {
+    if !native_contiguous::<T>(view).map_err(attribute_error)? {
         return Err(invalid());
     }
     let (rows, columns): (usize, usize) = view
@@ -127,11 +158,12 @@ fn snapshot<T: Component>(
             None => error,
         }));
     }
-    let row_bytes = columns.checked_mul(itemsize).ok_or_else(invalid)?;
+    let row_bytes = columns.checked_mul(size_of::<T>()).ok_or_else(invalid)?;
     let total = rows.checked_mul(row_bytes).ok_or_else(invalid)?;
     if rows != 0 && columns == 0 {
         return Err(invalid());
     }
+    admit(rows, total)?;
     // abi3-py39 通过只读 bytes 快照访问缓冲；释放 GIL 或转换 Payload 时宿主可重新使用原数组。
     let bytes = view
         .call_method0("tobytes")
@@ -148,11 +180,75 @@ fn snapshot<T: Component>(
         .collect())
 }
 
-pub(super) fn queries<T: Component>(value: &Bound<'_, PyAny>, dim: usize) -> PyResult<Vec<Vec<T>>> {
+pub(super) fn queries<
+    T: Component + crate::VectorType + serde::Serialize + serde::de::DeserializeOwned,
+>(
+    value: &Bound<'_, PyAny>,
+    db: &crate::Database<T>,
+) -> PyResult<(Vec<Vec<T>>, crate::resources::RequestWorkspace)> {
+    const FIELD: &str = "query_vectors";
+    let dim = db.dim();
+    let reserve = |bytes| {
+        db.reserve_request_workspace(bytes)
+            .map_err(super::errors::to_py_error)
+    };
+    let mut workspace = reserve(0)?;
     if let Ok(view) = value.cast::<PyMemoryView>() {
-        return snapshot(view, dim, "query_vectors", None);
+        let mut temporary = None;
+        let rows = snapshot(view, dim, FIELD, None, |rows, bytes| {
+            temporary = Some(reserve(bytes)?);
+            workspace.absorb(reserve(
+                bytes.saturating_add(rows.saturating_mul(size_of::<Vec<T>>())),
+            )?);
+            Ok(())
+        })?;
+        drop(temporary);
+        return Ok((rows, workspace));
     }
-    read_sequence(value, "query_vectors", |row, path| vector(row, path, None))
+    let mut rows = Vec::new();
+    for (i, item) in sequence_items(value, FIELD, None)?.enumerate() {
+        let row = item?;
+        let field = crate::sdk::field_member(FIELD, &i.to_string());
+        let items = sequence_items(&row, &field, None)?;
+        workspace.absorb(reserve(
+            dim.saturating_mul(size_of::<T>())
+                .saturating_add(4 * size_of::<Vec<T>>()),
+        )?);
+        let mut parsed = Vec::new();
+        parsed.try_reserve_exact(dim).map_err(|error| {
+            super::errors::to_py_error(
+                crate::TriviumError::CapacityAllocationFailed {
+                    reason: format!("向量行分配失败 (Vector row allocation failed): {error}"),
+                }
+                .at_field(&field),
+            )
+        })?;
+        let mismatch = |got| {
+            super::errors::to_py_error(
+                crate::TriviumError::DimensionMismatch { expected: dim, got }.at_field(&field),
+            )
+        };
+        for item in items {
+            if parsed.len() == dim {
+                return Err(mismatch(dim + 1));
+            }
+            let item = item?;
+            let component = match T::builtin(&item) {
+                Some(value) => value,
+                None => T::parse(
+                    &item,
+                    &crate::sdk::field_member(&field, &parsed.len().to_string()),
+                    None,
+                )?,
+            };
+            parsed.push(component);
+        }
+        if parsed.len() != dim {
+            return Err(mismatch(parsed.len()));
+        }
+        rows.push(parsed);
+    }
+    Ok((rows, workspace))
 }
 
 pub(super) enum WriteRows<'py, T> {
@@ -168,6 +264,7 @@ impl<'py, T: Component> WriteRows<'py, T> {
                     dim,
                     "vectors",
                     Some(WriteErrorInfo::MAINTENANCE_VALIDATION),
+                    |_, _| Ok(()),
                 )?
                 .into_iter(),
             ));

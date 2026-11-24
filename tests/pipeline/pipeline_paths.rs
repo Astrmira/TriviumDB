@@ -559,3 +559,144 @@ fn 多路径算子聚合强度和路径数() {
     assert_eq!(row.path.as_deref(), Some(&[1, 3, 4][..]));
     assert_eq!(row.path_strength.unwrap().kind, ScoreKind::Exact);
 }
+
+#[test]
+fn 最短路径的堆内存进入阶段预算和剖析() {
+    use triviumdb::query::pipeline::{NodeIdsSource, NodeRow, execute_pipeline};
+    let mut mt = MemTable::new(1);
+    for id in 1..=40 {
+        mt.insert_with_id(id, &[1f32], json!(null)).unwrap();
+        if id > 1 {
+            mt.link(id - 1, id, "next".into(), 1.).unwrap();
+        }
+    }
+    let ops: Vec<Box<dyn PipelineOperator<f32>>> = vec![
+        Box::new(NodeIdsSource { ids: vec![1] }),
+        Box::new(BatchShortestPaths {
+            targets: vec![40],
+            label_filter: None,
+        }),
+    ];
+    let mut budget = pipeline_budget();
+    budget.traversal.max_depth = 40;
+    budget.max_node_set_bytes = std::mem::size_of::<NodeRow>();
+    let mut ctx = PipelineContext::with_profile(&mt, budget, true);
+    assert_eq!(
+        execute_pipeline(&mut ctx, &ops).unwrap_err().code(),
+        "TDB_QUERY_EXECUTION"
+    );
+    ctx.budget.max_node_set_bytes = 16384;
+    let out = execute_pipeline(&mut ctx, &ops).unwrap();
+    let path: Vec<_> = (1..=40).collect();
+    assert_eq!(out.rows()[0].path.as_ref(), Some(&path));
+    assert!(
+        ctx.metrics.last().unwrap().node_set_bytes
+            >= std::mem::size_of::<NodeRow>() + 40 * std::mem::size_of::<u64>()
+    );
+}
+
+#[test]
+fn 多起点路径在最终舍入前比较成本() {
+    use triviumdb::query::{
+        tql_executor::{TqlValue, execute_tql_values},
+        tql_parser::parse_tql,
+    };
+    let mut mt = MemTable::<f32>::new(1);
+    for id in 1..=4 {
+        mt.insert_with_id(id, &[1.], json!({})).unwrap();
+    }
+    let big = 2f32.powi(60);
+    for (from, to, weight) in [(1, 3, big), (3, 4, 1.), (2, 4, big)] {
+        mt.link(from, to, "r".into(), weight).unwrap();
+    }
+    let query = parse_tql("SEARCH VECTOR [1] TOP 2 AS s WITH s WEIGHTED_PATHS s TO [4] AS r WITH r RETURN path(r) AS p, weighted_distance(r) AS cost").unwrap();
+    let rows = execute_tql_values(&query, &mt).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(&rows[0]["p"],TqlValue::Path(path) if path == &[2,4]));
+    assert!(matches!(rows[0]["cost"],TqlValue::Float(v) if v == f64::from(big)));
+}
+
+#[test]
+fn 全路径聚合区分刚好枚举完整与仍有剩余路径() {
+    use triviumdb::query::{
+        tql_executor::{TqlValue, execute_tql_values},
+        tql_parser::parse_tql,
+    };
+    let mt = graph();
+    for (cap, expected, truncated) in [(1, 1, true), (2, 2, false)] {
+        let query = parse_tql(&format!("MATCH (s {{id:1}}) WITH s ALL_PATHS s TO [4] DEPTH 2 PATHS {cap} AGGREGATE max_product AS r WITH r AS p RETURN path_count(p) AS n, path_truncated(p) AS truncated")).unwrap();
+        let rows = execute_tql_values(&query, &mt).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0]["n"], TqlValue::Int(n) if n == expected));
+        assert!(matches!(rows[0]["truncated"], TqlValue::Bool(v) if v == truncated));
+    }
+}
+
+#[test]
+fn 批量路径在当前子查询耗尽时报告对应维度及全阶段计数() {
+    use triviumdb::{TriviumError, graph::budget::BudgetDimension};
+    let mut mt = MemTable::<f32>::new(1);
+    for id in 1..=3 {
+        mt.insert_with_id(id, &[1.], json!({})).unwrap();
+    }
+    mt.link(1, 2, "r".into(), 1.).unwrap();
+    mt.link(1, 3, "r".into(), 1.).unwrap();
+    for op in [
+        Box::new(BatchShortestPaths {
+            targets: vec![2, 3],
+            label_filter: None,
+        }) as Box<dyn PipelineOperator<f32>>,
+        Box::new(BoundedAllPaths {
+            targets: vec![2, 3],
+            config: BoundedPathConfig {
+                max_depth: 1,
+                max_paths: 4,
+                label_sequence: None,
+                forbidden_nodes: BTreeSet::new(),
+            },
+            aggregation: PathStrengthAggregation::MaxProduct,
+        }),
+    ] {
+        let mut limits = pipeline_budget();
+        limits.traversal.max_examined_edges = 2;
+        limits.traversal.exhaustion_policy = BudgetExhaustionPolicy::Partial;
+        let e = op
+            .apply(
+                NodeSet::from_ids([1]),
+                &mut PipelineContext::new(&mt, limits),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                e,
+                TriviumError::TraversalBudgetExceeded {
+                    dimension: BudgetDimension::ExaminedEdges,
+                    examined_edges: 2,
+                    ..
+                }
+            ),
+            "{e:?}"
+        );
+    }
+    let mut limits = pipeline_budget();
+    limits.traversal.max_depth = 1;
+    limits.traversal.exhaustion_policy = BudgetExhaustionPolicy::Partial;
+    mt.link(2, 3, "via".into(), 1.).unwrap();
+    mt.link(1, 2, "via".into(), 1.).unwrap();
+    let e = BatchShortestPaths {
+        targets: vec![3],
+        label_filter: Some("via".into()),
+    }
+    .apply(
+        NodeSet::from_ids([1]),
+        &mut PipelineContext::new(&mt, limits),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        e,
+        TriviumError::TraversalBudgetExceeded {
+            dimension: BudgetDimension::Depth,
+            ..
+        }
+    ));
+}

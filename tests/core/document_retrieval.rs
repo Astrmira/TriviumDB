@@ -463,6 +463,31 @@ fn 上下文按字节顺序展开混合粒度同级及纯目录祖先并合并�
             end_column: 9,
         }]
     );
+    let mut first = seed(&unicode, "a", 10, 13);
+    first.block_key = None;
+    let mut last = first.clone();
+    last.reference.start_byte = 24;
+    last.reference.end_byte = 28;
+    let separate = db
+        .document_context(&DocumentContextQuery {
+            seeds: vec![last, first],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        separate[0]
+            .windows
+            .iter()
+            .map(|window| (
+                window.text.as_str(),
+                window.line,
+                window.column,
+                window.end_line,
+                window.end_column
+            ))
+            .collect::<Vec<_>>(),
+        [("猫", 2, 1, 2, 2), ("beta", 3, 1, 3, 5)]
+    );
     let mut bad_boundary = seed(&unicode, "a", 11, 23);
     let error = db
         .document_context(&DocumentContextQuery {

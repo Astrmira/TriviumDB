@@ -1,9 +1,8 @@
 use super::expression::RefValue;
-use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use triviumdb::query::tql_executor::TqlValue;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CanonicalValue {
     Null,
     Bool(bool),
@@ -11,23 +10,23 @@ pub enum CanonicalValue {
     Unsigned(u64),
     Float(u64),
     String(String),
-    Node(u64),
-    Edge(u64, u64, String),
+    Node {
+        id: u64,
+        vector: Vec<u32>,
+        payload: Box<CanonicalValue>,
+        edges: Vec<CanonicalValue>,
+    },
+    Edge {
+        graph_id: Option<String>,
+        source: u64,
+        target: u64,
+        label: String,
+        weight_bits: u32,
+        metadata: Box<CanonicalValue>,
+    },
     Path(Vec<u64>),
     List(Vec<CanonicalValue>),
     Object(BTreeMap<String, CanonicalValue>),
-}
-
-impl Ord for CanonicalValue {
-    fn cmp(&self, other: &Self) -> Ordering {
-        format!("{self:?}").cmp(&format!("{other:?}"))
-    }
-}
-
-impl PartialOrd for CanonicalValue {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
 }
 
 pub type CanonicalValueRow = BTreeMap<String, CanonicalValue>;
@@ -39,7 +38,7 @@ fn json_value(value: &serde_json::Value) -> CanonicalValue {
         serde_json::Value::Number(value) => value.as_i64().map_or_else(
             || {
                 value.as_u64().map_or_else(
-                    || CanonicalValue::Float(value.as_f64().unwrap_or(f64::NAN).to_bits()),
+                    || CanonicalValue::Float(value.as_f64().unwrap().to_bits()),
                     CanonicalValue::Unsigned,
                 )
             },
@@ -60,10 +59,35 @@ fn json_value(value: &serde_json::Value) -> CanonicalValue {
 
 pub fn from_tql_value(value: &TqlValue<f32>) -> CanonicalValue {
     match value {
-        TqlValue::Node(node) => CanonicalValue::Node(node.id),
-        TqlValue::Edge(edge) => {
-            CanonicalValue::Edge(edge.source_id, edge.target_id, edge.label.clone())
+        TqlValue::Node(node) => {
+            let mut edges = node
+                .edges
+                .iter()
+                .map(|edge| CanonicalValue::Edge {
+                    graph_id: None,
+                    source: node.id,
+                    target: edge.target_id,
+                    label: edge.label.clone(),
+                    weight_bits: edge.weight.to_bits(),
+                    metadata: Box::new(json_value(&edge.metadata)),
+                })
+                .collect::<Vec<_>>();
+            edges.sort();
+            CanonicalValue::Node {
+                id: node.id,
+                vector: node.vector.iter().map(|v| v.to_bits()).collect(),
+                payload: Box::new(json_value(&node.payload)),
+                edges,
+            }
         }
+        TqlValue::Edge(edge) => CanonicalValue::Edge {
+            graph_id: edge.graph_id.clone(),
+            source: edge.source_id,
+            target: edge.target_id,
+            label: edge.label.clone(),
+            weight_bits: edge.weight.to_bits(),
+            metadata: Box::new(json_value(&edge.metadata)),
+        },
         TqlValue::Int(value) => CanonicalValue::Integer(*value),
         TqlValue::UInt(value) => CanonicalValue::Unsigned(*value),
         TqlValue::Float(value) => CanonicalValue::Float(value.to_bits()),
@@ -81,11 +105,38 @@ pub fn from_tql_value(value: &TqlValue<f32>) -> CanonicalValue {
     }
 }
 
+/// 预期节点取自写入样例，出边和向量按该样例的构造约定生成。
+pub fn expected_node(reference: &super::model::RefDatabase, id: u64) -> CanonicalValue {
+    let edges = reference
+        .edges
+        .iter()
+        .filter(|edge| edge.source == id)
+        .map(|edge| CanonicalValue::Edge {
+            graph_id: None,
+            source: id,
+            target: edge.target,
+            label: edge.label.clone(),
+            weight_bits: 1f32.to_bits(),
+            metadata: Box::new(CanonicalValue::Null),
+        })
+        .collect();
+    CanonicalValue::Node {
+        id,
+        vector: [id as f32, 1., 0.].map(f32::to_bits).to_vec(),
+        payload: Box::new(json_value(&reference.nodes[&id].payload)),
+        edges,
+    }
+}
+
 pub fn from_reference(value: &RefValue) -> CanonicalValue {
     match value {
         RefValue::Missing | RefValue::Null => CanonicalValue::Null,
         RefValue::Bool(value) => CanonicalValue::Bool(*value),
-        RefValue::Integer(value) => CanonicalValue::Integer(*value),
+        RefValue::Integer(value) => i64::try_from(*value)
+            .map(CanonicalValue::Integer)
+            .unwrap_or_else(|_| {
+                CanonicalValue::Unsigned(u64::try_from(*value).expect("整数应属于 JSON 域"))
+            }),
         RefValue::Float(value) => CanonicalValue::Float(value.to_bits()),
         RefValue::String(value) => CanonicalValue::String(value.clone()),
         RefValue::List(value) => CanonicalValue::List(value.iter().map(from_reference).collect()),
@@ -127,7 +178,58 @@ mod tests {
             TqlValue::Null,
         ];
         let converted = values.iter().map(from_tql_value).collect::<Vec<_>>();
-        assert_eq!(converted.len(), 7);
+        assert_eq!(
+            converted,
+            [
+                CanonicalValue::Integer(7),
+                CanonicalValue::Float(1.5f64.to_bits()),
+                CanonicalValue::String("x".into()),
+                CanonicalValue::Bool(true),
+                CanonicalValue::Path(vec![1, 2]),
+                CanonicalValue::List(vec![CanonicalValue::Integer(1), CanonicalValue::Null]),
+                CanonicalValue::Null
+            ]
+        );
         assert_eq!(from_reference(&RefValue::Missing), CanonicalValue::Null);
+    }
+
+    #[test]
+    fn 边的图身份权重和元数据分别参与差分() {
+        // 两张图共享端点和标签，投影仍须保留每一条边的身份及独立属性。
+        let root = crate::support::TestDir::new("canonical-edges");
+        let mut db = triviumdb::Database::<f32>::open(&root.file("named.tdb"), 1).unwrap();
+        for id in [7, 9] {
+            db.insert_with_id(id, &[1.], serde_json::Value::Null)
+                .unwrap();
+        }
+        let cases = [("A", 1f32, 3), ("B", 2f32, 4)];
+        for (graph, weight, rank) in cases {
+            let data = serde_json::json!({"graph_id":graph,"metadata":{},"members":["7","9"],"edges":[{
+                "source_id":"7","target_id":"9","label":"rel","weight":weight,"metadata":{"rank":rank}
+            }]});
+            db.put_named_graph(serde_json::from_value(data).unwrap(), None)
+                .unwrap();
+        }
+        let rows = db
+            .tql_values("GRAPH {graph_ids:['A','B']} MATCH (a)-[e:rel]->(b) RETURN e")
+            .unwrap();
+        let mut expected = cases.map(|(graph, weight, rank)| {
+            BTreeMap::from([(
+                "e".into(),
+                CanonicalValue::Edge {
+                    graph_id: Some(graph.into()),
+                    source: 7,
+                    target: 9,
+                    label: "rel".into(),
+                    weight_bits: weight.to_bits(),
+                    metadata: Box::new(CanonicalValue::Object(BTreeMap::from([(
+                        "rank".into(),
+                        CanonicalValue::Integer(rank),
+                    )]))),
+                },
+            )])
+        });
+        expected.sort();
+        assert_eq!(canonicalize_rows(rows, false), expected);
     }
 }

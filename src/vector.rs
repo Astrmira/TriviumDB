@@ -96,7 +96,9 @@ pub(crate) fn normalized_cosine(dot: f64, norm_a: f64, norm_b: f64) -> f32 {
     if norm_a == 0. || norm_b == 0. {
         return 0.;
     }
-    (dot / (norm_a.sqrt() * norm_b.sqrt())).clamp(-1., 1.) as f32
+    let score = (dot / (norm_a.sqrt() * norm_b.sqrt())).clamp(-1., 1.) as f32;
+    // 极小余弦收窄后可能成为负零，所有 Top-K 路径应按节点身份打破零分平局。
+    if score == 0. { 0. } else { score }
 }
 
 /// 定义通用向量类型的 Trait，支持多种引擎底层数据 (f32 / f16 / u64)

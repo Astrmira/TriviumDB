@@ -137,7 +137,7 @@ impl<T: VectorType> PipelineOperator<T> for DocumentSource<T> {
             context.memtable,
             &query,
             recall,
-            context.document_memory_limit()?,
+            context.database_memory_limit,
         )?;
         if let Some(retrieval) = &result.retrieval {
             context.charge_vectors(retrieval.vector_scores)?;

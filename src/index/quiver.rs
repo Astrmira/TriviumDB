@@ -915,7 +915,8 @@ pub struct QuIVer {
 
     // 增量管理
     tombstones: Vec<bool>, // internal_index → 是否已删除
-    dirty_count: usize,    // 增量变更计数（tombstone + 追加节点）
+    tombstone_count: usize,
+    dirty_count: usize, // 增量变更计数（tombstone + 追加节点）
 
     // 当前 QuIVer 实例范围内的属性 posting → internal slot 派生缓存。
     // QuIVer 重建会替换整个实例；增量变更会清空缓存，不参与持久化或建图。
@@ -926,6 +927,7 @@ pub struct QuIVer {
     connectivity_parents: Vec<u32>,
 }
 
+#[derive(Clone, Copy, PartialEq)]
 pub struct QuIVerConfig {
     pub m: usize,
     pub ef_construction: usize,
@@ -971,6 +973,12 @@ impl QuIVerSearchConfig {
 }
 
 impl QuIVer {
+    pub(crate) fn matches_build_config(&self, config: &QuIVerConfig) -> bool {
+        self.m == config.m
+            && self.ef_construction == config.ef_construction
+            && self.alpha == config.alpha
+    }
+
     pub fn new(dim: usize, config: &QuIVerConfig) -> Self {
         assert!(
             dim <= crate::index::bq::MAX_BQ_DIM,
@@ -1004,6 +1012,7 @@ impl QuIVer {
             entry_point: 0,
             max_level: 0,
             tombstones: Vec::new(),
+            tombstone_count: 0,
             dirty_count: 0,
             prefilter_slot_cache: Mutex::new(PrefilterSlotCacheState::default()),
             visited: Bitset::new(0),
@@ -2107,6 +2116,7 @@ impl QuIVer {
             self.id_to_internal.insert(id, i as u32);
         }
         self.tombstones = vec![false; n];
+        self.tombstone_count = 0;
         self.dirty_count = 0;
         self.node_max_layer = levels;
         self.entry_point = 0;
@@ -2195,6 +2205,7 @@ impl QuIVer {
             self.id_to_internal.insert(id, i as u32);
         }
         self.tombstones = vec![false; n];
+        self.tombstone_count = 0;
         self.dirty_count = 0;
         self.node_max_layer = levels;
         self.entry_point = 0;
@@ -2332,13 +2343,11 @@ impl QuIVer {
     }
 
     pub fn stats(&self) -> QuIVerStats {
-        let tombstone_count = self.tombstones.iter().filter(|&&t| t).count();
-
         QuIVerStats {
             n: self.n,
             max_level: self.max_level,
             hot_bytes: self.hot_memory_bytes(),
-            tombstone_count,
+            tombstone_count: self.tombstone_count,
             dirty_count: self.dirty_count,
             avg_degree_l0: if self.n > 0 {
                 (0..self.n)
@@ -2411,6 +2420,7 @@ impl QuIVer {
             if !self.tombstones[idx as usize] {
                 self.corrected_sm = None;
                 self.tombstones[idx as usize] = true;
+                self.tombstone_count += 1;
                 self.dirty_count += 1;
                 self.prefilter_slot_cache
                     .get_mut()
@@ -2429,10 +2439,10 @@ impl QuIVer {
         self.n > 0 && self.dirty_count * 4 > self.n
     }
 
-    /// 活跃节点数（总数 - tombstone 数）
+    /// 常数时间取得活跃节点数；墓碑计数随图更新并从快照重建。
     #[inline]
     pub fn active_count(&self) -> usize {
-        self.n - self.tombstones.iter().filter(|&&t| t).count()
+        self.n - self.tombstone_count
     }
 
     /// sidecar 的活跃 ID 与冷向量 slot 必须逐项对应当前事实；墓碑不参与覆盖。
@@ -2631,7 +2641,7 @@ mod tests {
         index.ids[1] = 1;
         assert!(!index.matches_fact_slots(&mt));
         index.ids[1] = 2;
-        index.tombstones[0] = true;
+        assert!(index.soft_delete(1));
         assert!(!index.matches_fact_slots(&mt));
     }
 

@@ -18,6 +18,7 @@ thread_local! {
 pub(crate) struct PayloadMeter {
     lookups: AtomicU64,
     parsed_bytes: AtomicU64,
+    logical_bytes: AtomicU64,
     max_lookups: u64,
     max_parsed_bytes: u64,
     exhausted: OnceLock<PayloadBudgetFailure>,
@@ -41,6 +42,7 @@ impl PayloadMeter {
         Self {
             lookups: AtomicU64::new(0),
             parsed_bytes: AtomicU64::new(0),
+            logical_bytes: AtomicU64::new(0),
             max_lookups,
             max_parsed_bytes,
             exhausted: OnceLock::new(),
@@ -117,11 +119,19 @@ pub(crate) fn record_payload_lookup() -> Result<()> {
     })
 }
 
-pub(crate) fn record_payload_parse(bytes: u64) -> Result<()> {
+pub(crate) fn record_payload_parse(bytes: u64) {
+    PAYLOAD_METER.with(|active| {
+        if let Some(meter) = active.borrow().as_ref() {
+            meter.parsed_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+    });
+}
+
+pub(crate) fn charge_payload_bytes(bytes: u64) -> Result<()> {
     PAYLOAD_METER.with(|active| {
         active.borrow().as_ref().map_or(Ok(()), |meter| {
             meter.charge(
-                &meter.parsed_bytes,
+                &meter.logical_bytes,
                 bytes,
                 meter.max_parsed_bytes,
                 "parsed_bytes",

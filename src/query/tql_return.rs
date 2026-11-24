@@ -12,7 +12,7 @@ pub(super) enum Input<'a, T> {
 }
 
 pub(super) struct Scope<'a, T: VectorType> {
-    pub memory: &'a QueryMemory,
+    pub memory: &'a QueryMemory<'a>,
     pub query: &'a TqlQuery,
     pub mt: &'a MemTable<T>,
     pub limits: &'a ExecutionContext,
@@ -22,27 +22,42 @@ pub(super) struct Scope<'a, T: VectorType> {
 pub(super) struct Row<T> {
     pub source: Option<usize>,
     pub values: HashMap<String, TqlValue<T>>,
-    group_key: Option<Vec<String>>,
+    group_key: Vec<RuntimeValue>,
 }
 
 // 同分行按完整绑定身份比较，保持不同访问路径和 HashMap 顺序下的分页一致。
-fn compare_input_identity<T>(left: &Input<'_, T>, right: &Input<'_, T>) -> std::cmp::Ordering {
+fn compare_input_identity<T>(
+    left: &Input<'_, T>,
+    right: &Input<'_, T>,
+    entry: &QueryEntry,
+) -> std::cmp::Ordering {
     match (left, right) {
-        (Input::Nodes(_, Some((left_name, left))), Input::Nodes(_, Some((right_name, right)))) => (
-            left_name,
-            &left.graph_id,
-            left.source_id,
-            left.target_id,
-            &left.label,
-        )
-            .cmp(&(
-                right_name,
-                &right.graph_id,
-                right.source_id,
-                right.target_id,
-                &right.label,
-            )),
-        (Input::Nodes(_, left), Input::Nodes(_, right)) => left.is_some().cmp(&right.is_some()),
+        (Input::Nodes(a, x), Input::Nodes(b, y)) => {
+            let edge_key = |edge: &EdgeView| (edge.source_id, edge.target_id);
+            let edge_order = match (x, y) {
+                (Some((_, x)), Some((_, y))) => x
+                    .graph_id
+                    .cmp(&y.graph_id)
+                    .then_with(|| edge_key(x).cmp(&edge_key(y)))
+                    .then_with(|| x.label.cmp(&y.label)),
+                _ => x.is_some().cmp(&y.is_some()),
+            };
+            edge_order.then_with(|| match entry {
+                QueryEntry::Match { pattern } | QueryEntry::OptionalMatch { pattern } => pattern
+                    .nodes
+                    .iter()
+                    .filter_map(|node| node.var.as_ref())
+                    .map(|var| a.get(var).map(|n| n.id))
+                    .cmp(
+                        pattern
+                            .nodes
+                            .iter()
+                            .filter_map(|node| node.var.as_ref())
+                            .map(|var| b.get(var).map(|n| n.id)),
+                    ),
+                _ => a.get("_").map(|n| n.id).cmp(&b.get("_").map(|n| n.id)),
+            })
+        }
         (Input::Pipeline(left), Input::Pipeline(right)) => left
             .id
             .cmp(&right.id)
@@ -578,7 +593,12 @@ fn finish_inner<T: VectorType>(
         if inputs.is_empty() && group_items.is_empty() {
             groups.insert(Vec::new(), Vec::new());
         }
-        for (group_key, group) in groups {
+        for mut group in groups.into_values() {
+            if scope.pipeline.is_none() && scope.query.rank.is_none() {
+                group.sort_unstable_by(|&a, &b| {
+                    compare_input_identity(&inputs[a], &inputs[b], &scope.query.entry)
+                });
+            }
             let source = group.first().copied();
             let mut values = HashMap::new();
             for (item_index, item) in items.iter().enumerate() {
@@ -602,16 +622,37 @@ fn finish_inner<T: VectorType>(
                 })?;
                 values.insert(column_name(item), value);
             }
+            let group_key = if scope.query.order_by.is_empty() {
+                Vec::new()
+            } else {
+                group_items
+                    .iter()
+                    .map(|item| tql_value_runtime(&values[&column_name(item)]))
+                    .collect()
+            };
             rows.push(Row {
                 source,
                 values,
-                group_key: Some(group_key),
+                group_key,
             });
         }
     } else {
         let distinct = expressions.filter(|items| items.iter().any(|item| item.distinct));
         let mut seen = HashSet::new();
-        for (index, input) in inputs.iter().enumerate() {
+        // 普通绑定按完整身份选取 DISTINCT 代表行；显式排名和管线保留其输入顺序。
+        let canonical = (distinct.is_some()
+            && scope.query.rank.is_none()
+            && scope.pipeline.is_none())
+        .then(|| {
+            let mut order: Vec<_> = (0..inputs.len()).collect();
+            order.sort_unstable_by(|&a, &b| {
+                compare_input_identity(&inputs[a], &inputs[b], &scope.query.entry)
+            });
+            order
+        });
+        for position in 0..inputs.len() {
+            let index = canonical.as_ref().map_or(position, |order| order[position]);
+            let input = &inputs[index];
             scope.limits.check_cancelled()?;
             if let Some(distinct) = distinct {
                 let key = distinct
@@ -625,7 +666,7 @@ fn finish_inner<T: VectorType>(
             rows.push(Row {
                 source: Some(index),
                 values: HashMap::new(),
-                group_key: None,
+                group_key: Vec::new(),
             });
         }
     }
@@ -648,18 +689,10 @@ fn finish_inner<T: VectorType>(
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                let mut identity = match row.source.map(|index| &inputs[index]) {
-                    Some(Input::Nodes(nodes, _)) => nodes
-                        .iter()
-                        .map(|(name, node)| (name.as_str(), node.id))
-                        .collect::<Vec<_>>(),
-                    _ => Vec::new(),
-                };
-                identity.sort_unstable();
-                Ok((row, keys, identity))
+                Ok((row, keys))
             })
             .collect::<Result<Vec<_>, TriviumError>>()?;
-        sorted.sort_by(|(left, a, left_identity), (right, b, right_identity)| {
+        sorted.sort_by(|(left, a), (right, b)| {
             for ((a, b), order) in a.iter().zip(b).zip(&scope.query.order_by) {
                 let cmp = compare_for_sort(a, b);
                 let cmp = if order.descending { cmp.reverse() } else { cmp };
@@ -668,16 +701,19 @@ fn finish_inner<T: VectorType>(
                 }
             }
             left.group_key
-                .cmp(&right.group_key)
-                .then_with(|| left_identity.cmp(right_identity))
+                .iter()
+                .zip(&right.group_key)
+                .map(|(a, b)| compare_for_sort(a, b))
+                .find(|order| !order.is_eq())
+                .unwrap_or_else(|| left.group_key.len().cmp(&right.group_key.len()))
                 .then_with(|| match (left.source, right.source) {
                     (Some(left), Some(right)) => {
-                        compare_input_identity(&inputs[left], &inputs[right])
+                        compare_input_identity(&inputs[left], &inputs[right], &scope.query.entry)
                     }
                     _ => std::cmp::Ordering::Equal,
                 })
         });
-        rows = sorted.into_iter().map(|(row, _, _)| row).collect();
+        rows = sorted.into_iter().map(|(row, _)| row).collect();
     }
     apply_offset_limit(&mut rows, scope.query.offset, scope.query.limit);
     if !has_agg {

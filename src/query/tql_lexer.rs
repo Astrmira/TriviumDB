@@ -466,18 +466,23 @@ impl TqlLexer {
                             loop {
                                 match self.advance() {
                                     Some('\\') => {
-                                        // 转义字符支持
-                                        match self.advance() {
-                                            Some('n') => s.push('\n'),
-                                            Some('t') => s.push('\t'),
-                                            Some('\\') => s.push('\\'),
-                                            Some(c) if c == quote => s.push(c),
-                                            Some(c) => {
-                                                s.push('\\');
-                                                s.push(c);
+                                        s.push(match self.advance() {
+                                            Some('"') => '"',
+                                            Some('\'') if quote == '\'' => '\'',
+                                            Some('\\') => '\\',
+                                            Some('/') => '/',
+                                            Some('b') => '\x08',
+                                            Some('f') => '\x0c',
+                                            Some('n') => '\n',
+                                            Some('r') => '\r',
+                                            Some('t') => '\t',
+                                            Some('u') => self.unicode_escape()?,
+                                            _ => {
+                                                return Err(
+                                                    "字符串转义无效 (Invalid string escape)".into(),
+                                                );
                                             }
-                                            None => return Err("Unterminated string escape".into()),
-                                        }
+                                        });
                                     }
                                     Some(c) if c == quote => break,
                                     Some(c) => s.push(c),
@@ -575,6 +580,33 @@ impl TqlLexer {
     }
 
     /// 读取十进制数字，支持整数、小数和科学计数法。
+    fn unicode_escape(&mut self) -> Result<char, String> {
+        let invalid = || "Unicode 转义无效 (Invalid Unicode escape)".to_owned();
+        let unit = |lexer: &mut Self| -> Result<u32, String> {
+            (0..4).try_fold(0u32, |value, _| {
+                let digit = lexer
+                    .advance()
+                    .and_then(|c| c.to_digit(16))
+                    .ok_or_else(invalid)?;
+                Ok(value * 16 + digit)
+            })
+        };
+        let high = unit(self)?;
+        let code = if (0xd800..=0xdbff).contains(&high) {
+            if self.advance() != Some('\\') || self.advance() != Some('u') {
+                return Err(invalid());
+            }
+            let low = unit(self)?;
+            if !(0xdc00..=0xdfff).contains(&low) {
+                return Err(invalid());
+            }
+            0x10000 + ((high - 0xd800) << 10) + low - 0xdc00
+        } else {
+            high
+        };
+        char::from_u32(code).ok_or_else(invalid)
+    }
+
     fn read_number(&mut self) -> Result<TqlToken, String> {
         let mut num_str = String::new();
         let mut is_float = false;

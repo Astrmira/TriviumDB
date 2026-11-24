@@ -844,7 +844,7 @@ fn cancelled_waiter_leaves_the_shared_read_available_to_its_owner() {
 #[cfg(all(feature = "test-hooks", any(windows, target_os = "linux")))]
 #[test]
 fn cancellation_after_native_completion_drains_workers_and_releases_files() {
-    use crate::test_hooks::{ConcurrencyPoint, pause_at};
+    use crate::test_hooks::{ConcurrencyPoint, pause_at_request};
     let directory = TestDir::new("ssd_completion_cancel");
     let path = directory.0.join("index.qssd");
     let runtime = runtime();
@@ -866,7 +866,7 @@ fn cancellation_after_native_completion_drains_workers_and_releases_files() {
         .unwrap();
     let baseline = reader.stats().reserved_bytes;
     let reader = Arc::new(reader);
-    let gate = pause_at(ConcurrencyPoint::QuiverColdIoCompleted);
+    let gate = pause_at_request(ConcurrencyPoint::QuiverColdIoCompleted, "ssd-completion");
     let context = crate::sdk::RequestContext::with_timeout(
         "ssd-completion",
         std::time::Duration::ZERO,
@@ -892,4 +892,38 @@ fn cancellation_after_native_completion_drains_workers_and_releases_files() {
     std::fs::remove_file(&path).unwrap();
     assert_eq!(runtime.stats().reserved_workspace_bytes, 0);
     assert_eq!(runtime.stats().live_worker_threads, 0);
+}
+
+#[test]
+fn 宿主工作区参与读取器准入且只在实例账本中计入一次() {
+    let runtime = ResourceRuntime::new(Default::default()).unwrap();
+    let memory = Memory::new(runtime.clone(), 100);
+    let owned = memory.reserve(35).unwrap();
+    let host = runtime.reserve_workspace(60).unwrap();
+    let borrowed = memory.charge_external(60).unwrap();
+    let usage = || {
+        let used = crate::database::lock_or_recover(&memory.local.used);
+        (
+            used.total,
+            used.total - used.borrowed,
+            runtime.stats().reserved_workspace_bytes,
+        )
+    };
+    assert_eq!(usage(), (95, 35, 95));
+    let error = memory.reserve(6).err().expect("读请求应超出局部配额");
+    assert!(matches!(
+        error.underlying(),
+        TriviumError::ResourceBudgetExceeded {
+            resource: "quiver_ssd_memory_bytes",
+            requested: 6,
+            used: 95,
+            limit: 100
+        }
+    ));
+    assert_eq!(usage(), (95, 35, 95));
+    drop(borrowed);
+    drop(host);
+    assert_eq!(usage(), (35, 35, 35));
+    drop(owned);
+    assert_eq!(usage(), (0, 0, 0));
 }

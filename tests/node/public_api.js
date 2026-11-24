@@ -362,7 +362,8 @@ async function runAsyncResourceContract(root) {
         return true
       }
       assert.throws(() => db.searchExact(test.vector, 1), checkError)
-      await assert.rejects(() => db.searchBatch([test.vector], 1, 1, 0), checkError)
+      await assert.rejects(db.searchBatch([test.vector], 1, 1, 0), checkError)
+      await assert.rejects(db.searchIdsBatch([test.vector]), checkError)
       assert.equal(runtime.stats().active_tasks, 0)
       db.setMemoryLimit(8)
       assert.equal((await db.searchBatch([test.vector], 1, 1, 0))[0][0].id, 1)

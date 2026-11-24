@@ -101,6 +101,8 @@ impl Read {
         let (complete, receiver) = mpsc::channel();
         (
             Some(Self::new(Job {
+                #[cfg(feature = "test-hooks")]
+                request_id: None,
                 offset: 0,
                 bytes: vec![0; 8],
                 complete,

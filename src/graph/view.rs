@@ -23,9 +23,6 @@ pub(crate) trait GraphRead<T: VectorType>: Sync {
     fn ensure_readable(&self) -> Result<()> {
         self.facts().ensure_readable()
     }
-    fn resource_runtime(&self) -> &crate::ResourceRuntime {
-        self.facts().resource_runtime()
-    }
     fn get_in_degree(&self, id: NodeId) -> usize {
         self.get_incoming_sources(id)
             .iter()
@@ -85,7 +82,7 @@ pub(crate) struct ScopedGraph {
     identities: BTreeMap<NodeId, Vec<Option<Arc<str>>>>,
     incoming: BTreeMap<NodeId, Vec<NodeId>>,
     in_degrees: BTreeMap<NodeId, usize>,
-    _workspace: crate::resources::WorkspaceReservation,
+    _workspace: crate::resources::RequestWorkspace,
 }
 
 impl ScopedGraph {
@@ -132,10 +129,8 @@ impl ScopedGraph {
                 .saturating_add(nodes.saturating_mul(256))
                 .saturating_add(edges.saturating_mul(512))
         };
-        mt.ensure_additional_memory(memory_limit, view_bytes(min_nodes))?;
-        let mut workspace = mt
-            .resource_runtime()
-            .reserve_workspace(view_bytes(min_nodes))?;
+        let mut workspace = mt.reserve_instance_workspace(0)?;
+        mt.resize_request_workspace(&mut workspace, view_bytes(min_nodes), memory_limit)?;
         let ids = if scope.include_default {
             // 默认图的有序活跃节点已包含全部命名图成员。
             let mut ids = Vec::with_capacity(min_nodes);
@@ -155,8 +150,11 @@ impl ScopedGraph {
                     let count = members.len().saturating_add(1);
                     if count > min_nodes {
                         crate::named_graph::bound("named_graph_nodes", count, limits.max_nodes)?;
-                        mt.ensure_additional_memory(memory_limit, view_bytes(count))?;
-                        workspace.resize(view_bytes(count))?;
+                        mt.resize_request_workspace(
+                            &mut workspace,
+                            view_bytes(count),
+                            memory_limit,
+                        )?;
                     }
                     members.insert(member);
                 }
@@ -189,8 +187,7 @@ impl ScopedGraph {
                 }
             }
         }
-        mt.ensure_additional_memory(memory_limit, bytes)?;
-        workspace.resize(bytes)?;
+        mt.resize_request_workspace(&mut workspace, bytes, memory_limit)?;
         #[cfg(feature = "test-hooks")]
         crate::test_hooks::hit(crate::test_hooks::ConcurrencyPoint::NamedGraphRead);
         crate::request::check_current()?;

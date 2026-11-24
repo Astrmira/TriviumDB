@@ -2,18 +2,63 @@
 
 import json
 import math
+from array import array
 from pathlib import Path
 
 import triviumdb
 
 
 def verify_search_entries(root):
+    path = str(Path(root) / "cold-filter.tdb")
+    with triviumdb.TriviumDB(path, dim=1, payload_cache_mb=0) as db:
+        db.insert_with_id(1, [1], {"large": "x" * 600_000})
+    with triviumdb.TriviumDB(path, dim=1, payload_cache_mb=0) as db:
+        db.set_memory_limit(1)
+        for present in (True, False):
+            try:
+                db.search_ids([1], payload_filter={"large": {"$exists": present}}, exact=True)
+            except triviumdb.CapacityError as error:
+                assert error.code == "TDB_CAPACITY_RESERVATION_REJECTED"
+            else:
+                raise AssertionError("冷过滤必须先取得解码额度")
+        db.set_memory_limit(0)
+        assert db.search_ids([1], payload_filter={"large": {"$exists": True}}, exact=True) == [1]
+
+    with triviumdb.TriviumDB(str(Path(root) / "batch-input.tdb"), dim=128) as db:
+        unit = [1.0] + [0.0] * 127
+        db.insert_with_id(7, unit, {})
+        db.set_memory_limit(1)
+        matrix = memoryview(bytearray(2048 * 128 * 4)).cast("f", shape=(2048, 128))
+        for query in (db.search_ids_batch, db.search_batch):
+            try:
+                query(matrix)
+            except triviumdb.CapacityError as error:
+                assert error.code == "TDB_CAPACITY_RESERVATION_REJECTED"
+            else:
+                raise AssertionError("复制二维输入前必须取得实例额度")
+        assert db.search_ids_batch([unit], exact=True) == [[7]]
+
     half_path = str(Path(root) / "half-rounding.tdb")
     with triviumdb.TriviumDB(half_path, dim=2, dtype="f16") as half:
         half.insert_with_id(1, [1 + 2**-11 + 2**-28, 65519.9999], {})
     with triviumdb.TriviumDB(half_path, dim=2, dtype="f16") as half:
         assert half.get(1).vector == [1.0009765625, 65504.0]
         assert [h.id for h in half.search_exact([1.0009765625, 65519.9999], 1)] == [1]
+
+    with triviumdb.TriviumDB(str(Path(root) / "context-default.tdb"), dim=2) as db:
+        db.insert_with_id(1, [1, 0], {"node": 1})
+        db.insert_with_id(2, [0, 1], {"node": 2})
+        db.link(1, 2, "edge", 1.0)
+        for hits in (db.search([1, 0], top_k=2, min_score=0.9, exact=True),
+                     db.search_with_context([1, 0], top_k=2, min_score=0.9, exact=True)[0]):
+            assert [(h.id, h.score, h.payload) for h in hits] == [(1, 1.0, {"node": 1})]
+        for method, argument in ((db.search_ids, [1, 0]), (db.search_ids_batch, [[1, 0]])):
+            try:
+                method(argument, top_k=0)
+            except triviumdb.InvalidInputError as error:
+                assert error.code == "TDB_INVALID_INPUT"
+            else:
+                raise AssertionError("零 top_k 必须拒绝")
 
     fixture = json.loads((Path(__file__).parents[1] / "contracts/search_entry_cases.json").read_text(encoding="utf-8"))
     records = {record["id"]: record for record in fixture["records"]}
@@ -41,6 +86,7 @@ def verify_search_entries(root):
                         options["min_score"] = case["min_score"]
                     filtered = dict(options, payload_filter=case.get("filter"))
                     verify(db.search(query, **filtered), case)
+                    assert db.search_ids(query, **{key: value for key, value in filtered.items() if key != "expand_depth"}) == case["ids"]
                     hits, context = db.search_with_context(query, **filtered)
                     verify(hits, case)
                     assert context.observations["vector_route_quiver"] == 0
@@ -64,6 +110,31 @@ def verify_search_entries(root):
             if indexed:
                 db.search([1, 0], top_k=1)
                 assert db.search_with_context([1, 0], top_k=1)[1].observations["vector_route_quiver"] == 1
+                options = dict(top_k=3, recall_k=200, expand_depth=0, ann_rerank_limit=240)
+                hits, context = db.search_with_context([1, 0], **options)
+                assert context.observations["quiver_ef_search"] == 240
+                assert context.observations["quiver_rerank_limit"] == 240
+                assert context.observations["quiver_top_k"] == 3
+                advanced = db.search_advanced([1, 0], **options)
+                assert len(advanced) == 3
+                assert [(hit.id, hit.score, hit.payload) for hit in advanced] == [
+                    (hit.id, 1.0, {"id": hit.id}) for hit in hits
+                ]
+                assert [hit.id for hit in db.search([1, 0], **options)] == [hit.id for hit in hits]
+                query = memoryview(array("f", [1.0, 0.0]))
+                assert [hit.id for hit in db.search(query, **options)] == [hit.id for hit in hits]
+                assert [hit.id for hit in db.search_advanced(query, **options)] == [hit.id for hit in hits]
+                id_options = {key: value for key, value in options.items() if key != "expand_depth"}
+                assert db.search_ids(query, **id_options) == [hit.id for hit in hits]
+                queries = memoryview(array("f", [1.0, 0.0, 0.0, 1.0])).cast("B").cast("f", shape=[2, 2])
+                batch_ids = db.search_ids_batch(queries, min_score=0.5, parallelism=2, **id_options)
+                assert batch_ids == [[hit.id for hit in hits], []]
+                try:
+                    db.search_advanced([1, 0], ann_rerank_limit=0)
+                except triviumdb.InvalidInputError as error:
+                    assert error.target["field"] == "ann_rerank_limit"
+                else:
+                    raise AssertionError("显式零精排预算必须拒绝")
             hits, context = db.search_with_context([1, 0], top_k=3, expand_depth=0, exact=True)
             assert context.observations["vector_route_quiver"] == 0
             assert [(hit.id, hit.score, hit.payload) for hit in hits] == [(i, 1.0, {"id": i}) for i in (1, 2, 3)]

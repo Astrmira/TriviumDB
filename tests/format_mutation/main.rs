@@ -1,7 +1,6 @@
 #![allow(non_snake_case)]
 //! 格式感知变异矩阵：小型 fixture、逐字段变异、只读零写与 fail-closed。
 
-use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use triviumdb::database::Database;
 
@@ -36,11 +35,8 @@ impl Mutation {
 }
 
 fn path(name: &str) -> String {
-    let root = std::env::temp_dir().join("triviumdb_test");
-    std::fs::create_dir_all(&root).unwrap();
-    root.join(format!("format_mutation_{name}.tdb"))
-        .to_string_lossy()
-        .to_string()
+    thread_local! { static ROOT: support::TestDir = support::TestDir::new("format-mutation"); }
+    ROOT.with(|dir| dir.file(&format!("{name}.tdb")))
 }
 
 fn cleanup(path: &str) {
@@ -65,26 +61,17 @@ fn fixture(name: &str) -> String {
     path
 }
 
-fn snapshot(path: &str) -> BTreeMap<String, Vec<u8>> {
-    let database = std::path::Path::new(path);
-    let name = database.file_name().unwrap().to_str().unwrap();
-    let mut files = BTreeMap::new();
-    for entry in std::fs::read_dir(database.parent().unwrap()).unwrap() {
-        let entry = entry.unwrap();
-        let file_name = entry.file_name().to_string_lossy().into_owned();
-        if file_name == name || file_name.starts_with(&format!("{name}.")) {
-            files.insert(
-                file_name[name.len()..].to_owned(),
-                std::fs::read(entry.path()).unwrap(),
-            );
-        }
-    }
-    files
-}
-
 fn copy_group(source: &str, destination: &str) {
-    for (suffix, bytes) in snapshot(source) {
-        std::fs::write(format!("{destination}{suffix}"), bytes).unwrap();
+    let path = std::path::Path::new(source);
+    let name = path.file_name().unwrap().to_str().unwrap();
+    for entry in std::fs::read_dir(path.parent().unwrap()).unwrap() {
+        let entry = entry.unwrap();
+        let file = entry.file_name();
+        if let Some(suffix) = file.to_str().unwrap().strip_prefix(name)
+            && (suffix.is_empty() || suffix.starts_with('.'))
+        {
+            std::fs::copy(entry.path(), format!("{destination}{suffix}")).unwrap();
+        }
     }
 }
 
@@ -92,20 +79,19 @@ fn verify_control(source: &str) {
     let control = format!("{source}_control");
     cleanup(&control);
     copy_group(source, &control);
-    let before = snapshot(&control);
-    let mut db = Database::<f32>::open_read_only(&control, 4).unwrap();
-    assert_eq!(db.node_count().unwrap(), 12);
-    for id in 1..=12 {
-        let node = db.get(id).unwrap().unwrap();
-        assert_eq!(node.vector, vec![(id - 1) as f32, 1.0, 0.0, 0.0]);
-        assert_eq!(
-            node.payload,
-            serde_json::json!({"kind": "fixture", "index": id - 1})
-        );
-    }
-    db.close().unwrap();
-    assert_eq!(snapshot(&control), before);
+    read_only::check(&control, 4, |result| {
+        let mut db = result.unwrap();
+        check_contents(&db);
+        db.close().unwrap();
+    });
     cleanup(&control);
+}
+
+fn check_contents(db: &Database<f32>) {
+    let expected: Vec<_> = (1..=12).map(|id| serde_json::json!({
+        "id":id, "vector":[(id-1) as f32,1.,0.,0.], "payload":{"kind":"fixture","index":id-1}, "edges":[]
+    })).collect();
+    assert_eq!(node_facts::nodes(db), serde_json::json!(expected));
 }
 
 fn mutations(length: usize) -> Vec<Mutation> {
@@ -143,7 +129,7 @@ fn mutations(length: usize) -> Vec<Mutation> {
 }
 
 #[test]
-fn tdb格式变异全部拒绝或安全降级且绝不改写损坏输入() {
+fn 主文件内容改变时拒绝打开并保持文件组原样() {
     let original_path = fixture("tdb");
     verify_control(&original_path);
     let original = std::fs::read(&original_path).unwrap();
@@ -151,18 +137,26 @@ fn tdb格式变异全部拒绝或安全降级且绝不改写损坏输入() {
         let candidate = path(&format!("tdb_case_{index}"));
         cleanup(&candidate);
         copy_group(&original_path, &candidate);
-        std::fs::write(&candidate, mutation.apply(&original)).unwrap();
-        let before = snapshot(&candidate);
-        let result = Database::<f32>::open_read_only(&candidate, 4);
-        if let Ok(database) = result {
-            let _ = database.node_count().unwrap();
-            let _ = database.search(&[1.0, 0.0, 0.0, 0.0], 3, 0, -1.0);
-        }
-        assert_eq!(
-            snapshot(&candidate),
-            before,
-            "变异 {mutation:?} 导致只读写盘"
-        );
+        let changed = mutation.apply(&original);
+        std::fs::write(&candidate, &changed).unwrap();
+        read_only::check(&candidate, 4, |result| {
+            if changed == original {
+                check_contents(&result.unwrap());
+            } else {
+                let err = result.err().expect("已改变的主文件必须被检查点校验拒绝");
+                assert!(
+                    matches!(
+                        err.code(),
+                        "TDB_CORRUPTED_FILE"
+                            | "TDB_MIGRATION_REQUIRED"
+                            | "TDB_UNSUPPORTED_DATABASE_VERSION"
+                            | "TDB_DIMENSION_MISMATCH"
+                            | "TDB_DTYPE_MISMATCH"
+                    ),
+                    "{mutation:?}: {err}"
+                );
+            }
+        });
         cleanup(&candidate);
     }
     cleanup(&original_path);
@@ -182,9 +176,10 @@ fn flush_marker和vec等长变异由完整crc拒绝且只读零写() {
                 copy_group(&original_path, &candidate);
                 let mutated = Mutation::FlipBit { offset, bit }.apply(&original);
                 std::fs::write(format!("{candidate}{suffix}"), mutated).unwrap();
-                let before = snapshot(&candidate);
-                assert!(Database::<f32>::open_read_only(&candidate, 4).is_err());
-                assert_eq!(snapshot(&candidate), before);
+                read_only::check(&candidate, 4, |result| {
+                    let error = result.err().expect("校验和不同的文件组必须拒绝");
+                    assert_eq!(error.code(), "TDB_CORRUPTED_FILE");
+                });
                 cleanup(&candidate);
             }
         }
@@ -213,3 +208,13 @@ fn 文件读取工具自身覆盖偏移边界且不产生危险分配() {
 
 #[path = "../support/cleanup.rs"]
 mod cleanup_files;
+
+#[path = "../support/files.rs"]
+mod physical_files;
+#[path = "../support/read_only.rs"]
+mod read_only;
+#[path = "../support/mod.rs"]
+mod support;
+
+#[path = "../support/facts.rs"]
+mod node_facts;

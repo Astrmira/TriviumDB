@@ -21,17 +21,20 @@ pub enum ConcurrencyPoint {
     QuiverColdAfterPublish,
     /// 命名图复制前的受控读视图，用于取消和资源归还验收。
     NamedGraphRead,
+    NeighborhoodEdges,
     /// 文档精确向量评分及ANN导航的受控执行点。
     DocumentRecordCommitted,
     DocumentVectorStep,
     DocumentAnnStep,
     /// 文档成员posting访问中断点，用于受控取消交错。
     DocumentMemberStep,
+    TextPosting,
     BeforeDatabasePathMetadata,
     BeforeDatabasePathIdentity,
     DatabasePathResolutionFailed,
     BeforeSearchReadLock,
     BeforeSnapshotPublish,
+    GenerationManifestHashing,
     AfterSnapshotPublish,
     BeforeStatefulSearchLock,
     StatefulSearchEntered,
@@ -66,12 +69,14 @@ pub enum ConcurrencyPoint {
     MigrationCommitted,
     TqlPathStep,
     BeforeTqlProjection,
+    PropertyIndexBuildRow,
     ConsoleBeforeCommit,
     BeforeTransactionWal,
     TransactionWalLockAcquired,
     DirectWriteWalLockAcquired,
     ExactScanStep,
     GraphAlgorithmStep,
+    CognitiveStep,
     GraphAlgorithmIteration,
     BeforeDocumentIndexAccountingReset,
     DocumentPositionStep,
@@ -362,11 +367,14 @@ fn register_gate(key: GateKey) -> WaitHandle {
 
 /// 由生产路径调用：未注册时快速返回，注册时通知测试并等待释放。
 pub fn hit(point: ConcurrencyPoint) {
-    let request_gate = crate::request::current()
-        .map(|context| GateScope::Request(context.request_id().to_owned()));
+    let context = crate::request::current();
+    hit_for_request(point, context.as_ref().map(|ctx| ctx.request_id()));
+}
+
+pub(crate) fn hit_for_request(point: ConcurrencyPoint, request_id: Option<&str>) {
     wait_at(point, GateScope::Global);
-    if let Some(scope) = request_gate {
-        wait_at(point, scope);
+    if let Some(id) = request_id {
+        wait_at(point, GateScope::Request(id.to_owned()));
     }
 }
 

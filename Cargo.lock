@@ -2633,7 +2633,7 @@ checksum = "0d15f4f5898bcfc5d8a8e45ed30b2f108d710c1a2e5489dbf80e078f707181bc"
 
 [[package]]
 name = "triviumdb"
-version = "0.9.4-beta.1"
+version = "0.9.4-beta.2"
 dependencies = [
  "aho-corasick",
  "bincode",
@@ -2674,7 +2674,7 @@ dependencies = [
 
 [[package]]
 name = "triviumdb-cli"
-version = "0.9.4-beta.1"
+version = "0.9.4-beta.2"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -2696,7 +2696,7 @@ dependencies = [
 
 [[package]]
 name = "triviumdb-server"
-version = "0.9.4-beta.1"
+version = "0.9.4-beta.2"
 dependencies = [
  "async-stream",
  "axum",
@@ -2704,6 +2704,7 @@ dependencies = [
  "clap",
  "futures-util",
  "http-body-util",
+ "mime",
  "serde",
  "serde_json",
  "sha2",

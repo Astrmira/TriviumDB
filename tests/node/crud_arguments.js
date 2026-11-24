@@ -6,17 +6,10 @@ const fs = require('node:fs')
 const path = require('node:path')
 const fixture = require('../contracts/crud_arguments.json')
 
+const { invalid: invalidInput } = require('./input_errors')
+
 function invalid(field) {
-  return error => {
-    assert.equal(error.schema_version, 1)
-    assert.equal(error.code, 'TDB_INVALID_INPUT')
-    assert.deepEqual(error.target, { field })
-    assert.equal(error.stage, undefined)
-    assert.deepEqual(error.write, { phase: 'validation', outcome: 'not_committed' })
-    assert.deepEqual(Object.keys(error.details), ['reason'])
-    assert.ok(error.details.reason)
-    return true
-  }
+  return invalidInput(field, { phase: 'validation', outcome: 'not_committed' })
 }
 
 function rejectedValues(kind, field) {

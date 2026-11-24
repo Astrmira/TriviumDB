@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+message: >-
+  Please cite TriviumDB when using this software. If your work uses QuIVer
+  or Pelorus, please also cite the corresponding paper listed below.
+type: software
+title: TriviumDB
+authors:
+  - name: TriviumDB contributors
+repository-code: "https://github.com/Astrmira/TriviumDB"
+license: Apache-2.0
+references:
+  - type: article
+    title: "QuIVer: Efficient Graph Indexing with Two-Bit Construction and Navigation"
+    authors:
+      - family-names: Xiao
+        given-names: Wenxuan
+      - family-names: Zhu
+        given-names: Peidong
+      - family-names: Li
+        given-names: Chengcheng
+      - family-names: Cao
+        given-names: Xu
+    journal: arXiv
+    year: 2026
+    doi: 10.48550/arXiv.2605.02171
+    url: "https://arxiv.org/abs/2605.02171"
+  - type: article
+    title: "Pelorus: Warped-Product Graph Indexing for Hyperbolic Vector Search"
+    authors:
+      - family-names: Xiao
+        given-names: Wenxuan
+      - family-names: Cao
+        given-names: Xu
+    journal: arXiv
+    year: 2026
+    doi: 10.48550/arXiv.2611.22159
+    url: "https://arxiv.org/abs/2611.22159"

@@ -225,7 +225,7 @@ function runPreparedDiagnostics(root, { TriviumDB, ConsoleSession }) {
       for (const parameters of [null, undefined, [], 42, 'x', true, 1n, Symbol('container'), () => 42]) {
         assert.throws(() => db.executePreparedTql(prepared, parameters), invalid({ field: 'parameters' }))
       }
-      for (const value of [NaN, Infinity, -Infinity, undefined, 1n, Symbol('value'), () => 42]) {
+      for (const value of [NaN, Infinity, -Infinity, undefined, 1n << 64n, -(1n << 63n) - 1n, Symbol('value'), () => 42]) {
         assert.throws(() => db.executePreparedTql(prepared, { x: value }), invalid(xTarget, 'bind'))
       }
       for (const value of [null, true, false, '中文\u0000参数', 0, -2147483648, 4294967295, 4294967296, 1.25, Number.MAX_SAFE_INTEGER]) {

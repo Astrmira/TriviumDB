@@ -636,6 +636,13 @@ fn 显式LIMIT可覆盖配置行上限但OFFSET仍受内存硬上限() {
         overflow.underlying(),
         triviumdb::TriviumError::QueryRowBudgetExceeded { budget: 2 }
     ));
+    for entry in ["MATCH", "OPTIONAL MATCH"] {
+        for projection in ["n.id AS x ORDER BY x", "COUNT(*) AS total"] {
+            let query = format!("{entry} (n) RETURN {projection} LIMIT 0 OFFSET 10000");
+            assert!(db.tql_values(&query).unwrap().is_empty());
+            assert!(db.tql_nodes(&query).unwrap().is_empty());
+        }
+    }
     let rows = db.tql_nodes("MATCH (n) RETURN n LIMIT 3").unwrap();
     assert_eq!(
         rows.iter().map(|row| row["n"].id).collect::<Vec<_>>(),

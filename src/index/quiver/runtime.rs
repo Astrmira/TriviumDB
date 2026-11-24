@@ -319,8 +319,10 @@ impl SsdRow {
 }
 
 impl QuiverRuntime {
-    pub(crate) fn reserved_bytes(&self) -> usize {
-        *crate::database::lock_or_recover(&self.memory.local.used)
+    // 实例账本已包含宿主借入的工作区，此处仅返回读取器自身持有的额度。
+    pub(crate) fn owned_reservation_bytes(&self) -> usize {
+        let used = crate::database::lock_or_recover(&self.memory.local.used);
+        used.total - used.borrowed
     }
 
     pub(crate) fn set_database_capacity(&self, limit: usize) {
@@ -708,6 +710,7 @@ impl QuiverRuntime {
 
     pub fn stats(&self) -> QuiverRuntimeStats {
         let cache = crate::database::lock_or_recover(&self.cache);
+        let reserved_bytes = crate::database::lock_or_recover(&self.memory.local.used).total;
         let alignment = self
             .state
             .as_ref()
@@ -726,7 +729,7 @@ impl QuiverRuntime {
             metadata: self.metadata,
             closed: self.state.is_none(),
             reserved_hot_bytes: self.state.as_ref().map_or(0, |state| state.hot_bytes),
-            reserved_bytes: *crate::database::lock_or_recover(&self.memory.local.used),
+            reserved_bytes,
             cold_read_calls: self
                 .state
                 .as_ref()
@@ -1164,8 +1167,15 @@ fn loading_bytes(hot: &[u8], metadata: SsdMetadata) -> Result<usize> {
         .ok_or_else(capacity)
 }
 
+#[derive(Default)]
+struct LocalUsage {
+    total: usize,
+    // 宿主凭证已计入实例账本，只参与 Reader 的局部准入。
+    borrowed: usize,
+}
+
 struct LocalBudget {
-    used: Mutex<usize>,
+    used: Mutex<LocalUsage>,
     limit: AtomicUsize,
 }
 
@@ -1196,7 +1206,7 @@ impl Memory {
         Self {
             runtime,
             local: Arc::new(LocalBudget {
-                used: Mutex::new(0),
+                used: Mutex::default(),
                 limit: AtomicUsize::new(limit),
             }),
         }
@@ -1205,8 +1215,8 @@ impl Memory {
     fn reserve(&self, bytes: usize) -> Result<MemoryLease> {
         let global = self.runtime.reserve_workspace(bytes)?;
         let mut used = crate::database::lock_or_recover(&self.local.used);
-        let projected = self.local.projected(*used, bytes)?;
-        *used = projected;
+        let projected = self.local.projected(used.total, bytes)?;
+        used.total = projected;
         Ok(MemoryLease {
             global,
             local: self.local.clone(),
@@ -1216,7 +1226,8 @@ impl Memory {
 
     fn charge_external(&self, bytes: usize) -> Result<ExternalMemory> {
         let mut used = crate::database::lock_or_recover(&self.local.used);
-        *used = self.local.projected(*used, bytes)?;
+        used.total = self.local.projected(used.total, bytes)?;
+        used.borrowed += bytes;
         Ok(ExternalMemory {
             local: self.local.clone(),
             bytes,
@@ -1232,7 +1243,9 @@ struct ExternalMemory {
 
 impl Drop for ExternalMemory {
     fn drop(&mut self) {
-        *crate::database::lock_or_recover(&self.local.used) -= self.bytes;
+        let mut used = crate::database::lock_or_recover(&self.local.used);
+        used.total -= self.bytes;
+        used.borrowed -= self.bytes;
     }
 }
 
@@ -1246,12 +1259,12 @@ impl MemoryLease {
     fn resize(&mut self, bytes: usize) -> Result<()> {
         if bytes > self.bytes {
             let mut used = crate::database::lock_or_recover(&self.local.used);
-            let projected = self.local.projected(*used, bytes - self.bytes)?;
+            let projected = self.local.projected(used.total, bytes - self.bytes)?;
             self.global.resize(bytes)?;
-            *used = projected;
+            used.total = projected;
         } else {
             self.global.resize(bytes)?;
-            *crate::database::lock_or_recover(&self.local.used) -= self.bytes - bytes;
+            crate::database::lock_or_recover(&self.local.used).total -= self.bytes - bytes;
         }
         self.bytes = bytes;
         Ok(())
@@ -1259,7 +1272,7 @@ impl MemoryLease {
 }
 impl Drop for MemoryLease {
     fn drop(&mut self) {
-        *crate::database::lock_or_recover(&self.local.used) -= self.bytes;
+        crate::database::lock_or_recover(&self.local.used).total -= self.bytes;
     }
 }
 fn invalid(message: &str) -> TriviumError {

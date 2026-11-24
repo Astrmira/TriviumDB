@@ -20,7 +20,7 @@ use protocol::{
     ApiError, BatchGetRequest, BulkEdgeRecord, BulkNodeRecord, ConditionalMutationRequest,
     DeleteManyRequest, ExecutePreparedRequest, HealthDetailsResponse, HealthResponse, IndexRequest,
     IndexedLookupRequest, PrepareRequest, SubstringLookupRequest, TqlRequest, TransactionOperation,
-    TransactionRequest, TransactionResponse, encode_node, projection_columns,
+    TransactionRequest, TransactionResponse, projection_columns,
 };
 use serde::Deserialize;
 use std::{
@@ -660,6 +660,7 @@ struct VectorSearchQuery {
     recall_k: usize,
     #[serde(default)]
     rerank_k: usize,
+    ann_rerank_limit: Option<usize>,
     #[serde(default = "default_min_score")]
     min_score: f32,
     #[serde(default)]
@@ -704,6 +705,7 @@ async fn execute_prepared(
     request: Result<Json<ExecutePreparedRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let Json(request) = decode_json(request)?;
+    let wants_ndjson = prefers_ndjson(&headers)?;
     let started = std::time::Instant::now();
     let result = state
         .engine
@@ -713,7 +715,7 @@ async fn execute_prepared(
             request_deadline(started, state.request_timeout)?,
         )
         .await?;
-    query_response(result, &headers, request.profile, true, started, None)
+    query_response(result, wants_ndjson, request.profile, true, started, None)
 }
 
 async fn search_vector(
@@ -740,6 +742,9 @@ async fn search_vector(
         || query.top_k > 10_000
         || query.recall_k > MAX_SEARCH_CANDIDATES
         || query.rerank_k > MAX_SEARCH_CANDIDATES
+        || query
+            .ann_rerank_limit
+            .is_some_and(|limit| limit == 0 || limit > MAX_SEARCH_CANDIDATES)
         || !query.min_score.is_finite()
     {
         return Err(ApiError::invalid_request(
@@ -766,8 +771,10 @@ async fn search_vector(
         top_k: query.top_k,
         recall_k: query.recall_k,
         rerank_k: query.rerank_k,
+        ann_rerank_limit: query.ann_rerank_limit,
         min_score: query.min_score,
         force_brute_force: query.force_brute_force,
+        expand_depth: 0,
         ..Default::default()
     };
     let (hits, version) = state
@@ -779,17 +786,29 @@ async fn search_vector(
         )
         .await?;
     let etag = version.global_etag();
-    let mut response = Json(serde_json::json!({
-        "hits": hits.into_iter().map(|hit| serde_json::json!({
-            "id": hit.id.to_string(),
-            "score": hit.score,
-            "payload": protocol::SafeJson(&hit.payload),
-        })).collect::<Vec<_>>(),
-        "generation": etag,
-    }))
-    .into_response();
-    insert_etag(response.headers_mut(), &etag)?;
-    Ok(response)
+    #[derive(serde::Serialize)]
+    struct Hit<'a> {
+        id: String,
+        score: f32,
+        payload: protocol::SafeJson<'a>,
+    }
+    #[derive(serde::Serialize)]
+    struct VectorResponse<'a> {
+        hits: Vec<Hit<'a>>,
+        generation: &'a str,
+    }
+    let body = VectorResponse {
+        hits: hits
+            .iter()
+            .map(|hit| Hit {
+                id: hit.id.to_string(),
+                score: hit.score,
+                payload: protocol::SafeJson(&hit.payload),
+            })
+            .collect(),
+        generation: &etag,
+    };
+    json_bytes_response(encode_bounded_json(&body, MAX_RESPONSE_BYTES)?, &etag)
 }
 
 async fn tql(
@@ -834,10 +853,11 @@ async fn tql(
         Ok(response)
     } else {
         let started = std::time::Instant::now();
+        let wants_ndjson = prefers_ndjson(&headers)?;
         let result = state.engine.query(query.to_owned(), deadline).await?;
         query_response(
             result,
-            &headers,
+            wants_ndjson,
             request.profile,
             false,
             started,
@@ -848,59 +868,83 @@ async fn tql(
 
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
+struct BoundedBody {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    exceeded: bool,
+}
+
+impl std::io::Write for BoundedBody {
+    fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+        if input.len() > self.max_bytes - self.bytes.len() {
+            self.exceeded = true;
+            return Err(std::io::Error::other(
+                "响应体超过上限 (Response exceeds limit)",
+            ));
+        }
+        let required = self.bytes.len() + input.len();
+        if required > self.bytes.capacity() {
+            let capacity = required
+                .max(self.bytes.capacity().saturating_mul(2))
+                .min(self.max_bytes);
+            self.bytes
+                .try_reserve_exact(capacity - self.bytes.len())
+                .map_err(std::io::Error::other)?;
+        }
+        self.bytes.extend_from_slice(input);
+        Ok(input.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl BoundedBody {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            max_bytes,
+            exceeded: false,
+        }
+    }
+    fn error(&self, error: impl std::fmt::Display) -> ApiError {
+        if self.exceeded {
+            ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "RESPONSE_TOO_LARGE",
+                "响应体超过上限 (Response too large)",
+                "请缩小结果集或请求投影 (Reduce the result set or project fewer fields)",
+                false,
+            )
+        } else {
+            ApiError::internal(error.to_string())
+        }
+    }
+    fn append(&mut self, bytes: &[u8]) -> Result<(), ApiError> {
+        std::io::Write::write_all(self, bytes).map_err(|err| self.error(err))
+    }
+    fn json(&mut self, value: &impl serde::Serialize) -> Result<(), ApiError> {
+        serde_json::to_writer(&mut *self, value).map_err(|err| self.error(err))
+    }
+}
+
 fn encode_bounded_json(
     value: &impl serde::Serialize,
     max_bytes: usize,
 ) -> Result<Vec<u8>, ApiError> {
-    struct BoundedBody {
-        bytes: Vec<u8>,
-        max_bytes: usize,
-        exceeded: bool,
-    }
-    impl std::io::Write for BoundedBody {
-        fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
-            if input.len() > self.max_bytes - self.bytes.len() {
-                self.exceeded = true;
-                return Err(std::io::Error::other(
-                    "响应体超过上限 (Response body exceeds limit)",
-                ));
-            }
-            let required = self.bytes.len() + input.len();
-            if required > self.bytes.capacity() {
-                let capacity = required
-                    .max(self.bytes.capacity().saturating_mul(2))
-                    .min(self.max_bytes);
-                self.bytes
-                    .try_reserve_exact(capacity - self.bytes.len())
-                    .map_err(std::io::Error::other)?;
-            }
-            self.bytes.extend_from_slice(input);
-            Ok(input.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    let mut writer = BoundedBody {
-        bytes: Vec::new(),
-        max_bytes,
-        exceeded: false,
-    };
-    if let Err(error) = serde_json::to_writer(&mut writer, value) {
-        if writer.exceeded {
-            return Err(ApiError::new(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "RESPONSE_TOO_LARGE",
-                "响应体超过上限 (Response too large)",
-                "请使用属性投影、LIMIT 或 NDJSON 流式响应 (Use property projection, LIMIT, or NDJSON streaming)",
-                false,
-            ));
-        }
-        return Err(ApiError::internal(error.to_string()));
-    }
+    let mut writer = BoundedBody::new(max_bytes);
+    writer.json(value)?;
     Ok(writer.bytes)
+}
+
+fn json_bytes_response(bytes: Vec<u8>, etag: &str) -> Result<Response, ApiError> {
+    let mut response = Response::new(Body::from(bytes));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    insert_etag(response.headers_mut(), etag)?;
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -947,9 +991,89 @@ fn request_profile(started: Instant, prepared_cache_hit: bool) -> serde_json::Va
     })
 }
 
+// 按具体媒体范围优先确定各表示的权重；权重相同则优先客户端指定的类型。
+fn prefers_ndjson(headers: &HeaderMap) -> Result<bool, ApiError> {
+    if !headers.contains_key(header::ACCEPT) {
+        return Ok(false);
+    }
+    let mut preferences = [None; 2];
+    for value in headers.get_all(header::ACCEPT) {
+        let value = value
+            .to_str()
+            .map_err(|_| ApiError::invalid_request("Accept 编码无效 (Invalid Accept header)"))?;
+        for range in value.split(',') {
+            let Ok(media) = range.trim().parse::<mime::Mime>() else {
+                continue;
+            };
+            let mut weight = 1000;
+            let mut parameters = 0;
+            let mut compatible = true;
+            for (name, value) in media.params() {
+                if name == "q" {
+                    let raw = value.as_str();
+                    let (whole, fraction) = raw.split_once('.').unwrap_or((raw, ""));
+                    if fraction.len() > 3
+                        || !fraction.bytes().all(|b| b.is_ascii_digit())
+                        || !matches!(whole, "0" | "1")
+                        || (whole == "1" && fraction.bytes().any(|b| b != b'0'))
+                    {
+                        compatible = false;
+                        break;
+                    }
+                    weight = if whole == "1" {
+                        1000
+                    } else {
+                        fraction
+                            .bytes()
+                            .zip([100, 10, 1])
+                            .map(|(b, p)| u16::from(b - b'0') * p)
+                            .sum()
+                    };
+                } else if name == mime::CHARSET && value == mime::UTF_8 {
+                    parameters += 1;
+                } else {
+                    compatible = false;
+                    break;
+                }
+            }
+            if !compatible || media.suffix().is_some() {
+                continue;
+            }
+            for (slot, subtype) in preferences.iter_mut().zip(["json", "x-ndjson"]) {
+                let specificity =
+                    if media.type_() == mime::APPLICATION && media.subtype() == subtype {
+                        2
+                    } else if media.type_() == mime::APPLICATION && media.subtype() == mime::STAR {
+                        1
+                    } else if media.type_() == mime::STAR && media.subtype() == mime::STAR {
+                        0
+                    } else {
+                        continue;
+                    };
+                let priority = (specificity, parameters, weight);
+                if slot.is_none_or(|old| priority > old) {
+                    *slot = Some(priority);
+                }
+            }
+        }
+    }
+    let [json, ndjson] =
+        preferences.map(|choice| choice.map_or((0, 0, 0), |(spec, params, q)| (q, spec, params)));
+    if json.0 == 0 && ndjson.0 == 0 {
+        return Err(ApiError::new(
+            StatusCode::NOT_ACCEPTABLE,
+            "TDB_HTTP_NOT_ACCEPTABLE",
+            "无法协商响应格式 (No acceptable representation)",
+            "支持 JSON 和 NDJSON (Supported representations are JSON and NDJSON)",
+            false,
+        ));
+    }
+    Ok(ndjson > json)
+}
+
 fn query_response(
     result: engine::QueryResult,
-    headers: &HeaderMap,
+    wants_ndjson: bool,
     profile: bool,
     prepared_cache_hit: bool,
     started: std::time::Instant,
@@ -962,14 +1086,6 @@ fn query_response(
     let row_count = rows.len();
     let columns = projection_columns(&rows, result.columns);
     let etag = result.version.global_etag();
-    let wants_ndjson = headers
-        .get(header::ACCEPT)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(',')
-                .any(|item| item.trim() == "application/x-ndjson")
-        });
     if wants_ndjson {
         let stream_etag = etag.clone();
         let stream = async_stream::stream! {
@@ -1005,6 +1121,9 @@ fn query_response(
             HeaderValue::from_static("application/x-ndjson; charset=utf-8"),
         );
         insert_etag(response.headers_mut(), &etag)?;
+        response
+            .headers_mut()
+            .append(header::VARY, HeaderValue::from_static("accept"));
         return Ok(response);
     }
 
@@ -1031,12 +1150,10 @@ fn query_response(
         },
         MAX_RESPONSE_BYTES,
     )?;
-    let mut response = Response::new(Body::from(encoded_bytes));
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    insert_etag(response.headers_mut(), &etag)?;
+    let mut response = json_bytes_response(encoded_bytes, &etag)?;
+    response
+        .headers_mut()
+        .append(header::VARY, HeaderValue::from_static("accept"));
     Ok(response)
 }
 
@@ -1108,13 +1225,16 @@ async fn get_node(
         })
         .collect::<Vec<_>>();
     let mut response = Json(serde_json::json!({
-        "node": encode_node(result.node),
+        "node": protocol::WireNode(&result.node),
         "generation": result.version.global_etag(),
         "version": node_etag,
         "edgeVersions": edge_versions,
     }))
     .into_response();
-    insert_etag(response.headers_mut(), &node_etag)?;
+    insert_etag(
+        response.headers_mut(),
+        &result.version.node_representation_etag(&node_etag),
+    )?;
     Ok(response)
 }
 
@@ -1252,28 +1372,14 @@ async fn batch_get_nodes(
             "ids 数量必须为 1..=10000 (ids count must be 1..=10000)",
         ));
     }
-    let requested = request.ids.clone();
-    let (nodes, version) = state
+    let (bytes, version) = state
         .engine
         .batch_get_nodes(
             request.ids,
             request_deadline(Instant::now(), state.request_timeout)?,
         )
         .await?;
-    let found = nodes
-        .iter()
-        .map(|node| node.id)
-        .collect::<std::collections::HashSet<_>>();
-    let missing_ids = requested
-        .into_iter()
-        .filter(|id| !found.contains(id))
-        .map(|id| id.to_string())
-        .collect::<Vec<_>>();
-    Ok(Json(serde_json::json!({
-        "nodes": nodes.into_iter().map(encode_node).collect::<Vec<_>>(),
-        "missingIds": missing_ids,
-        "generation": version.global_etag(),
-    })))
+    json_bytes_response(bytes, &version.global_etag())
 }
 
 async fn get_paths(
@@ -1286,25 +1392,19 @@ async fn get_paths(
             "maxHops 必须为 1..=64 (maxHops must be 1..=64)",
         ));
     }
-    let config = triviumdb::graph::reachability::ReachabilityConfig {
-        min_depth: 1,
-        max_depth: query.max_hops,
-        labels: query.label.map(|label| vec![label]),
-        direction: triviumdb::graph::reachability::ReachabilityDirection::Outgoing,
-        ..Default::default()
-    };
     let (result, version) = state
         .engine
-        .reachable(
+        .shortest_path(
             from,
-            config,
+            to,
+            query.max_hops,
+            query.label,
             request_deadline(Instant::now(), state.request_timeout)?,
         )
         .await?;
     let paths = result
         .results
         .into_iter()
-        .filter(|result| result.target_id == to)
         .map(|result| {
             serde_json::json!({
                 "nodes": result.path.into_iter().map(|id| id.to_string()).collect::<Vec<_>>(),
@@ -1742,7 +1842,12 @@ async fn map_body_limit_error(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let response = next.run(request).await;
-    if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
+    if response.status() == StatusCode::PAYLOAD_TOO_LARGE
+        && response
+            .extensions()
+            .get::<protocol::StructuredErrorResponse>()
+            .is_none()
+    {
         ApiError::payload_too_large().into_response()
     } else {
         response

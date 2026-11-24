@@ -155,95 +155,48 @@ fn EMI_02_向量数据区10_percent翻转_搜索降级不崩溃() {
 }
 
 // ════════════════════════════════════════════════════════════════
-//  3. WAL CRC 检测率验证
+//  3. WAL 完整帧的单比特翻转
 // ════════════════════════════════════════════════════════════════
 
-/// 对 WAL 文件的每一个字节逐一翻转 1 bit，统计引擎检测率。
-/// 军工要求：CRC 检测率应 > 99%（理论值 > 99.99%）。
 #[test]
-fn EMI_03_WAL单比特翻转_CRC检测率() {
-    let path = tmp_db("wal_crc");
-    cleanup(&path);
-
-    // 写入数据到 WAL（不 flush）
-    {
-        let mut db = Database::<f32>::open(&path, DIM).unwrap();
-        for i in 0..10u32 {
-            db.insert(&[i as f32, 0.0, 0.0, 0.0], serde_json::json!({"idx": i}))
-                .unwrap();
-        }
-        // flush 确保 .tdb 存在，WAL 里还有数据
-        db.flush().unwrap();
-        for i in 10..20u32 {
-            db.insert(&[i as f32, 0.0, 0.0, 0.0], serde_json::json!({"idx": i}))
-                .unwrap();
+fn EMI_03_WAL完整帧单比特翻转逐项拒绝() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("crc.tdb");
+    let path = file.to_str().unwrap();
+    let mut db = Database::<f32>::open(path, DIM).unwrap();
+    for i in 0..20 {
+        db.insert(&[i as f32, 0., 0., 0.], serde_json::json!({"idx":i}))
+            .unwrap();
+        if i == 9 {
+            db.flush().unwrap();
         }
     }
-
-    let wal_path = format!("{}.wal", path);
-    let original_wal = std::fs::read(&wal_path).expect("WAL 文件不存在，无法执行 CRC 检测率测试");
-    assert!(
-        original_wal.len() > 8,
-        "WAL 文件过小，无法执行 CRC 检测率测试"
-    );
-
-    let total_bits = (original_wal.len() * 8).min(2000); // 最多测 2000 bit
-    let mut detected = 0usize;
-    let mut total_tested = 0usize;
-
-    for bit_idx in 0..total_bits {
-        let byte_idx = bit_idx / 8;
-        let bit_pos = bit_idx % 8;
-
-        // 制作损坏副本
-        let mut corrupted = original_wal.clone();
-        corrupted[byte_idx] ^= 1u8 << bit_pos;
-
-        // 写入损坏的 WAL
-        std::fs::write(&wal_path, &corrupted).unwrap();
-
-        // 尝试打开
-        let result = std::panic::catch_unwind(|| Database::<f32>::open(&path, DIM));
-        total_tested += 1;
-
-        match result {
-            Ok(Ok(db)) => {
-                // 加载成功，检查节点数是否异常
-                if db.node_count().unwrap() != 20 {
-                    // CRC 检测到损坏，只恢复了部分数据
-                    detected += 1;
-                }
-                // 如果 node_count == 20，说明翻转的 bit 恰好不影响 CRC
-                // （极少数情况，如翻转了 padding 或未使用的字节）
-            }
-            Ok(Err(_)) => {
-                // 引擎拒绝加载 = 检测到损坏
-                detected += 1;
-            }
-            Err(_) => {
-                // panic = 未检测到但崩溃（这是 bug，但此处计为"某种程度的检测"）
-                detected += 1;
+    drop(db);
+    let wal = format!("{path}.wal");
+    let original = std::fs::read(&wal).unwrap();
+    let frames = crate::wal_frames::frames(&original);
+    assert_eq!(frames.len(), 11, "一个检查点封条与十条已确认写入");
+    let mut corrupt = original.clone();
+    // 长度和物理截断由格式规格覆盖。完整帧的正文和 CRC 逐位核对。
+    for frame in frames {
+        for offset in frame.start + 4..frame.end {
+            for bit in 0..8 {
+                corrupt[offset] ^= 1 << bit;
+                std::fs::write(&wal, &corrupt).unwrap();
+                crate::wal_frames::assert_corrupt(path, DIM, &corrupt, offset);
+                corrupt[offset] = original[offset];
             }
         }
     }
-
-    // 恢复原始 WAL
-    std::fs::write(&wal_path, &original_wal).unwrap();
-
-    let detection_rate = detected as f64 / total_tested as f64 * 100.0;
-    eprintln!(
-        "  📊 WAL CRC 检测率: {}/{} = {:.2}%",
-        detected, total_tested, detection_rate
-    );
-
-    // 军工要求 > 99%
-    assert!(
-        detection_rate > 90.0, // 宽松阈值，考虑 padding 字节
-        "WAL CRC 检测率 {:.2}% 低于 90% 阈值",
-        detection_rate
-    );
-
-    cleanup(&path);
+    std::fs::write(&wal, original).unwrap();
+    let expected: Vec<_> = (0..20)
+        .map(|i| {
+            serde_json::json!({
+                "id":i+1, "vector":[i as f32,0.0,0.0,0.0], "payload":{"idx":i}, "edges":[]
+            })
+        })
+        .collect();
+    crate::wal_frames::assert_recovered(path, DIM, &serde_json::json!(expected));
 }
 
 // ════════════════════════════════════════════════════════════════

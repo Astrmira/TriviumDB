@@ -4,6 +4,48 @@ use triviumdb::index::pelorus::{PelorusConfig, PelorusSearchOptions, PoincareNav
 use triviumdb::{Database, DatabaseReader, Filter};
 
 #[test]
+fn 维度迁移在回填与重开时保持源曲率() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.tdb");
+    let target = dir.path().join("target.tdb");
+    let mut db = Database::<f32>::open(source.to_str().unwrap(), 2).unwrap();
+    db.insert_with_id(7, &[0.25, 0.], json!({"key":7})).unwrap();
+    db.build_pelorus_index(PelorusConfig {
+        curvature: 4.,
+        ..Default::default()
+    })
+    .unwrap();
+    let (mut target_db, ids) = db.migrate_to(target.to_str().unwrap(), 3).unwrap();
+    assert_eq!(ids, [7]);
+    // 半径为 0.5，0.75 可区分源曲率与默认曲率。
+    assert_eq!(
+        target_db
+            .update_vector(7, &[0.75, 0., 0.])
+            .unwrap_err()
+            .code(),
+        "TDB_INVALID_VECTOR"
+    );
+    target_db.update_vector(7, &[0.25, 0., 0.]).unwrap();
+    target_db.close().unwrap();
+    let reopened = Database::<f32>::open(target.to_str().unwrap(), 3).unwrap();
+    assert_eq!(
+        reopened
+            .update_vector(7, &[0.75, 0., 0.])
+            .unwrap_err()
+            .code(),
+        "TDB_INVALID_VECTOR"
+    );
+    let hits = reopened
+        .search_pelorus(&[0.25, 0., 0.], &Default::default())
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(
+        (hits[0].id, hits[0].distance, &hits[0].payload),
+        (7, 0., &json!({"key":7}))
+    );
+}
+
+#[test]
 fn Pelorus批量编码按JSON转义后的大小准入() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("encode.tdb");

@@ -300,17 +300,21 @@ fn 批量搜索_空批次与单查询边界() {
             .unwrap()
             .is_empty()
     );
-    assert!(matches!(
-        db.search_batch(
+    let error = db
+        .search_batch(
             &[],
             &SearchConfig {
                 top_k: 0,
                 ..Default::default()
             },
-            &BatchSearchConfig::default()
-        ),
-        Err(TriviumError::InvalidInput(_))
-    ));
+            &BatchSearchConfig::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), "TDB_INVALID_INPUT");
+    assert_eq!(
+        serde_json::to_value(error.info().target).unwrap(),
+        serde_json::json!({"field": "top_k"})
+    );
     let hits = db
         .search_batch(
             &[vec![1.0, 0.0, 0.0, 0.0]],

@@ -45,6 +45,8 @@ mod transaction_state;
 mod typed_facade;
 mod vector_types;
 mod workflow;
+#[cfg(feature = "test-hooks")]
+mod workspace;
 mod write_boundaries;
 mod write_outcomes;
 
@@ -55,3 +57,9 @@ mod document_ingestion;
 
 #[path = "../support/cleanup.rs"]
 mod cleanup_files;
+
+#[path = "../support/files.rs"]
+mod physical_files;
+
+#[path = "../support/facts.rs"]
+mod node_facts;

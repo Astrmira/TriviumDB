@@ -14,3 +14,14 @@ mod wal_spec;
 
 #[path = "../support/cleanup.rs"]
 mod cleanup_files;
+
+#[path = "../support/files.rs"]
+mod physical_files;
+#[path = "../support/mod.rs"]
+mod support;
+
+#[path = "../support/read_only.rs"]
+mod read_only;
+
+#[path = "../support/facts.rs"]
+mod node_facts;

@@ -1,6 +1,6 @@
 # TriviumDB Server（HTTP 服务端版）
 
-> 本文说明 `0.9.4-beta.1` 源码中的 nightly Server，覆盖 HTTP 协议、并发调度、部署与关闭。服务端使用 Rust、Axum 和 Tokio，许可为 Apache-2.0。版本记录见[变更说明](changes/0.9.4-beta.1.md)。
+> 本文说明 `0.9.4-beta.2` 源码中的 nightly Server，覆盖 HTTP 协议、并发调度、部署与关闭。服务端使用 Rust、Axum 和 Tokio，许可为 Apache-2.0。版本记录见[变更说明](changes/0.9.4-beta.2.md)。
 
 ---
 
@@ -171,7 +171,7 @@ RUST_LOG=triviumdb_server=info,triviumdb=warn ./triviumdb-server
 | POST | `/v1/nodes/batch-get` | 按 ID 批量读取节点并报告缺失 ID |
 | GET | `/v1/nodes/{id}/neighbors` | 有界多跳邻域子图，返回真实节点、边和截断状态 |
 | GET | `/v1/nodes/{id}/edges` | 按方向、标签和分页列举真实边 |
-| GET | `/v1/nodes/{from}/paths/to/{to}` | 有界最短路径及逐跳边标签 |
+| GET | `/v1/nodes/{from}/paths/to/{to}` | 目标导向的最短路径，含逐跳边标签、权重与元数据。已存在节点到自身返回单节点路径和空边数组 |
 | GET | `/v1/indexes` | 查询四类属性索引及统计 |
 | POST | `/v1/indexes` | 创建属性索引 |
 | DELETE | `/v1/indexes/delete` | 删除属性索引 |
@@ -179,6 +179,8 @@ RUST_LOG=triviumdb_server=info,triviumdb=warn ./triviumdb-server
 | POST | `/v1/indexes/quiver` | 按 Core 资格和预算启动 QuIVer 构建 |
 | POST | `/v1/import/nodes` | 有界、整请求原子的节点 NDJSON 导入 |
 | POST | `/v1/import/edges` | 有界、整请求原子的边 NDJSON 导入 |
+
+邻域接口的 `limit` 限制遍历发现的邻居数量，根节点单独保留。`types` 在遍历后筛选节点及两端均保留的边。`truncated` 描述遍历是否触及预算，因此筛选后的邻居数可以小于 `limit`。
 
 ### TQL
 
@@ -198,9 +200,9 @@ curl -X POST http://127.0.0.1:8080/v1/tql \
 
 Server 不为认知算子维护另一套 HTTP API；`TEXT`、`RESIDUAL`、`DIVERSIFY`、`TOPICS` 和 `SA_PPR_CONFIG` 均通过 `/v1/tql` 使用 Core 的相同 Parser、Cascades、预算和确定性语义。Refractory Fatigue 未开放为普通 TQL 算子，因为它会修改进程内检索状态。
 
-普通 JSON 查询响应在编码过程中实施 16 MiB 硬上限。超限返回 `413 TDB_HTTP_RESPONSE_TOO_LARGE`，旧类别保存在 legacyCode。可使用属性投影、`LIMIT` 或 NDJSON 响应控制返回量。
+TQL 普通 JSON、`/v1/search/vector` 和 `/v1/nodes/batch-get` 在编码过程中执行 16 MiB 响应上限。超限返回 `413 TDB_HTTP_RESPONSE_TOO_LARGE`。TQL 可缩小投影、设置 `LIMIT` 或使用 NDJSON，向量检索可降低 `top_k`，批量读取可拆分 ID 列表。
 
-请求头设置 `Accept: application/x-ndjson` 时，响应按 `meta → row... → summary` 输出；`meta.columns` 明确声明每个投影列的 `node`、`edge`、`path` 或标量类型。同一列含多种非空类型时标记为 `mixed`，只有空值或零行时标记为 `null`。普通 JSON 响应也在顶层 `columns` 返回相同元数据。HTTP 输出逐行生成，但排序、聚合和 Top-K 等 Core 算子仍可能先物化结果。
+查询默认返回 JSON。请求支持通过 `Accept` 指定媒体类型和权重，例如 `application/x-ndjson;q=1.0, application/json;q=0.5`。两种格式均不可接受时返回 HTTP 406。选择 NDJSON 时，响应按 `meta → row... → summary` 输出；`meta.columns` 明确声明每个投影列的 `node`、`edge`、`path` 或标量类型。同一列含多种非空类型时标记为 `mixed`，只有空值或零行时标记为 `null`。普通 JSON 响应也在顶层 `columns` 返回相同元数据。HTTP 输出逐行生成，但排序、聚合和 Top-K 等 Core 算子仍可能先物化结果。
 
 普通及 Prepared TQL 的空结果保留静态投影列名。没有结果值可推断类型时，`kind` 为 `null`。查询诊断的字节位置按客户端提交的原始 UTF-8 计算。
 
@@ -222,14 +224,14 @@ curl -X DELETE http://127.0.0.1:8080/v1/indexes/delete \
   -d '{"kind":"hash","fields":["type"]}'
 ```
 
-可用 kind 为 `hash`、`ordered`、`bitmap` 和 `composite`。单字段索引必须恰好提供一个字段；复合索引至少两个字段。修改操作统一进入 Writer Actor，并推进 Server generation。
+`hash`、`ordered`、`bitmap`、`ngram` 和 `unique` 接受一个字段。`composite` 和 `unique_composite` 至少需要两个字段。修改操作统一进入 Writer Actor，并推进 Server generation。
 
 ### 二进制向量搜索
 
 请求体必须为连续 little-endian f32，媒体类型为 `application/vnd.triviumdb.vector+f32`：
 
 ```text
-POST /v1/search/vector?top_k=10&recall_k=80&rerank_k=40&min_score=0.1
+POST /v1/search/vector?top_k=10&recall_k=80&rerank_k=40&ann_rerank_limit=64&min_score=0.1
 Content-Type: application/vnd.triviumdb.vector+f32
 ```
 
@@ -241,7 +243,7 @@ Content-Type: application/vnd.triviumdb.vector+f32
 | `recall_k` | `0`（Core 自动） | 不超过 `100000` |
 | `rerank_k` | `0`（Core 自动） | 不超过 `100000` |
 | `min_score` | `-1.0` | 必须为有限值 |
-| `force_brute_force` | `false` | true 时请求精确暴力搜索 |
+| `force_brute_force` | `false` | `true` 时精确扫描存储向量。此端点按向量相似度应用 `min_score`，扩散查询使用 TQL。 |
 
 查询向量中的 NaN/Infinity 会被拒绝。
 
@@ -274,7 +276,7 @@ Content-Type: application/vnd.triviumdb.vector+f32
 ## OCC、幂等与错误模型
 
 - 全局 ETag 为 `"<epoch>-g<n>"`，成功写入后递增；
-- `GET /v1/nodes/{id}` 返回节点和边 ETag；
+- `GET /v1/nodes/{id}` 的 HTTP ETag 覆盖整个响应，包括全库 generation。响应的 `version` 字段是节点版本，可交给 `expectedNodes` 校验；其他节点的独立写入只推进全库代际。
 - `If-Match`、`expectedGeneration`、`expectedNodes` 和 `expectedEdges` 提供 OCC；
 - 删除节点或边后移除对应版本条目，并更新仍存在的关联节点版本。对已删除实体使用旧 ETag 会返回冲突。TQL 写入统一推进细粒度版本代际并释放旧版本表。
 - Core 版本不匹配返回 `409 TDB_WRITE_CONFLICT`，HTTP 前置头条件拒绝使用 `TDB_HTTP_PRECONDITION_FAILED` 并保留 `legacyCode=WRITE_CONFLICT`。
@@ -317,7 +319,7 @@ Writer Actor 由 supervisor 监管。异常退出会设置失败状态、关闭�
 - TQL mutation 当前保守失效此前签发的全部细粒度节点/边 ETag；
 - 幂等缓存与 Server generation 不持久化；
 - 启动预热和手工构建共享一个 QuIVer 任务。已有任务运行时，重复构建请求返回 `published: false`。等待请求超时后，可通过 `GET /v1/indexes/quiver` 查看任务的实际结果。数据量不足、索引已就绪或配置禁用时也返回 `published: false`；
-- JSON 响应受 16 MiB 上限约束；NDJSON 只流式编码 HTTP 输出，Core 算子仍受自己的内存与查询预算约束；
+- TQL 的 NDJSON 响应流式编码 HTTP 输出，Core 算子仍按各自的内存与查询预算执行。
 - 安装方式和跨平台二进制以 GitHub Release 的 nightly 说明为准。
 
 ---

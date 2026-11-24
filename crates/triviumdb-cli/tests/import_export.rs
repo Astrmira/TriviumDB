@@ -151,7 +151,17 @@ fn 跨库导入归档指针整批拒绝并保留原文档检索() {
         .unwrap();
         db.close().unwrap();
     }
-    tdb().args(["export", &source, &dump]).assert().success();
+    // 独立构造旧 JSONL，既验证导入拒绝，也验证导出失败保留已有目标。
+    let old_dump = b"{\"id\":1,\"vector\":[1],\"payload\":{}}\n{\"id\":3,\"vector\":[1],\"payload\":{\"_tdb_document\":{}}}\n";
+    std::fs::write(&dump, old_dump).unwrap();
+    let export = tdb()
+        .args(["--format=json", "export", &source, &dump])
+        .output()
+        .unwrap();
+    assert_eq!(export.status.code(), Some(1));
+    let error: Value = serde_json::from_slice(&export.stderr).unwrap();
+    assert_eq!(error["code"], "TDB_INVALID_INPUT");
+    assert_eq!(std::fs::read(&dump).unwrap(), old_dump);
     let before = files(Path::new(&target));
     let output = tdb()
         .args(["--format=json", "import", &target, &dump])

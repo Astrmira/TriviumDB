@@ -1,21 +1,30 @@
 //! TQL 快照与返回阶段共用的查询峰值准入，凭证随最外层执行作用域释放。
 use super::{Node, NodeId, TriviumError, VectorType};
-use crate::resources::{ResourceRuntime, WorkspaceReservation};
+use crate::resources::RequestWorkspace;
 use crate::storage::memtable::MemTable;
 use std::cell::{Cell, RefCell};
 
-pub(super) struct QueryMemory {
-    runtime: ResourceRuntime,
+trait QueryAllocator {
+    fn reserve(&self, bytes: usize) -> crate::Result<RequestWorkspace>;
+}
+impl<T: VectorType> QueryAllocator for MemTable<T> {
+    fn reserve(&self, bytes: usize) -> crate::Result<RequestWorkspace> {
+        self.reserve_instance_workspace(bytes)
+    }
+}
+
+pub(super) struct QueryMemory<'db> {
+    allocator: &'db dyn QueryAllocator,
     limit: usize,
     bytes: Cell<usize>,
     external_bytes: Cell<usize>,
-    leases: RefCell<Vec<WorkspaceReservation>>,
+    leases: RefCell<Vec<RequestWorkspace>>,
 }
 
 pub(super) struct Temporary<'a> {
-    owner: &'a QueryMemory,
+    owner: &'a QueryMemory<'a>,
     bytes: usize,
-    lease: Option<WorkspaceReservation>,
+    lease: Option<RequestWorkspace>,
 }
 
 impl Temporary<'_> {
@@ -52,12 +61,7 @@ pub(super) fn node_bytes<T: VectorType>(id: NodeId, mt: &MemTable<T>) -> crate::
     for edge in mt.get_edges(id).unwrap_or(&[]) {
         bytes = bytes
             .checked_add(std::mem::size_of_val(edge) * 2)
-            .and_then(|bytes| bytes.checked_add(edge.label.len()))
-            .and_then(|bytes| {
-                bytes.checked_add(crate::storage::payload_store::query_clone_peak(
-                    &edge.metadata,
-                ))
-            })
+            .and_then(|bytes| bytes.checked_add(edge.clone_heap_bytes()))
             .ok_or_else(overflow)?;
     }
     Ok(bytes)
@@ -76,21 +80,16 @@ pub(super) fn snapshot_bytes<T: VectorType>(node: &Node<T>) -> crate::Result<usi
     for edge in &node.edges {
         bytes = bytes
             .checked_add(std::mem::size_of_val(edge) * 2)
-            .and_then(|v| v.checked_add(edge.label.len()))
-            .and_then(|v| {
-                v.checked_add(crate::storage::payload_store::query_clone_peak(
-                    &edge.metadata,
-                ))
-            })
+            .and_then(|v| v.checked_add(edge.clone_heap_bytes()))
             .ok_or_else(overflow)?;
     }
     Ok(bytes)
 }
 
-impl QueryMemory {
-    pub(super) fn new<T: VectorType>(limit: usize, mt: &MemTable<T>) -> Self {
+impl<'db> QueryMemory<'db> {
+    pub(super) fn new<T: VectorType>(limit: usize, mt: &'db MemTable<T>) -> Self {
         Self {
-            runtime: mt.resource_runtime().clone(),
+            allocator: mt,
             limit,
             bytes: Cell::new(0),
             external_bytes: Cell::new(0),
@@ -115,6 +114,7 @@ impl QueryMemory {
             .checked_add(self.external_bytes.get())
             .ok_or_else(overflow)?;
         let projected = used.checked_add(bytes).ok_or_else(overflow)?;
+        let lease = self.allocator.reserve(bytes)?;
         if self.limit > 0 && projected > self.limit {
             return Err(TriviumError::ResourceBudgetExceeded {
                 resource: "query_memory_bytes",
@@ -123,7 +123,6 @@ impl QueryMemory {
                 limit: self.limit,
             });
         }
-        let lease = self.runtime.reserve_workspace(bytes)?;
         self.bytes
             .set(owned.checked_add(bytes).ok_or_else(overflow)?);
         Ok(Temporary {

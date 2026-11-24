@@ -146,7 +146,7 @@ def conversion_failure(root, dtype):
     try:
         tx = db.transaction()
         tx.insert_with_id(2, [1, 0], {"state": "prepared"})
-        from query_arguments import check_input_error
+        from input_errors import check_input_error
         for action, field in [
             (lambda: tx.insert([1, "x"], {}), "/vector/1"),
             (lambda: tx.insert_with_id("3", [1, 0], {}), "id"),

@@ -179,15 +179,7 @@ fn assert_case<T: VectorType + Serialize + DeserializeOwned>(
     result
 }
 
-fn files(path: &std::path::Path) -> std::collections::BTreeMap<std::ffi::OsString, Vec<u8>> {
-    std::fs::read_dir(path)
-        .unwrap()
-        .map(|entry| {
-            let entry = entry.unwrap();
-            (entry.file_name(), std::fs::read(entry.path()).unwrap())
-        })
-        .collect()
-}
+use crate::physical_files::files;
 
 fn roundtrip<T: VectorType + Serialize + DeserializeOwned>() {
     for mode in [StorageMode::Rom, StorageMode::Mmap] {

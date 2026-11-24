@@ -349,6 +349,20 @@ fn 当前双曲来源迁移后保留曲率和原始向量() {
 }
 
 #[test]
+fn empty_legacy_stage_can_be_retried_in_place() {
+    let root = tempfile::tempdir().unwrap();
+    let source = fixture("f32", "rom", "checkpoint", &root.path().join("source"));
+    let opts = options(source, root.path().join("target"));
+    std::fs::create_dir(root.path().join(".target.migration-stage")).unwrap();
+    let report = triviumdb_migrate::run(&opts).unwrap();
+    let db = Database::<f32>::open_read_only(report.database.to_str().unwrap(), 2).unwrap();
+    assert_eq!(db.all_node_ids().unwrap(), [7, 9]);
+    assert_eq!(db.get_payload(7).unwrap().unwrap()["code"], "alpha");
+    drop(db);
+    assert!(triviumdb_migrate::run(&opts).unwrap().reused);
+}
+
+#[test]
 fn corruption_and_unowned_staging_are_preserved() {
     let root = tempfile::tempdir().unwrap();
     let source = fixture("f32", "rom", "checkpoint", &root.path().join("source"));

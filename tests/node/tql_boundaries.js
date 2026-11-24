@@ -38,7 +38,23 @@ module.exports = function tqlBoundaries(root, TriviumDB) {
     for (const query of ['MATCH (n) RETURN 1 AS x, 2 AS x', 'MATCH (n) RETURN 1, 1', 'MATCH (n) RETURN $unbound', 'MATCH (n)-[n]->(b) RETURN n']) assert.throws(() => db.tql(query), Error)
     const prepared = db.prepareTql('MATCH (n {id:1}) RETURN $a, $b')
     assert.deepEqual(db.executePreparedTql(prepared, { a: 1, b: 1 }), [{ '$a': 1, '$b': 1 }])
+    for (const literal of ['9007199254740993', '18446744073709551615', '-9223372036854775808']) {
+      const equal = db.prepareTql(`MATCH (n {id:1}) WHERE $x == ${literal} RETURN n.id AS id`)
+      assert.deepEqual(db.executePreparedTql(equal, { x: BigInt(literal) }), [{ id: 1 }])
+    }
   } finally { db.close() }
+
+  const groups = open('group-ties')
+  try {
+    for (const [id, g, age] of [[1, 10, 42], [2, 2, '42'], [3, 11, '43']]) {
+      groups.insertWithId(id, [1], { g, age })
+    }
+    for (const indexed of [false, true]) {
+      if (indexed) groups.createIndex('age')
+      assert.deepEqual(groups.tql('MATCH (n) RETURN n.g AS g, COUNT(*) AS c ORDER BY c LIMIT 1'), [{ g: 2, c: 1 }])
+      assert.deepEqual(groups.tql("MATCH (n) WHERE n.age != '42' RETURN n.id AS id"), [{ id: 3 }])
+    }
+  } finally { groups.close() }
 
   const ids = open('id-index')
   try {

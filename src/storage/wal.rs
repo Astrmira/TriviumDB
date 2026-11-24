@@ -175,7 +175,7 @@ pub struct Wal {
     cumulative_written_bytes: u64,
     cumulative_logical_bytes: u64,
     group_commit_active: bool,
-    group_commit_pending: bool,
+    group_commit_pending: Option<SyncMode>,
     cumulative_sync_count: u64,
     checkpoint_token: Option<[u8; 16]>,
 }
@@ -211,7 +211,7 @@ impl Wal {
     pub(crate) fn release_writer(&mut self) {
         self.writer.take();
         self.group_commit_active = false;
-        self.group_commit_pending = false;
+        self.group_commit_pending = None;
     }
 
     pub fn disabled(db_path: &str, sync_mode: SyncMode) -> Self {
@@ -222,7 +222,7 @@ impl Wal {
             cumulative_written_bytes: 0,
             cumulative_logical_bytes: 0,
             group_commit_active: false,
-            group_commit_pending: false,
+            group_commit_pending: None,
             cumulative_sync_count: 0,
             checkpoint_token: None,
         }
@@ -291,7 +291,7 @@ impl Wal {
             cumulative_written_bytes: base_written,
             cumulative_logical_bytes: 0,
             group_commit_active: false,
-            group_commit_pending: false,
+            group_commit_pending: None,
             cumulative_sync_count: 0,
             checkpoint_token: token.or(clean_token),
         })
@@ -349,11 +349,7 @@ impl Wal {
         if !matches!(entry, WalEntry::Checkpoint { .. }) {
             self.cumulative_logical_bytes = self.cumulative_logical_bytes.saturating_add(len);
         }
-        if self.group_commit_active {
-            self.group_commit_pending = true;
-        } else {
-            self.sync_writer()?;
-        }
+        self.sync_after_append()?;
         Ok(())
     }
 
@@ -418,11 +414,7 @@ impl Wal {
         self.cumulative_logical_bytes = self.cumulative_logical_bytes.saturating_add(logical_bytes);
 
         // Group Commit 中只追加完整事务帧，组尾统一执行同步。
-        if self.group_commit_active {
-            self.group_commit_pending = true;
-        } else {
-            self.sync_writer()?;
-        }
+        self.sync_after_append()?;
         Ok(())
     }
 
@@ -437,7 +429,7 @@ impl Wal {
             ));
         }
         self.group_commit_active = true;
-        self.group_commit_pending = false;
+        self.group_commit_pending = None;
         Ok(())
     }
 
@@ -449,11 +441,10 @@ impl Wal {
             ));
         }
         self.group_commit_active = false;
-        let pending = std::mem::take(&mut self.group_commit_pending);
-        if !pending {
-            return Ok(false);
+        match self.group_commit_pending.take() {
+            Some(mode) => self.sync_writer(mode),
+            None => Ok(false),
         }
-        self.sync_writer()
     }
 
     pub fn stats(&self) -> WalStats {
@@ -464,19 +455,33 @@ impl Wal {
         }
     }
 
-    fn sync_writer(&mut self) -> Result<bool> {
-        let result = self.sync_writer_inner();
+    fn sync_after_append(&mut self) -> Result<()> {
+        if self.group_commit_active {
+            // 已写入帧的持久性要求持续到组结束，运行期调低模式仅影响后续写入。
+            self.group_commit_pending = Some(match (self.group_commit_pending, self.sync_mode) {
+                (Some(SyncMode::Full), _) | (_, SyncMode::Full) => SyncMode::Full,
+                (Some(SyncMode::Normal), _) | (_, SyncMode::Normal) => SyncMode::Normal,
+                _ => SyncMode::Off,
+            });
+        } else {
+            self.sync_writer(self.sync_mode)?;
+        }
+        Ok(())
+    }
+
+    fn sync_writer(&mut self, mode: SyncMode) -> Result<bool> {
+        let result = self.sync_writer_inner(mode);
         if result.is_err() {
             self.release_writer();
         }
         result
     }
 
-    fn sync_writer_inner(&mut self) -> Result<bool> {
+    fn sync_writer_inner(&mut self, mode: SyncMode) -> Result<bool> {
         let Some(writer) = self.writer.as_mut() else {
             return Err(TriviumError::WalClosed);
         };
-        match self.sync_mode {
+        match mode {
             SyncMode::Full => {
                 #[cfg(feature = "test-hooks")]
                 crate::test_hooks::io_result(crate::test_hooks::IoPoint::WalFlush)?;
@@ -517,9 +522,11 @@ impl Wal {
     /// 逐条交付已提交操作；只暂存当前事务，回调失败时立即停止。
     pub(crate) fn replay_entries<T: serde::de::DeserializeOwned>(
         db_path: &str,
-        visit: impl FnMut(WalEntry<T>) -> Result<()>,
+        mut visit: impl FnMut(WalEntry<T>) -> Result<()>,
     ) -> Result<u64> {
-        Self::replay_entries_limited(db_path, 0, &std::cell::Cell::new(0), visit)
+        Self::replay_entries_limited(db_path, 0, &std::cell::Cell::new(0), |entry, _| {
+            visit(entry)
+        })
     }
 
     /// 当前 WAL 在预算内恢复，成功准入后才截断无效尾部。
@@ -527,7 +534,7 @@ impl Wal {
         db_path: &str,
         limit: usize,
         current: &std::cell::Cell<usize>,
-        visit: impl FnMut(WalEntry<T>) -> Result<()>,
+        visit: impl FnMut(WalEntry<T>, usize) -> Result<()>,
     ) -> Result<u64> {
         Self::replay_entries_limited(db_path, limit, current, visit)
     }
@@ -536,7 +543,7 @@ impl Wal {
         db_path: &str,
         limit: usize,
         current: &std::cell::Cell<usize>,
-        visit: impl FnMut(WalEntry<T>) -> Result<()>,
+        visit: impl FnMut(WalEntry<T>, usize) -> Result<()>,
     ) -> Result<u64> {
         let wal_path = format!("{}.wal", db_path);
         let mut file = match File::open(&wal_path) {
@@ -604,11 +611,11 @@ impl Wal {
 
     fn replay_entries_from_reader<T: serde::de::DeserializeOwned>(
         reader: impl Read,
-        visit: impl FnMut(WalEntry<T>) -> Result<()>,
+        mut visit: impl FnMut(WalEntry<T>) -> Result<()>,
     ) -> Result<u64> {
         Self::replay_entries_from_reader_limited(
             reader,
-            visit,
+            |entry, _| visit(entry),
             0,
             &std::cell::Cell::new(0),
             WAL_VERSION,
@@ -617,7 +624,7 @@ impl Wal {
 
     fn replay_entries_from_reader_limited<T: serde::de::DeserializeOwned>(
         mut reader: impl Read,
-        mut visit: impl FnMut(WalEntry<T>) -> Result<()>,
+        mut visit: impl FnMut(WalEntry<T>, usize) -> Result<()>,
         limit: usize,
         current: &std::cell::Cell<usize>,
         _version: u16,
@@ -659,13 +666,14 @@ impl Wal {
                 )));
             }
 
-            // 同时计入帧、事务暂存、JSON 解码及应用副本，准入先于扩容和反序列化。
-            admit(
-                pending_encoded_bytes
-                    .saturating_add(len)
-                    .saturating_mul(64)
-                    .saturating_add(data.capacity()),
-            )?;
+            // 帧缓冲、已解码操作和事务槽位同时存活；应用层按具体 JSON 结构另计。
+            let slot_size = std::mem::size_of::<(WalEntry<T>, usize)>();
+            let held = data
+                .capacity()
+                .max(len.next_power_of_two())
+                .saturating_add(pending_tx.capacity().saturating_mul(slot_size))
+                .saturating_add(pending_encoded_bytes);
+            admit(held.saturating_add(len))?;
             // 复用帧缓冲，并按实际读入量扩容；截断的恶意长度不会触发整帧分配。
             data.clear();
             while data.len() < len {
@@ -734,8 +742,12 @@ impl Wal {
                 }
                 WalEntry::TxCommit { tx_id } => {
                     if current_tx_id == Some(tx_id) {
-                        for operation in pending_tx.drain(..) {
-                            visit(operation)?;
+                        let fixed = data
+                            .capacity()
+                            .saturating_add(pending_tx.capacity().saturating_mul(slot_size));
+                        for (operation, bytes) in pending_tx.drain(..) {
+                            visit(operation, fixed.saturating_add(pending_encoded_bytes))?;
+                            pending_encoded_bytes -= bytes;
                         }
                         current_tx_id = None;
                         pending_encoded_bytes = 0;
@@ -749,15 +761,22 @@ impl Wal {
                         ));
                     }
                     if current_tx_id.is_some() {
+                        if pending_tx.len() == pending_tx.capacity() {
+                            let extra_slots = pending_tx.capacity().max(4);
+                            admit(
+                                held.saturating_add(len)
+                                    .saturating_add(extra_slots.saturating_mul(slot_size)),
+                            )?;
+                        }
                         pending_tx.try_reserve(1).map_err(|error| {
                             TriviumError::CapacityAllocationFailed {
                                 reason: format!("WAL 待提交事务预留失败：{error}"),
                             }
                         })?;
-                        pending_tx.push(other);
+                        pending_tx.push((other, len));
                         pending_encoded_bytes = pending_encoded_bytes.saturating_add(len);
                     } else {
-                        visit(other)?;
+                        visit(other, held.saturating_add(len))?;
                         safe_commit_offset = physical_offset;
                     }
                 }

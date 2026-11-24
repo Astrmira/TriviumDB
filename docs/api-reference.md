@@ -1,6 +1,6 @@
 # TriviumDB API 完整参考
 
-> 本文记录 `0.9.4-beta.1` 的 Rust、Python（PyO3）和 Node.js（napi-rs）公共 API。版本说明见 [0.9.4-beta.1 变更](changes/0.9.4-beta.1.md)，后续开发见[未发布变更](changes/unreleased.md)。许可为 Apache-2.0。
+> 本文记录 `0.9.4-beta.2` 的 Rust、Python（PyO3）和 Node.js（napi-rs）公共 API。版本说明见 [0.9.4-beta.2 变更](changes/0.9.4-beta.2.md)，后续开发见[未发布变更](changes/unreleased.md)。许可为 Apache-2.0。
 
 应用支持范围见 [SDK 正式接口清单](sdk-contract.md)。历史数据库由[外部迁移入口](migration.md)转换到当前文件组。普通打开通过 `TDB_MIGRATION_REQUIRED` 提供结构化指引。
 
@@ -201,7 +201,7 @@ Immutable 会在加载前验证 manifest 版本、完成状态、dtype、维度�
 | `BuildInMemory` | 允许当前进程在内存中惰性构建 QuIVer，磁盘 sidecar 保持原样 |
 | `Error` | 严格模式；立即返回 `ImmutableArtifactInvalid`，不修改任何文件 |
 
-Python 使用 `missing_index_policy="fallback|build_in_memory|error"`；Node.js 使用 `missingIndexPolicy: "fallback" | "buildInMemory" | "error"`。ReadOnly/Immutable Reader 禁止启用 `enable_refractory_fatigue`，避免不同 Worker 因进程本地疲劳状态产生不一致结果。
+Python 使用 `missing_index_policy="fallback|build_in_memory|error"`；Node.js 使用 `missingIndexPolicy: "fallback" | "buildInMemory" | "error"`。有状态检索由调用方在单次读写实例搜索的配置中显式启用 `enable_refractory_fatigue`。状态在检索成功后更新。Reader、批量搜索以及试图在回调中开启该选项的 Hook 均返回结构化错误。
 
 ### Rust 类型化门面
 
@@ -725,6 +725,8 @@ const paths = db.reachable(1, {
 
 `labels=None` 或省略表示全部 label，空列表表示禁止遍历。`min_depth=0` 可让源节点作为深度 0 结果返回。三个预算分别限制访问节点、结果和扫描边；详细接口在超限时保留已完成结果并设置 `truncated=true`。
 
+Rust 的 `shortest_path_detailed(source, target, max_depth, label)` 沿默认图出边查找一条最短路径，结果带有逐跳边标签、权重与元数据。存在的源节点到自身返回零跳路径。
+
 `max_edges` 在读取邻接表时扣减，`traversed_edges` 包含因标签、端点或去重而舍弃的扫描记录。出边按目标 ID 和标签扫描，反向来源按源 ID 扫描。详细结果只包含预算范围内已发现的路径。
 
 Rust 与 Python 使用 `max_frontier_size`，Node.js 使用 `maxFrontierSize`。该参数限制 BFS 每层新发现的节点数，默认 10,000。Python 的 `reachable`、`reachable_detailed` 和 `query_subgraph` 均接受这个关键字，Node.js 的对应方法通过遍历选项传入。
@@ -865,9 +867,11 @@ const detailed = db.searchAdvanced(queryVector, {
 })
 ```
 
-Python `search`、`search_batch`、`search_grouped`、`search_with_context`、`search_advanced` 与 `search_hybrid` 均接受关键字参数 `exact`。Node 的 `search`、`searchBatch`、`searchGrouped`、`searchHybrid` 在既有位置参数之后追加可选 `exact`，`searchAdvanced` 和 `searchWithContext` 使用配置字段 `exact`。高级入口保留 `force_brute_force`／`forceBruteForce`，两个开关任一为真时选择精确召回。Rust `with_exact(bool)` 设置同一 `force_brute_force` 字段。
+Python `search`、`search_batch`、`search_grouped`、`search_with_context`、`search_advanced` 与 `search_hybrid` 均接受关键字参数 `exact`。Node 的 `search`、`searchBatch`、`searchGrouped`、`searchHybrid` 在既有位置参数之后追加可选 `exact`，`searchAdvanced` 和 `searchWithContext` 使用配置字段 `exact`。高级入口保留 `force_brute_force`／`forceBruteForce`，两个开关任一为真时选择精确召回。Rust `with_exact(bool)` 设置同一 `force_brute_force` 字段。Node 的 `searchHybrid` 在 `exact` 之后接受可选的正整数 `annRerankLimit`，对应 Python 的 `ann_rerank_limit`。
 
-> **资源提醒**　精确召回扫描全部符合条件的存储向量，查询成本随数据量和维度增长。取消、只读和资源预算继续由内核执行。`search_with_context`／`searchWithContext` 的 `observations.vector_route_quiver` 为 `0` 时表示实际向量召回走精确路径，为 `1` 时表示 QuIVer 路径。
+> **资源提醒**　精确召回扫描全部符合条件的存储向量，查询成本随数据量和维度增长。取消、只读和资源预算继续由内核执行。
+
+诊断检索的 `observations` 分别记录主向量召回实际执行的路径。`vector_route_quiver=1` 表示执行过 QuIVer，`vector_route_exact=1` 表示执行过精确扫描。QuIVer 过滤后命中不足而回退时，两项均为 `1`，并记录 `quiver_fallback_filtered=1`。
 
 **返回值 `SearchHit`：**
 
@@ -882,6 +886,19 @@ Python 普通／分组检索的整数数量及展开参数、批量检索的数�
 精确、图优先、上下文、高级及混合检索的已覆盖整数数量字段采用同一错误契约。Python 图优先检索在请求范围内提取锚点序列，转换回调的同库写入明确拒绝。混合检索文本类型错误定位 `query_text` 或 `queryText`。Node 上下文／高级配置的数字字段以省略或 `undefined` 使用默认值，`null` 按既有类型边界拒绝。可选方法数字实参继续支持 `null` 默认值。
 
 Python 的 `search`、`search_grouped`、`search_with_context`、`search_advanced` 和 `search_hybrid` 接受外层 `Mapping` 过滤器，包括 `MappingProxyType` 和 `UserDict`。Mapping 协议在请求范围内执行，转换中的宿主异常保留原对象与 cause。已覆盖 Filter 表示及语义错误定位 `payload_filter`，Node 对应语义错误定位 `payloadFilter`。
+
+### search_ids / search_ids_batch — 只返回命中 ID
+
+```python
+from array import array
+
+query_buffer = memoryview(array("f", query_vector))
+ids = db.search_ids(query_buffer, top_k=100, recall_k=4000, ann_rerank_limit=1000)
+batch_ids = db.search_ids_batch(queries, top_k=100, parallelism=8,
+                                recall_k=4000, ann_rerank_limit=1000)
+```
+
+单条返回 `list[int]`，批量按输入顺序返回 `list[list[int]]`。纯向量查询直接从已排序候选生成 ID，属性过滤仍在截断 Top-K 前执行。Node.js 使用 `searchIds(vector, config)` 和 `searchIdsBatch(vectors, config, parallelism)`。Rust 入口接收 `SearchConfig`。
 
 ### search_batch — 批量并行向量检索
 
@@ -928,7 +945,7 @@ db.batchInsert(matrix, [{ name: 'a' }, { name: 'b' }])
 const hits = await db.searchBatch(matrix, 1, 0, 0, true)
 ```
 
-> **精度提醒**　`BigUint64Array` 输入保留全部 64 位。`get().vector` 沿用 JavaScript `number[]` 表示，超过安全整数范围的分量可能舍入。
+> **精度提醒**　`BigUint64Array` 输入保留全部 64 位。`get().vector` 沿用 JavaScript `number[]` 表示，每个分量须能精确表示为 JavaScript `number`，否则返回 `TDB_INVALID_INPUT`。例如，`2^53` 可精确读出，`2^53 + 1` 会触发该错误。
 
 Node.js 接口返回 Promise，检索工作在后台线程执行。参数依次为 `queryVectors`、`topK`、`parallelism`、`minScore`、`exact`。
 
@@ -1038,8 +1055,9 @@ let results = db.search_advanced(&query_vec, &config)?;
 | 参数 | 类型 | 默认值 | 说明 |
 | ------ | ------ | -------- | ------ |
 | `top_k` | `usize` | `5` | 最终返回的结果数量 |
-| `recall_k` | `usize` | `0`（自动） | 初始召回池；自动值为 `max(top_k × 8, 64)` |
+| `recall_k` | `usize` | `0`（自动） | 初始召回池；自动值为 `max(top_k × 8, 64)`。显式值控制 QuIVer 导航宽度，纯向量查询只向内层请求最终 Top-K |
 | `rerank_k` | `usize` | `0`（自动） | 高级处理候选池；自动值为 `max(top_k × 4, 32)`，且不超过 `recall_k` |
+| `ann_rerank_limit` | `Option<usize>` | `None`（自动） | QuIVer 内部精排候选数，显式传入正整数；Node.js 为 `annRerankLimit` |
 | `expand_depth` | `usize` | `2` | SA-PPR 有限深度扩散跳数 |
 | `min_score` | `f32` | `0.0` | 相似度下限，包含边界值 |
 | `teleport_alpha` | `f32` | `0.0` | PPR 回跳概率 (0.0~1.0)，越高越抑制深层扩散 |
@@ -1157,7 +1175,7 @@ db.clear_hook();
 
 ### search_with_context — 带管线上下文的检索
 
-与 `search` 相同的检索能力，但额外返回 `HookContext` 对象，包含管线各阶段的计时统计和 Hook 注入的自定义数据。
+Python 的 `search`、`search_with_context` 和 Node.js 的 `search`、`searchWithContext` 均默认使用零层图扩散。相同的查询参数产生相同的命中与分数，诊断入口额外返回各阶段的计时统计和 Hook 写入的上下文。单条和批量向量检索均要求 `top_k` 大于零。
 
 **Python：**
 ```python
@@ -1418,7 +1436,7 @@ Python 的参数容器接受字符串键 `Mapping`，包括 `dict`、`MappingPro
 
 `tql`、`prepare_tql` 和 `tql_mut` 的查询文本类型拒绝定位 `query`，发生在解析之前，阶段省略。Python 保留原类型及编码异常。写入口类型拒绝提供 `validation/not_committed`，回调重入提供 `admission/not_committed`，读取入口省略写入结果。
 
-Node Prepared 只绑定参数对象的自有可枚举字符串键。NaN、无穷、undefined、BigInt、Symbol、函数及复合值返回具名绑定错误。属性枚举与 getter 抛出的宿主异常保留原对象与 cause，有效标量沿用原有数值和字符串转换规则。
+Node Prepared 只绑定参数对象的自有可枚举字符串键。NaN、无穷、undefined、超出 64 位整数域的 BigInt、Symbol、函数及复合值返回具名绑定错误。属性枚举与 getter 抛出的宿主异常保留原对象与 cause，有效标量沿用原有数值和字符串转换规则。
 
 命名参数转换及绑定错误提供 `stage=bind` 和 `target.parameter`。缺参、多参与类型错误保留各自错误码和详情，Python 保留原异常继承关系。映射协议产生的宿主异常保留原对象与 cause。Rust 使用 `TriviumError::underlying()` 取得带定位错误的原始变体。覆盖边界见[公共错误契约](error-contracts.md)。
 
@@ -1437,6 +1455,8 @@ SEARCH 向量的字面量与数值参数按数据库 dtype 转换，u64 分量�
 | Object | dict，嵌套整数保持精度 | object，嵌套超安全整数转十进制字符串 |
 | Null | None | null |
 
+Node 的普通查询与 Prepared 查询均返回 `QueryRow[]`。节点投影中的 Payload 和边投影中的 Metadata 沿用原始文档的整数表示，超出安全整数范围的整数可读为 `bigint`。直接投影同一整数属性时，标量列按上表返回十进制字符串。
+
 Rust 使用 `TqlValue::Object(serde_json::Map<String, serde_json::Value>)` 承载对象。数组和对象作为完整 JSON 值参与空值判断、COALESCE、去重与分组；节点和边按实体身份参与表达式求值。
 
 ### tql_mut — 执行 TQL 写操作
@@ -1445,7 +1465,7 @@ Rust 使用 `TqlValue::Object(serde_json::Map<String, serde_json::Value>)` 承�
 
 多字段 SET 按节点累计，重复字段采用最后一次赋值。MATCH … CREATE 每条匹配建立独立的新节点作用域，零匹配返回零次创建。SET VECTOR 按目标 dtype 检查，u64 整数字面量覆盖完整范围；任一目标失败时整个 mutation 保持原子性。
 
-DETACH DELETE 按去重后的节点集合生成统一事务删除，由内核清理入边、出边、平行边与自环。相连节点和同一节点的重复匹配共享同一个 WAL 提交边界，集合外的节点与其剩余关系保持完整。
+`DELETE` 和 `DETACH DELETE` 均按去重后的节点集合生成统一事务删除，由内核清理入边、出边、平行边与自环。相连节点和同一节点的重复匹配共享同一个 WAL 提交边界，集合外的节点与其剩余关系保持完整。
 
 **Python：**
 ```python
@@ -1500,7 +1520,7 @@ ReturnList := Ident (',' Ident)* | '*'
 
 ## 持久化索引管理与观测
 
-四类属性索引均持久化到 `.pidx` 并由 Planner 透明选择：
+属性索引随检查点发布到统一的 `.idx` 容器 并由 Planner 透明选择：
 
 | 类型 | Python | Node | Rust |
 | --- | --- | --- | --- |
@@ -1692,7 +1712,7 @@ Rust 内存参数单位为字节，Python/Node 参数单位为 MiB。有共享�
 
 `InstanceStats.memory` 包含 `reserved_database_bytes`、`estimated_memory_bytes`、`node_count`。MemTable 写锁繁忙时返回 `None` / `null`，表示本次采样暂不可用。共享余额由 `available_foreground_bytes`、`available_maintenance_bytes`、`available_task_slots` 提供，未设置对应上限时为 `None` / `null`。
 
-运行时资源拒绝在 Rust 中返回 `ResourceBudgetExceeded { resource, requested, used, limit }`；Python 抛出 `ResourceBudgetError`，Node 错误码为 `QueueFull`，两端均携带上述四个字段。Node `searchBatch()` 的 Promise 拒绝采用相同字段。
+运行时资源拒绝在 Rust 中返回 `ResourceBudgetExceeded { resource, requested, used, limit }`。Python 抛出 `ResourceBudgetError`，Node 错误码为 `QueueFull`，两端均携带上述四个字段。Node 的 `searchBatch()` 和 `searchIdsBatch()` 通过 Promise 拒绝交付相同字段。
 
 ```python
 from triviumdb import ResourceBudgetError
@@ -1851,6 +1871,8 @@ Mmap 只读打开在采用 `.gidx` 前校验所有边块、派生目录与主文
 ### migrate — 迁移到新维度
 
 将当前数据库的所有节点 Payload、图谱边复制到一个全新的数据库文件中，向量以零向量占位（因为维度变了，旧向量无法直接复用）。
+
+启用 Pelorus 的源库会将曲率与建图、精排配置带入目标库。目标库从首次回填起按同一曲率校验向量。派生图按新维度重建，重建前按目标实例的缺失索引策略处理查询。
 
 目标须避开源库制品名称和文件路径。冲突返回 `TDB_INVALID_INPUT`。独立目标已有主文件或制品时返回 `TDB_IO`，`details.io_kind` 为 `AlreadyExists`。这些检查在创建目标租约、暂存库或发布日志前执行，覆盖 Windows 的 Unicode 大小写别名。
 

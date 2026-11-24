@@ -365,6 +365,10 @@ fn info_json_is_valid() {
     assert_eq!(v["node_count"], 2);
     assert_eq!(v["dimension"], 4);
     assert_eq!(v["dtype"], "f32");
+    let wal_bytes = std::fs::metadata(format!("{path}.wal")).unwrap().len();
+    assert!(wal_bytes > 0);
+    assert_eq!(v["files"]["wal_bytes"], wal_bytes);
+    assert_eq!(v["files"]["wal_pending"], false);
 }
 
 // ── exec (read) ────────────────────────────────────────────────

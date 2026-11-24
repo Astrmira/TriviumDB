@@ -6,7 +6,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const graph = require('../contracts/graph_arguments.json')
 const fixture = require('../contracts/read_arguments.json')
-const { invalid } = require('./graph_arguments')
+const { invalid } = require('./input_errors')
 
 function edge(value) {
   return { targetId: value.target_id, label: value.label, weight: value.weight, metadata: value.metadata }

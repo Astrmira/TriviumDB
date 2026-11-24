@@ -1,6 +1,6 @@
 //! 批量向量输入在 JS 线程完成快照；后台任务只持有 Rust 数据。
 
-use super::arguments::{read_array, validate_u64_component, vector_numbers, write_array};
+use super::arguments::{read_array, validate_u64_component, vector_numbers_admitted, write_array};
 use super::errors::argument_input_error;
 use crate::VectorType;
 use napi::{Env, JsTypedArray, JsTypedArrayValue, JsUnknown, NapiRaw, TypedArrayType};
@@ -19,11 +19,37 @@ impl Batch {
         dtype: &str,
         writing: bool,
     ) -> napi::Result<Self> {
+        Self::read_admitted(env, value, dim, dtype, writing, |_| Ok(()))
+    }
+
+    pub(super) fn read_admitted(
+        env: Env,
+        value: JsUnknown,
+        dim: usize,
+        dtype: &str,
+        writing: bool,
+        mut admit: impl FnMut(usize) -> napi::Result<()>,
+    ) -> napi::Result<Self> {
         let write = writing.then_some(crate::error::WriteErrorInfo::MAINTENANCE_VALIDATION);
         let field = if writing { "vectors" } else { "queryVectors" };
         if !value.is_typedarray()? {
-            let row = |env, item, field: &str| {
-                vector_numbers(env, item, field, writing && dtype == "u64", write)
+            let row = |env, item: JsUnknown, field: &str| {
+                vector_numbers_admitted(
+                    env,
+                    item,
+                    field,
+                    writing && dtype == "u64",
+                    write,
+                    |cells| {
+                        // JS 数组与目标 dtype 可同时驻留，长度取自执行本次读取的同一个数组。
+                        admit(
+                            cells
+                                .max(4)
+                                .saturating_mul(3 * size_of::<f64>())
+                                .saturating_add(4 * size_of::<Vec<f64>>()),
+                        )
+                    },
+                )
             };
             return (if writing {
                 write_array(env, value, field, row)
@@ -51,10 +77,17 @@ impl Batch {
         }
         let bounds = || reject("向量视图超出缓冲范围 (Vector view exceeds the backing buffer)");
         match (dtype, array.typedarray_type) {
-            ("f32" | "f16", TypedArrayType::Float32) => {
-                copy_rows(array, dim, bounds).map(Self::Float32)
+            ("f32" | "f16", TypedArrayType::Float32) => copy_rows(
+                array,
+                dim,
+                bounds,
+                if dtype == "f16" { 2 } else { 0 },
+                admit,
+            )
+            .map(Self::Float32),
+            ("u64", TypedArrayType::BigUint64) => {
+                copy_rows(array, dim, bounds, 0, admit).map(Self::Uint64)
             }
-            ("u64", TypedArrayType::BigUint64) => copy_rows(array, dim, bounds).map(Self::Uint64),
             _ => Err(reject(
                 "缓冲区元素类型与数据库 dtype 不匹配 (Typed array does not match the database dtype)",
             )),
@@ -127,6 +160,8 @@ fn copy_rows<T: bytemuck::Pod>(
     array: JsTypedArrayValue,
     dim: usize,
     invalid: impl Fn() -> napi::Error,
+    converted_width: usize,
+    admit: impl FnOnce(usize) -> napi::Result<()>,
 ) -> napi::Result<Vec<Vec<T>>> {
     if array.length == 0 {
         return Ok(Vec::new());
@@ -143,6 +178,15 @@ fn copy_rows<T: bytemuck::Pod>(
         .as_ref()
         .get(array.byte_offset..end)
         .ok_or_else(invalid)?;
+    let header_copies = if converted_width == 0 { 1 } else { 2 };
+    admit(
+        bytes
+            .len()
+            .saturating_add(array.length.saturating_mul(converted_width))
+            .saturating_add(
+                (array.length / dim).saturating_mul(header_copies * size_of::<Vec<T>>()),
+            ),
+    )?;
     Ok(bytes
         .chunks_exact(row_bytes)
         .map(bytemuck::allocation::pod_collect_to_vec)
