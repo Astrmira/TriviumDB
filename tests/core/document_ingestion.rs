@@ -1097,7 +1097,12 @@ fn 有限共享工作区可展开单个归档的短证据() {
     let dir = TestDir::new("archived-context-quota");
     let path = dir.file("data.tdb");
     let cfg = config(StorageMode::Mmap);
-    let mut db = Database::<f32>::open_with_config(&path, cfg).unwrap();
+    let mut db = Database::<f32>::open_with_runtime(
+        &path,
+        cfg,
+        triviumdb::ResourceRuntime::new(Default::default()).unwrap(),
+    )
+    .unwrap();
     let parsed = parse(
         &mut db,
         "archive.txt",

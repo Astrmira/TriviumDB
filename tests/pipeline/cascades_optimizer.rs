@@ -617,3 +617,21 @@ fn pipeline默认不采集指标且显式profile可采集() {
     assert_eq!(profiled.metrics.len(), 1);
     assert_eq!(profiled.metrics[0].output_rows, 3);
 }
+
+#[test]
+fn 最终标量投影在独立阶段登记真实的Payload读取() {
+    let mut mt = MemTable::<f32>::new(1);
+    mt.insert_with_id(1, &[1.], json!({"label":"目标"}))
+        .unwrap();
+    let query =
+        parse_tql("EXPLAIN ANALYZE SEARCH VECTOR [1] TOP 1 AS n WITH n RETURN n.label AS label")
+            .unwrap();
+    let plan = execute_tql(&query, &mt).unwrap();
+    let stages = plan[0]["plan"].payload["pipeline_stage_actuals"]
+        .as_array()
+        .unwrap();
+    let projection = stages.last().unwrap();
+    assert_eq!(projection["operator"], "return");
+    assert_eq!(projection["actual_rows"], 1);
+    assert_eq!(projection["payload_lookups"], 1);
+}

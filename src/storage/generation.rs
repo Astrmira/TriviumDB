@@ -18,6 +18,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const CURRENT_VERSION: u16 = 1;
 static CURRENT_NONCE: AtomicU64 = AtomicU64::new(1);
 
+fn lease_error(id: &str, error: std::io::Error) -> TriviumError {
+    if error.kind() == std::io::ErrorKind::WouldBlock
+        || error
+            .raw_os_error()
+            .is_some_and(|code| Some(code) == fs2::lock_contended_error().raw_os_error())
+    {
+        TriviumError::GenerationBusy {
+            generation_id: id.to_owned(),
+        }
+    } else {
+        TriviumError::Io(error)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CurrentGeneration {
     pub format_version: u16,
@@ -233,11 +247,8 @@ impl GenerationStore {
             .read(true)
             .write(true)
             .open(&lease_path)?;
-        lease
-            .try_lock_shared()
-            .map_err(|_| TriviumError::GenerationBusy {
-                generation_id: current.generation_id.clone(),
-            })?;
+        FileExt::try_lock_shared(&lease)
+            .map_err(|error| lease_error(&current.generation_id, error))?;
         let path = directory.join(&current.database_file);
         let manifest = crate::storage::snapshot::validate_manifest_for_generation(
             &path.to_string_lossy(),
@@ -301,11 +312,7 @@ impl GenerationStore {
             .read(true)
             .write(true)
             .open(&lease_path)?;
-        lease
-            .try_lock_exclusive()
-            .map_err(|_| TriviumError::GenerationBusy {
-                generation_id: generation_id.to_string(),
-            })?;
+        FileExt::try_lock_exclusive(&lease).map_err(|error| lease_error(generation_id, error))?;
         validate_generation_database(
             &current_directory.join(&current.database_file),
             &current.generation_id,
@@ -633,4 +640,18 @@ fn validate_generation_name(value: &str) -> Result<()> {
         .at_field("generation_id"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod lease_errors {
+    use super::*;
+    #[test]
+    fn 租约竞争与底层权限错误分别报告() {
+        assert!(
+            matches!(lease_error("g",fs2::lock_contended_error()),TriviumError::GenerationBusy{generation_id} if generation_id=="g")
+        );
+        assert!(
+            matches!(lease_error("g",std::io::Error::from(std::io::ErrorKind::PermissionDenied)),TriviumError::Io(e) if e.kind()==std::io::ErrorKind::PermissionDenied)
+        );
+    }
 }

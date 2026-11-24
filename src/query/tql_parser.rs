@@ -2049,6 +2049,7 @@ impl TqlParser {
                         | "depth"
                         | "path_strength"
                         | "path_count"
+                        | "path_truncated"
                         | "community"
                         | "path"
                         | "path_length"
@@ -2084,6 +2085,7 @@ impl TqlParser {
                     "depth" => Ok(TqlExpr::Depth { var }),
                     "path_strength" => Ok(TqlExpr::PathStrength { var }),
                     "path_count" => Ok(TqlExpr::PathCount { var }),
+                    "path_truncated" => Ok(TqlExpr::PathTruncated { var }),
                     "community" => Ok(TqlExpr::Community { var }),
                     "path" => Ok(TqlExpr::Path { var }),
                     "path_length" => Ok(TqlExpr::PathLength { var }),
@@ -2729,6 +2731,7 @@ fn collect_expr_vars(expr: &TqlExpr, output: &mut Vec<String>, bare_fields: bool
         | TqlExpr::Depth { var }
         | TqlExpr::PathStrength { var }
         | TqlExpr::PathCount { var }
+        | TqlExpr::PathTruncated { var }
         | TqlExpr::Community { var }
         | TqlExpr::Path { var }
         | TqlExpr::PathLength { var }

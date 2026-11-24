@@ -82,11 +82,8 @@ pub(super) fn validate_config<T: VectorType>(config: &SearchConfig, dim: usize) 
         }
     }
 
-    if crate::vector::is_binary_vector::<T>()
-        && config.enable_advanced_pipeline
-        && (config.enable_sparse_residual || config.enable_dpp)
-    {
-        return Err(crate::TriviumError::InvalidInput("u64 支持汉明检索与图扩散，浮点认知重排配置不适用于二进制指纹 (u64 supports Hamming retrieval and graph expansion; floating-point cognitive reranking is unavailable for binary fingerprints)".into()));
+    if config.enable_advanced_pipeline && (config.enable_sparse_residual || config.enable_dpp) {
+        crate::cognitive::validate_dtype::<T>()?;
     }
     crate::index::text::validate_bm25(config.bm25_k1, config.bm25_b)?;
     if let Some(bias) = config.diffusion_bias.as_deref() {
@@ -608,7 +605,7 @@ pub(crate) fn execute_pipeline_with_limit<T: VectorType>(
     if config.enable_advanced_pipeline
         && config.enable_dpp
         && expanded.len() > config.top_k
-        && let Some(selected) = apply_dpp(&mt, config, &mut expanded)
+        && let Some(selected) = apply_dpp(&mt, config, &mut expanded)?
     {
         expanded = selected;
     } else {
@@ -997,7 +994,8 @@ fn recall_residual<T: VectorType>(
         config.fista_lambda,
         80,
         config.fista_threshold,
-    ) {
+        &crate::request::control().unwrap_or_default(),
+    )? {
         tracing::debug!(
             threshold = config.fista_threshold,
             "残差超过阈值，执行二次召回 (Residual exceeds threshold, running secondary recall)"
@@ -1141,7 +1139,7 @@ fn apply_dpp<T: VectorType>(
     mt: &MemTable<T>,
     config: &SearchConfig,
     expanded: &mut [SearchHit],
-) -> Option<Vec<SearchHit>> {
+) -> Result<Option<Vec<SearchHit>>> {
     let limit = config.top_k;
     let dpp_pool_size = std::cmp::min(expanded.len(), limit.saturating_mul(3));
     let mut pool_vecs = Vec::with_capacity(dpp_pool_size);
@@ -1151,17 +1149,23 @@ fn apply_dpp<T: VectorType>(
     for (i, hit) in expanded.iter().take(dpp_pool_size).enumerate() {
         if let Some(v) = mt.get_vector(hit.id) {
             pool_vecs.push(v.iter().map(|&x| x.to_f32()).collect());
-            pool_scores.push(hit.score);
+            pool_scores.push(f64::from(hit.score));
             pool_valid.push(i);
         }
     }
 
     if pool_valid.len() <= limit {
-        return None;
+        return Ok(None);
     }
 
-    let selected_idx =
-        crate::cognitive::dpp_greedy(&pool_vecs, &pool_scores, limit, config.dpp_quality_weight);
+    let control = crate::request::control().unwrap_or_default();
+    let selected_idx = crate::cognitive::dpp_greedy_wide(
+        &pool_vecs,
+        &pool_scores,
+        limit,
+        config.dpp_quality_weight,
+        || crate::cognitive::checkpoint(&control),
+    )?;
 
     let mut final_results = Vec::with_capacity(limit);
     for &idx in &selected_idx {
@@ -1173,7 +1177,7 @@ fn apply_dpp<T: VectorType>(
         });
     }
     final_results.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
-    Some(final_results)
+    Ok(Some(final_results))
 }
 
 #[cfg(test)]
@@ -1655,7 +1659,7 @@ mod tests {
             },
         ];
         // pool_valid.len() <= top_k → 返回 None
-        assert!(apply_dpp(&mt, &cfg, &mut expanded).is_none());
+        assert!(apply_dpp(&mt, &cfg, &mut expanded).unwrap().is_none());
     }
 
     #[test]
@@ -1698,7 +1702,7 @@ mod tests {
             },
         ];
 
-        let result = apply_dpp(&mt, &cfg, &mut expanded);
+        let result = apply_dpp(&mt, &cfg, &mut expanded).unwrap();
         assert!(result.is_some());
         let selected = result.unwrap();
         assert_eq!(selected.len(), 2);

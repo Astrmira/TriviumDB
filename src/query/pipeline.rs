@@ -513,7 +513,7 @@ pub struct PipelineContext<'a, T: VectorType> {
     profile: bool,
     stages: usize,
     vector_read_bytes: usize,
-    payload_meter: Arc<crate::request::PayloadMeter>,
+    pub(crate) payload_meter: Arc<crate::request::PayloadMeter>,
     workspace_bytes: usize,
     workspaces: Vec<crate::resources::RequestWorkspace>,
 }
@@ -1123,6 +1123,9 @@ impl<T: VectorType> PipelineOperator<T> for DppDiversify {
     }
 
     fn apply(&self, input: NodeSet, context: &mut PipelineContext<'_, T>) -> Result<NodeSet> {
+        crate::cognitive::validate_dtype::<T>()?;
+        let request = context.graph_request()?;
+        let control = request.control();
         const MAX_POOL: usize = 512;
         if self.top_k == 0 || input.len() > MAX_POOL || self.top_k > input.len() {
             return Err(TriviumError::InvalidInput(
@@ -1166,8 +1169,13 @@ impl<T: VectorType> PipelineOperator<T> for DppDiversify {
                 valid.push(row);
             }
         }
-        let selected =
-            crate::cognitive::dpp_greedy_wide(&vectors, &scores, self.top_k, self.quality_weight);
+        let selected = crate::cognitive::dpp_greedy_wide(
+            &vectors,
+            &scores,
+            self.top_k,
+            self.quality_weight,
+            || crate::cognitive::checkpoint(control),
+        )?;
         let mut output = Vec::with_capacity(selected.len());
         for (rank, index) in selected.into_iter().enumerate() {
             if let Some(mut row) = valid.get(index).cloned() {
@@ -1196,6 +1204,9 @@ impl<T: VectorType> PipelineOperator<T> for FistaResidualRecall<T> {
     }
 
     fn apply(&self, input: NodeSet, context: &mut PipelineContext<'_, T>) -> Result<NodeSet> {
+        crate::cognitive::validate_dtype::<T>()?;
+        let request = context.graph_request()?;
+        let control = request.control();
         crate::vector::validate_query_vector(&self.query, context.memtable.dim())?;
         const MAX_CANDIDATES: usize = 512;
         const MAX_ITERATIONS: usize = 256;
@@ -1215,32 +1226,46 @@ impl<T: VectorType> PipelineOperator<T> for FistaResidualRecall<T> {
         if input.is_empty() {
             return Ok(NodeSet::empty());
         }
-        let gram_cells = input
-            .len()
-            .checked_mul(input.len())
-            .ok_or_else(|| TriviumError::QueryExecution("FISTA Gram 矩阵预算溢出".into()))?;
-        let gram_bytes = gram_cells
-            .checked_mul(std::mem::size_of::<f64>())
-            .ok_or_else(|| TriviumError::QueryExecution("FISTA Gram 矩阵字节预算溢出".into()))?;
-        if gram_bytes > context.budget.max_node_set_bytes {
-            return Err(TriviumError::QueryExecution(
-                "FISTA Gram 矩阵超过临时内存预算 (FISTA Gram matrix exceeds temporary memory budget)".into(),
-            ));
-        }
-        let _matrix_workspace = context.memtable.reserve_instance_workspace(gram_bytes)?;
+        use crate::index::exact::{Candidate, insert_candidate};
+        let anchors = input.len();
+        let dim = context.memtable.dim();
+        let k = self.top_k.min(context.memtable.node_count());
+        // 求解阶段同时持有锚点副本、查询、宽残差、Gram 和四组系数。
+        // 召回阶段释放锚点，改为逐条评分并保留有界候选堆。
+        let solve_bytes = anchors
+            .saturating_mul(
+                dim.saturating_mul(size_of::<f32>())
+                    .saturating_add(size_of::<Vec<f32>>()),
+            )
+            .saturating_add(
+                anchors
+                    .saturating_mul(anchors + 4)
+                    .saturating_mul(size_of::<f64>()),
+            )
+            .saturating_add(dim.saturating_mul(2 * size_of::<f32>() + size_of::<f64>()));
+        let recall_bytes = k
+            .saturating_mul(size_of::<Candidate>() + size_of::<NodeRow>())
+            .saturating_add(anchors.saturating_mul(2 * (size_of::<NodeRow>() + 64)))
+            .saturating_add(dim.saturating_mul(2 * size_of::<f32>()));
+        let limit = context.budget.max_node_set_bytes;
+        let check_peak = |bytes| {
+            if bytes > limit {
+                return Err(TriviumError::QueryExecution(
+                    "FISTA 超过临时内存预算 (FISTA exceeds temporary memory budget)".into(),
+                ));
+            }
+            Ok(())
+        };
+        check_peak(solve_bytes)?;
+        let mut workspace = context.memtable.reserve_instance_workspace(solve_bytes)?;
         context.charge_vectors(input.len())?;
-        let entities = input
-            .rows()
-            .iter()
-            .filter_map(|row| {
-                context.memtable.get_vector(row.id).map(|vector| {
-                    vector
-                        .iter()
-                        .map(|value| value.to_f32())
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut entities = Vec::with_capacity(anchors);
+        for row in input.rows() {
+            control.check()?;
+            if let Some(vector) = context.memtable.get_vector(row.id) {
+                entities.push(vector.iter().map(|value| value.to_f32()).collect());
+            }
+        }
         let query = self
             .query
             .iter()
@@ -1252,39 +1277,39 @@ impl<T: VectorType> PipelineOperator<T> for FistaResidualRecall<T> {
             self.lambda,
             self.iterations,
             self.threshold,
-        ) else {
+            control,
+        )?
+        else {
             return Ok(NodeSet::empty());
         };
+        drop(entities);
+        drop(query);
+        // 残差向量贯穿交接点，按同一凭证调节保留额度。
+        check_peak(recall_bytes)?;
+        context
+            .memtable
+            .resize_instance_workspace(&mut workspace, recall_bytes)?;
         context.charge_vectors(context.memtable.node_count())?;
         let mut inherited = input
             .into_rows()
             .into_iter()
             .map(|row| (row.id, row))
             .collect::<BTreeMap<_, _>>();
-        let mut scored = context
-            .memtable
-            .all_node_ids()
-            .into_iter()
-            .filter_map(|id| {
-                let vector = context.memtable.get_vector(id)?;
-                let vector = vector
-                    .iter()
-                    .map(|value| value.to_f32())
-                    .collect::<Vec<_>>();
-                Some((id, crate::vector::cosine_similarity_f32(&residual, &vector)))
-            })
-            .collect::<Vec<_>>();
-        scored.sort_by(|left, right| {
-            right
-                .1
-                .total_cmp(&left.1)
-                .then_with(|| left.0.cmp(&right.0))
-        });
-        scored.truncate(self.top_k);
+        let mut heap = std::collections::BinaryHeap::with_capacity(k);
+        let mut vector = Vec::with_capacity(dim);
+        for slot in 0..context.memtable.internal_slot_count() {
+            crate::cognitive::checkpoint(control)?;
+            if let Some((id, stored)) = context.memtable.active_vector_at_slot(slot)? {
+                vector.clear();
+                vector.extend(stored.iter().map(|value| value.to_f32()));
+                let score = crate::vector::cosine_similarity_f32(&residual, &vector);
+                insert_candidate(&mut heap, Candidate { id, score }, k);
+            }
+        }
         Ok(NodeSet::from_rows(
-            scored
+            heap.into_sorted_vec()
                 .into_iter()
-                .map(|(id, score)| {
+                .map(|Candidate { id, score }| {
                     let mut row = inherited.remove(&id).unwrap_or_else(|| NodeRow::new(id));
                     row.residual_score = Some(ScoreValue {
                         value: f64::from(score),
@@ -1308,6 +1333,9 @@ impl<T: VectorType> PipelineOperator<T> for NmfTopics {
     }
 
     fn apply(&self, input: NodeSet, context: &mut PipelineContext<'_, T>) -> Result<NodeSet> {
+        crate::cognitive::validate_dtype::<T>()?;
+        let request = context.graph_request()?;
+        let control = request.control();
         const MAX_CANDIDATES: usize = 512;
         const MAX_TOPICS: usize = 32;
         const MAX_ITERATIONS: usize = 256;
@@ -1367,14 +1395,15 @@ impl<T: VectorType> PipelineOperator<T> for NmfTopics {
                 .ok_or(TriviumError::NodeNotFound(row.id))?;
             flat.extend(vector.iter().map(|value| value.to_f32()));
         }
-        let (weights, topics) = crate::cognitive::nmf_multiplicative_update(
+        let (weights, topics) = crate::cognitive::nmf_checked(
             &flat,
             rows.len(),
             context.memtable.dim(),
             self.topics,
             self.iterations,
             1e-4,
-        );
+            control,
+        )?;
         if weights
             .iter()
             .chain(&topics)
@@ -1996,8 +2025,7 @@ impl<T: VectorType> PipelineOperator<T> for BatchShortestPaths {
 
     fn apply(&self, input: NodeSet, context: &mut PipelineContext<'_, T>) -> Result<NodeSet> {
         let mut output = BTreeMap::<NodeId, NodeRow>::new();
-        let mut consumed_nodes = 0usize;
-        let mut consumed_edges = 0usize;
+        let mut metrics = crate::graph::budget::TraversalMetrics::default();
         let targets = unique_path_targets(&self.targets);
         for source in input.rows {
             for &target in &targets {
@@ -2006,17 +2034,13 @@ impl<T: VectorType> PipelineOperator<T> for BatchShortestPaths {
                     source.id,
                     target,
                     self.label_filter.as_deref(),
-                    &context.budget.traversal,
+                    &TraversalBudget {
+                        exhaustion_policy: BudgetExhaustionPolicy::Error,
+                        ..context.budget.traversal
+                    },
+                    metrics,
                 )?;
-                consumed_nodes = consumed_nodes.saturating_add(result.metrics.visited_nodes);
-                consumed_edges = consumed_edges.saturating_add(result.metrics.examined_edges);
-                if consumed_nodes > context.budget.traversal.max_visited_nodes
-                    || consumed_edges > context.budget.traversal.max_examined_edges
-                {
-                    return Err(TriviumError::QueryExecution(
-                        "批量最短路径超过全局遍历预算 (Batch shortest paths exceed global traversal budget)".into(),
-                    ));
-                }
+                metrics = result.metrics;
                 let Some(path) = result.path else {
                     continue;
                 };
@@ -2043,7 +2067,7 @@ impl<T: VectorType> PipelineOperator<T> for BatchShortestPaths {
                 }
             }
         }
-        context.record_graph_work(consumed_nodes, consumed_edges);
+        context.record_graph_work(metrics.visited_nodes, metrics.examined_edges);
         Ok(NodeSet::from_rows(output.into_values().collect()))
     }
 }
@@ -2081,9 +2105,11 @@ impl<T: VectorType> PipelineOperator<T> for WeightedShortestPathsOperator {
         let targets = unique_path_targets(&self.targets);
         let mut work = workspace.examined_edges;
         let mut rows = Vec::new();
-        for source in input.rows {
-            for &target in &targets {
-                let Some(path) = crate::graph::analytics::weighted_dijkstra_with_work(
+        for target in targets {
+            let mut best = None;
+            let mut row = NodeRow::new(target);
+            for source in input.rows() {
+                let Some((nodes, cost)) = crate::graph::analytics::weighted_dijkstra_exact(
                     &workspace,
                     source.id,
                     target,
@@ -2093,16 +2119,23 @@ impl<T: VectorType> PipelineOperator<T> for WeightedShortestPathsOperator {
                 else {
                     continue;
                 };
-                let mut row = NodeRow::new(target);
-                row.provenance.min_depth = Some(path.nodes.len().saturating_sub(1));
-                row.path = Some(path.nodes);
-                row.path_count = Some(1);
-                row.provenance.source_ids = vec![source.id];
-
+                row.provenance.source_ids.push(source.id);
+                if best.as_ref().is_none_or(|(previous, path)| {
+                    cost.compare(previous).then_with(|| nodes.cmp(path)).is_lt()
+                }) {
+                    best = Some((cost, nodes));
+                }
+            }
+            if let Some((cost, nodes)) = best {
+                row.path_count = Some(row.provenance.source_ids.len());
+                row.provenance.source_ids.sort_unstable();
+                row.provenance.source_ids.dedup();
+                row.provenance.min_depth = Some(nodes.len().saturating_sub(1));
+                row.path = Some(nodes);
                 row.set_graph_metric(
                     GraphMetric::WeightedDistance,
                     ScoreValue {
-                        value: path.cost,
+                        value: cost.finite_value()?,
                         kind: ScoreKind::Exact,
                     },
                 )?;
@@ -2262,10 +2295,10 @@ impl<T: VectorType> PipelineOperator<T> for BoundedAllPaths {
 
     fn apply(&self, input: NodeSet, context: &mut PipelineContext<'_, T>) -> Result<NodeSet> {
         let mut output = Vec::new();
-        let mut consumed_nodes = 0usize;
-        let mut consumed_edges = 0usize;
+        let mut metrics = crate::graph::budget::TraversalMetrics::default();
         for target in unique_path_targets(&self.targets) {
             let mut row = NodeRow::new(target);
+            let mut truncated = false;
             let mut count = 0usize;
             let mut sum = crate::numeric::ExactSum::default();
             let mut best_score = f32::NEG_INFINITY;
@@ -2279,16 +2312,10 @@ impl<T: VectorType> PipelineOperator<T> for BoundedAllPaths {
                         exhaustion_policy: BudgetExhaustionPolicy::Error,
                         ..context.budget.traversal
                     },
+                    metrics,
                 )?;
-                consumed_nodes = consumed_nodes.saturating_add(result.metrics.visited_nodes);
-                consumed_edges = consumed_edges.saturating_add(result.metrics.examined_edges);
-                if consumed_nodes > context.budget.traversal.max_visited_nodes
-                    || consumed_edges > context.budget.traversal.max_examined_edges
-                {
-                    return Err(TriviumError::QueryExecution(
-                        "批量全路径超过全局遍历预算 (Batch all-paths exceed global traversal budget)".into(),
-                    ));
-                }
+                metrics = result.metrics;
+                truncated |= result.truncated;
                 if result.paths.is_empty() {
                     continue;
                 }
@@ -2341,12 +2368,16 @@ impl<T: VectorType> PipelineOperator<T> for BoundedAllPaths {
             row.provenance.source_ids.dedup();
             row.path_strength = Some(ScoreValue {
                 value: f64::from(score),
-                kind: ScoreKind::Exact,
+                kind: if truncated {
+                    ScoreKind::Approximate
+                } else {
+                    ScoreKind::Exact
+                },
             });
             row.path_count = Some(count);
             output.push(row);
         }
-        context.record_graph_work(consumed_nodes, consumed_edges);
+        context.record_graph_work(metrics.visited_nodes, metrics.examined_edges);
         Ok(NodeSet::from_rows(output))
     }
 }

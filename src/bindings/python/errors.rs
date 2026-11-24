@@ -119,7 +119,7 @@ pub(super) fn write_admission_error(error: PyErr) -> PyErr {
     python_write_error(error, crate::error::WriteErrorInfo::MAINTENANCE_ADMISSION)
 }
 
-fn python_write_error(error: PyErr, write: crate::error::WriteErrorInfo) -> PyErr {
+pub(super) fn python_write_error(error: PyErr, write: crate::error::WriteErrorInfo) -> PyErr {
     Python::attach(|py| -> PyResult<()> {
         let write = serde_json::to_value(write)
             .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(error.to_string()))?;

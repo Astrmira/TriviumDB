@@ -590,3 +590,45 @@ fn 边分页保持双向顺序且自环只出现一次() {
     }
     db.close().unwrap();
 }
+
+#[test]
+fn 最短路在实例额度耗尽时拒绝并在额度恢复后返回完整路径() {
+    let dir = TestDir::new("path-workspace");
+    let runtime = triviumdb::ResourceRuntime::new(Default::default()).unwrap();
+    let mut db = Database::<f32>::open_with_runtime(
+        &dir.file("graph.tdb"),
+        triviumdb::database::Config {
+            dim: 1,
+            ..Default::default()
+        },
+        runtime.clone(),
+    )
+    .unwrap();
+    for id in 1..=3 {
+        db.insert_with_id(id, &[1.], json!({})).unwrap();
+    }
+    db.link(1, 2, "r", 1.).unwrap();
+    db.link(2, 3, "r", 1.).unwrap();
+    db.set_memory_limit(db.estimated_memory()).unwrap();
+    let budget = triviumdb::graph::budget::TraversalBudget::default();
+    for e in [
+        db.shortest_path(1, 3, 2, None).unwrap_err(),
+        db.shortest_path_bidirectional(1, 3, None, &budget)
+            .unwrap_err(),
+    ] {
+        assert_eq!(e.code(), "TDB_CAPACITY_RESERVATION_REJECTED");
+        assert_eq!(runtime.stats().reserved_workspace_bytes, 0);
+    }
+    db.set_memory_limit(0).unwrap();
+    assert_eq!(
+        db.shortest_path(1, 3, 2, None).unwrap(),
+        Some(vec![1, 2, 3])
+    );
+    assert_eq!(
+        db.shortest_path_bidirectional(1, 3, None, &budget)
+            .unwrap()
+            .path,
+        Some(vec![1, 2, 3])
+    );
+    assert_eq!(runtime.stats().reserved_workspace_bytes, 0);
+}

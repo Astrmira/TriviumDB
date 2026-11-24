@@ -631,28 +631,14 @@ fn execute_tql_context_inner<T: VectorType>(
             executable.explain = false;
             executable.analyze = false;
             if uses_pipeline(&executable) {
-                let (set, name, aliases, profile, workspaces) =
-                    execute_pipeline_set(&executable, memtable, true, &limits)?;
-                limits.compose_memory(&executable, memtable, &memory, &workspaces);
-                let mut rows = set.into_rows();
-                rows.truncate(admit_input_rows(
+                let (returned, profile) = project_pipeline(
                     &executable,
                     memtable,
                     &limits,
-                    rows.len(),
-                )?);
-                let inputs = rows
-                    .iter()
-                    .map(returning::Input::Pipeline)
-                    .collect::<Vec<_>>();
-                let scope = returning::Scope {
-                    memory: &memory,
-                    query: &executable,
-                    mt: memtable,
-                    limits: &limits,
-                    pipeline: Some((&name, &aliases)),
-                };
-                let returned = returning::finish(&inputs, &scope)?;
+                    &memory,
+                    true,
+                    returning::finish,
+                )?;
                 return Ok(generate_explain_plan(
                     query,
                     memtable,
@@ -863,6 +849,7 @@ fn test_parallelism_budget() -> crate::query::parallel::QueryParallelismBudget {
 struct PipelineExecutionProfile {
     plan: crate::query::cascades::CascadesPlan,
     metrics: Vec<crate::query::pipeline::PipelineStageMetrics>,
+    return_actuals: Option<serde_json::Value>,
 }
 
 type PipelineSetResult = (
@@ -870,6 +857,7 @@ type PipelineSetResult = (
     String,
     std::collections::BTreeSet<String>,
     Option<PipelineExecutionProfile>,
+    Arc<crate::request::PayloadMeter>,
     Vec<crate::resources::RequestWorkspace>,
 );
 
@@ -1730,8 +1718,63 @@ fn execute_pipeline_set<T: VectorType>(
     let execution_profile = profile.then_some(PipelineExecutionProfile {
         plan,
         metrics: context.metrics,
+        return_actuals: None,
     });
-    Ok((set, current_name, columns, execution_profile, workspaces))
+    Ok((
+        set,
+        current_name,
+        columns,
+        execution_profile,
+        context.payload_meter,
+        workspaces,
+    ))
+}
+
+/// 节点、标量和执行计划共用最终投影；账本及管线工作区持续到语言无关的返回值构造完成。
+fn project_pipeline<T: VectorType, R>(
+    query: &TqlQuery,
+    mt: &MemTable<T>,
+    limits: &ExecutionContext,
+    memory: &QueryMemory,
+    profile: bool,
+    project: impl FnOnce(
+        &[returning::Input<'_, T>],
+        &returning::Scope<'_, T>,
+    ) -> Result<Vec<R>, TriviumError>,
+) -> Result<(Vec<R>, Option<PipelineExecutionProfile>), TriviumError> {
+    let (set, name, aliases, mut execution, meter, workspaces) =
+        execute_pipeline_set(query, mt, profile, limits)?;
+    let _scope = meter.enter();
+    let before = profile.then(|| (Instant::now(), meter.usage()));
+    limits.compose_memory(query, mt, memory, &workspaces);
+    let mut rows = set.into_rows();
+    rows.truncate(admit_input_rows(query, mt, limits, rows.len())?);
+    let inputs = rows
+        .iter()
+        .map(returning::Input::Pipeline)
+        .collect::<Vec<_>>();
+    let scope = returning::Scope {
+        memory,
+        query,
+        mt,
+        limits,
+        pipeline: Some((&name, &aliases)),
+    };
+    let result = project(&inputs, &scope);
+    meter
+        .check()
+        .map_err(|e| limits.error(e, QueryErrorStage::Execute, SourceSelector::Return))?;
+    let result = result?;
+    if let (Some(execution), Some((start, (lookups, bytes)))) = (&mut execution, before) {
+        let (end_lookups, end_bytes) = meter.usage();
+        execution.return_actuals = Some(serde_json::json!({
+            "operator": "return", "input_rows": inputs.len(), "actual_rows": result.len(),
+            "elapsed_ns": start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+            "payload_lookups": end_lookups - lookups, "payload_parsed_bytes": end_bytes - bytes,
+            "estimated_rows": null, "estimate_error_ratio": null, "estimate_source": null, "estimate_confidence": null,
+        }));
+    }
+    Ok((result, execution))
 }
 
 fn execute_pipeline_node_query<T: VectorType>(
@@ -1747,23 +1790,10 @@ fn execute_pipeline_node_query<T: VectorType>(
             "节点结果 API 无法承载标量列，请使用 tql_values (Node-only result API cannot carry scalar columns; use tql_values)".into(),
         ));
     }
-    let (set, current_name, columns, _, workspaces) =
-        execute_pipeline_set(query, mt, false, &limits)?;
-    limits.compose_memory(query, mt, memory, &workspaces);
-    let mut rows = set.into_rows();
-    rows.truncate(admit_input_rows(query, mt, &limits, rows.len())?);
-    let inputs = rows
-        .iter()
-        .map(returning::Input::Pipeline)
-        .collect::<Vec<_>>();
-    let scope = returning::Scope {
-        memory,
-        query,
-        mt,
-        limits: &limits,
-        pipeline: Some((&current_name, &columns)),
-    };
-    returning::into_nodes(returning::finish(&inputs, &scope)?, &inputs, &scope)
+    project_pipeline(query, mt, &limits, memory, false, |inputs, scope| {
+        returning::into_nodes(returning::finish(inputs, scope)?, inputs, scope)
+    })
+    .map(|(rows, _)| rows)
 }
 
 fn json_to_tql_value<T>(value: serde_json::Value) -> TqlValue<T> {
@@ -1876,23 +1906,8 @@ fn execute_tql_values_context_inner<T: VectorType>(
         return returning::finish(&inputs, &scope)
             .map(|rows| rows.into_iter().map(|row| row.values).collect());
     }
-    let (set, current_name, columns, _, workspaces) =
-        execute_pipeline_set(query, mt, false, &limits)?;
-    limits.compose_memory(query, mt, &memory, &workspaces);
-    let mut rows = set.into_rows();
-    rows.truncate(admit_input_rows(query, mt, &limits, rows.len())?);
-    let inputs = rows
-        .iter()
-        .map(returning::Input::Pipeline)
-        .collect::<Vec<_>>();
-    let scope = returning::Scope {
-        memory: &memory,
-        query,
-        mt,
-        limits: &limits,
-        pipeline: Some((&current_name, &columns)),
-    };
-    returning::finish(&inputs, &scope).map(|rows| rows.into_iter().map(|row| row.values).collect())
+    let (rows, _) = project_pipeline(query, mt, &limits, &memory, false, returning::finish)?;
+    Ok(rows.into_iter().map(|row| row.values).collect())
 }
 
 fn execute_single_edge_values<T: VectorType>(
@@ -2269,6 +2284,7 @@ enum BoundMetric {
     Path,
     PathStrength,
     PathCount,
+    PathTruncated,
     PathRank,
     Depth,
     GraphScore,
@@ -2284,11 +2300,12 @@ enum BoundMetric {
 }
 
 impl BoundMetric {
-    const ALL: [Self; 27] = [
+    const ALL: [Self; 28] = [
         Self::Similarity,
         Self::Path,
         Self::PathStrength,
         Self::PathCount,
+        Self::PathTruncated,
         Self::PathRank,
         Self::Depth,
         Self::GraphScore,
@@ -2362,6 +2379,9 @@ impl BoundMetric {
             Self::PairRight => row.pair.map(|v| runtime_u64(v.1)),
             Self::Path => row.path.clone().map(RuntimeValue::Path),
             Self::PathCount => row.path_count.map(|count| runtime_u64(count as u64)),
+            Self::PathTruncated => row.path_strength.map(|score| {
+                RuntimeValue::Bool(score.kind == crate::query::pipeline::ScoreKind::Approximate)
+            }),
             Self::PathRank => row.path_rank.map(|rank| runtime_u64(rank as u64)),
             metric => metric.score(row).map(|s| RuntimeValue::Float(s.value)),
         }
@@ -2933,6 +2953,7 @@ fn eval_pipeline_row_expr<T: VectorType>(
         }
         TqlExpr::PathStrength { var } => BoundMetric::PathStrength.value(row, var),
         TqlExpr::PathCount { var } => BoundMetric::PathCount.value(row, var),
+        TqlExpr::PathTruncated { var } => BoundMetric::PathTruncated.value(row, var),
         TqlExpr::Path { var } => BoundMetric::Path.value(row, var),
         TqlExpr::PathLength { var } => match BoundMetric::Path.value(row, var) {
             RuntimeValue::Path(path) => runtime_u64(path.len().saturating_sub(1) as u64),
@@ -3599,6 +3620,7 @@ fn eval_tql_expr<'a, T: VectorType>(
         | TqlExpr::Depth { .. }
         | TqlExpr::PathStrength { .. }
         | TqlExpr::PathCount { .. }
+        | TqlExpr::PathTruncated { .. }
         | TqlExpr::Community { .. } => RuntimeValue::Null,
         TqlExpr::Property { var, field } => {
             if let Some(&idx) = var_map.get(var)
@@ -3651,6 +3673,7 @@ fn eval_tql_expr_single(expr: &TqlExpr, id: NodeId, payload: &serde_json::Value)
         | TqlExpr::Depth { .. }
         | TqlExpr::PathStrength { .. }
         | TqlExpr::PathCount { .. }
+        | TqlExpr::PathTruncated { .. }
         | TqlExpr::Community { .. }
         | TqlExpr::Path { .. }
         | TqlExpr::PathLength { .. }
@@ -3906,6 +3929,7 @@ fn extract_order_key<T>(expr: &TqlExpr, row: &HashMap<String, Node<T>>) -> Runti
         | TqlExpr::Depth { .. }
         | TqlExpr::PathStrength { .. }
         | TqlExpr::PathCount { .. }
+        | TqlExpr::PathTruncated { .. }
         | TqlExpr::Community { .. }
         | TqlExpr::Path { .. }
         | TqlExpr::PathLength { .. }
@@ -4029,6 +4053,7 @@ fn expr_first_var(expr: &TqlExpr) -> Option<&String> {
         | TqlExpr::Depth { var }
         | TqlExpr::PathStrength { var }
         | TqlExpr::PathCount { var }
+        | TqlExpr::PathTruncated { var }
         | TqlExpr::Community { var }
         | TqlExpr::Path { var }
         | TqlExpr::PathLength { var }
@@ -4071,6 +4096,7 @@ fn collect_vars_from_kind(kind: &ReturnExprKind, out: &mut Vec<String>) {
                 | TqlExpr::Depth { var }
                 | TqlExpr::PathStrength { var }
                 | TqlExpr::PathCount { var }
+                | TqlExpr::PathTruncated { var }
                 | TqlExpr::Community { var }
                 | TqlExpr::Path { var }
                 | TqlExpr::PathLength { var }
@@ -4539,7 +4565,7 @@ fn generate_explain_plan<T: VectorType>(
                 "estimated_memo_bytes".into(),
                 serde_json::json!(profile.plan.estimated_memo_bytes),
             );
-            let stages = profile
+            let mut stages = profile
                 .metrics
                 .iter()
                 .enumerate()
@@ -4569,6 +4595,7 @@ fn generate_explain_plan<T: VectorType>(
                     })
                 })
                 .collect::<Vec<_>>();
+            stages.extend(profile.return_actuals);
             plan.insert("pipeline_stage_actuals".into(), serde_json::json!(stages));
         }
     } else {
@@ -4645,6 +4672,7 @@ fn format_tql_expr(expr: &TqlExpr) -> String {
         TqlExpr::Depth { var } => format!("depth({var})"),
         TqlExpr::PathStrength { var } => format!("path_strength({var})"),
         TqlExpr::PathCount { var } => format!("path_count({var})"),
+        TqlExpr::PathTruncated { var } => format!("path_truncated({var})"),
         TqlExpr::Community { var } => format!("community({var})"),
         TqlExpr::Path { var } => format!("path({var})"),
         TqlExpr::PathLength { var } => format!("path_length({var})"),

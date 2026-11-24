@@ -8,6 +8,9 @@
 
 本页记录下一批变更。最近的预发布版本见 [0.9.4-beta.1 双语说明](0.9.4-beta.1.md)，最近的正式版本见 [0.9.3 双语说明](0.9.3.md)。
 
+- 多起点加权最短路按精确成本选路。批量路径查询共享遍历额度，`path_truncated()` 标明全路径聚合是否受枚举上限影响。最短路工作区按实例及共享额度准入。管线最终投影计入 Payload 预算与 PROFILE。
+- 浮点认知阶段检查 dtype、取消和工作区，残差召回只保留 Top-K。DPP 按实际向量计算对角质量。Rust 的 `nmf_multiplicative_update` 返回 `Result<(Vec<f32>, Vec<f32>)>`，调用方可用 `?` 传播矩阵形状错误。
+- Node 的普通与 Prepared TQL 均声明返回 `QueryRow[]`，节点投影的 ID 为字符串。Python 传播行构造错误，成功提交后的回执转换错误标记为已提交。代际租约保留 I/O 错误，CLI 按检查点状态标记 WAL。
 - 普通 TQL 绑定按稳定身份选择 DISTINCT 代表行；普通 MATCH 完成语义校验后跳过空页扫描。控制台 MATCH CREATE 按新增节点与边收取写操作额度。
 - 条件更新及属性索引复核在解码旧 Payload 前预留空间。并发图快照、全量 ID 枚举和 GraphFirst 去重计入实例与共享额度。Node 两个批量检索入口通过 Promise 返回资源准入和取消错误。
 - 精确余弦 Top-K 对舍入为零的分数按 ID 决胜。检索诊断分别记录 QuIVer、精确扫描和过滤回退。维度迁移保留 Pelorus 的曲率与构建配置，回填向量沿用源库的球内约束。
@@ -36,6 +39,9 @@
 
 This page tracks upcoming changes. See the [0.9.4-beta.1 prerelease notes](0.9.4-beta.1.md) and the [0.9.3 stable release notes](0.9.3.md).
 
+- Multi-source weighted paths retain exact costs through route selection. Batched paths share traversal limits, and `path_truncated()` reports when the enumeration cap affects an aggregate. Shortest paths reserve instance and shared workspace. Final pipeline projection charges the query payload budget and appears in PROFILE.
+- Floating-point cognitive stages check dtype, cancellation and workspace. Residual recall retains the top K candidates. DPP computes its quality diagonal from the actual vectors. Rust `nmf_multiplicative_update` returns `Result<(Vec<f32>, Vec<f32>)>`. Callers can propagate invalid matrix shapes with `?`.
+- Node declares `QueryRow[]` for ordinary and prepared TQL, with string IDs in projected nodes. Python propagates row conversion errors and marks post-commit receipt conversion failures as committed. Generation leases preserve I/O errors. CLI WAL status follows checkpoint state.
 - TQL selects DISTINCT representatives by stable binding identity for ordinary unranked matches and finds. Plain MATCH skips empty pages after semantic validation. Console MATCH CREATE charges the operation budget for new nodes and edges.
 - Conditional updates and property index verification reserve memory before decoding stored payloads. Concurrent graph snapshots, full ID enumeration, and GraphFirst deduplication account for both instance and shared memory. Both Node batch search methods deliver resource admission failures and cancellation through their returned promises.
 - Exact cosine Top-K breaks ties by ID when scores round to zero. Search diagnostics distinguish QuIVer, exact scans, and filtered fallback. Dimension migration preserves the Pelorus curvature and build settings so vector backfills follow the source database’s Poincaré ball constraint.

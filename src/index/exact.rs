@@ -13,9 +13,9 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 #[derive(Clone, Copy)]
-struct Candidate {
-    id: NodeId,
-    score: f32,
+pub(crate) struct Candidate {
+    pub(crate) id: NodeId,
+    pub(crate) score: f32,
 }
 
 impl PartialEq for Candidate {
@@ -42,7 +42,11 @@ impl Ord for Candidate {
     }
 }
 
-fn insert_candidate(heap: &mut BinaryHeap<Candidate>, candidate: Candidate, top_k: usize) {
+pub(crate) fn insert_candidate(
+    heap: &mut BinaryHeap<Candidate>,
+    candidate: Candidate,
+    top_k: usize,
+) {
     if heap.len() < top_k {
         heap.push(candidate);
         return;

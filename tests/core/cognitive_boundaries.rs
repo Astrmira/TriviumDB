@@ -262,3 +262,87 @@ fn 调和中心性在TQL投影排序和聚合中保留f64尺度() {
         db.close().unwrap();
     }
 }
+
+#[test]
+fn 浮点认知算子在汉明指纹库统一拒绝() {
+    let dir = TestDir::new("binary-cognitive");
+    let mut db = Database::<u64>::open(&dir.file("data.tdb"), 2).unwrap();
+    db.insert_with_id(1, &[1 << 60, 0], json!({})).unwrap();
+    for stage in [
+        "RESIDUAL s BY VECTOR [1,0] TOP 1 LAMBDA 0.1 THRESHOLD 0 ITERATIONS 2",
+        "DIVERSIFY s TOP 1 QUALITY_WEIGHT 1",
+        "TOPICS s K 1 ITERATIONS 2",
+    ] {
+        let error = db
+            .tql(&format!(
+                "SEARCH VECTOR [1,0] TOP 1 AS s WITH s {stage} AS r WITH r RETURN r.id AS id"
+            ))
+            .unwrap_err();
+        assert_eq!(error.code(), "TDB_INVALID_INPUT", "{stage}: {error}");
+    }
+}
+
+#[test]
+fn 残差准入包含宽锚点与查询工作区() {
+    use triviumdb::query::pipeline::{
+        FistaResidualRecall, NodeIdsSource, PipelineBudget, PipelineContext, execute_pipeline,
+    };
+    use triviumdb::storage::memtable::MemTable;
+    let mut mt = MemTable::<f32>::new(4096);
+    let mut anchor = vec![0.; 4096];
+    anchor[0] = 1.;
+    mt.insert_with_id(1, &anchor, json!({})).unwrap();
+    let mut query = vec![0.; 4096];
+    query[1] = 1.;
+    let op = FistaResidualRecall {
+        query,
+        top_k: 1,
+        lambda: 0.1,
+        threshold: 0.,
+        iterations: 2,
+    };
+    let mut context = PipelineContext::new(
+        &mt,
+        PipelineBudget {
+            max_node_set_bytes: 1024,
+            ..Default::default()
+        },
+    );
+    let ops: Vec<Box<dyn triviumdb::query::pipeline::PipelineOperator<f32>>> =
+        vec![Box::new(NodeIdsSource { ids: vec![1] }), Box::new(op)];
+    assert_eq!(
+        execute_pipeline(&mut context, &ops).unwrap_err().code(),
+        "TDB_QUERY_EXECUTION"
+    );
+    context.budget.max_node_set_bytes = 1024 * 1024;
+    let set = execute_pipeline(&mut context, &ops).unwrap();
+    assert_eq!(set.rows().len(), 1);
+    assert_eq!(set.rows()[0].id, 1);
+    assert_eq!(set.rows()[0].residual_score.unwrap().value, 0.);
+}
+
+#[test]
+fn 零向量仅贡献DPP正则项() {
+    use triviumdb::cognitive::dpp_greedy;
+    assert_eq!(
+        dpp_greedy(&[vec![0.], vec![0.], vec![1.]], &[1.; 3], 2, 1.),
+        [2, 0]
+    );
+}
+
+#[test]
+fn NMF拒绝缺项多项和溢出形状() {
+    use triviumdb::cognitive::nmf_multiplicative_update;
+    for (m, d, data) in [
+        (1, 2, &[1.][..]),
+        (1, 1, &[1., 0.][..]),
+        (usize::MAX, 2, &[][..]),
+    ] {
+        assert_eq!(
+            nmf_multiplicative_update(data, m, d, 1, 2, 0.01)
+                .unwrap_err()
+                .code(),
+            "TDB_INVALID_INPUT"
+        );
+    }
+}

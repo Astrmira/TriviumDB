@@ -188,7 +188,7 @@ fn dpp_大质量因子和大向量保持独立方向与稳定选择() {
 #[test]
 fn nmf_有限大数的标量分解保持原始尺度() {
     for value in [1.0f32, 1e30, f32::MAX] {
-        let (w, h) = nmf_multiplicative_update(&[value], 1, 1, 1, 8, 1e-4);
+        let (w, h) = nmf_multiplicative_update(&[value], 1, 1, 1, 8, 1e-4).unwrap();
         assert_eq!(w.len(), 1);
         assert_eq!(h.len(), 1);
         assert!(w[0].is_finite() && w[0] > 0.0);
@@ -202,7 +202,7 @@ fn nmf_有限大数的标量分解保持原始尺度() {
 fn nmf_基本分解() {
     // 3×4 矩阵，分解为 rank=2
     let v = vec![1.0, 0.0, 0.5, 0.0, 0.0, 1.0, 0.0, 0.5, 0.5, 0.5, 0.5, 0.5];
-    let (w, h) = nmf_multiplicative_update(&v, 3, 4, 2, 100, 1e-3);
+    let (w, h) = nmf_multiplicative_update(&v, 3, 4, 2, 100, 1e-3).unwrap();
     assert_eq!(w.len(), 3 * 2);
     assert_eq!(h.len(), 2 * 4);
     // 所有元素应非负
@@ -213,7 +213,7 @@ fn nmf_基本分解() {
 #[test]
 fn nmf_重建误差应下降() {
     let v = vec![1.0, 0.0, 0.0, 1.0, 0.5, 0.5];
-    let (w, h) = nmf_multiplicative_update(&v, 2, 3, 2, 200, 1e-4);
+    let (w, h) = nmf_multiplicative_update(&v, 2, 3, 2, 200, 1e-4).unwrap();
 
     // 重建: V_approx = W @ H
     let mut v_approx = [0.0f32; 6];
@@ -237,7 +237,7 @@ fn nmf_重建误差应下降() {
 #[test]
 fn nmf_1x1_退化情况() {
     let v = vec![5.0f32];
-    let (w, h) = nmf_multiplicative_update(&v, 1, 1, 1, 100, 1e-3);
+    let (w, h) = nmf_multiplicative_update(&v, 1, 1, 1, 100, 1e-3).unwrap();
     assert_eq!(w.len(), 1);
     assert_eq!(h.len(), 1);
     assert!((w[0] * h[0] - 5.0).abs() < 0.5, "1×1 分解应接近原值");

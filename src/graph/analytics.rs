@@ -747,7 +747,24 @@ pub(crate) fn weighted_dijkstra_with_work(
     work: &mut usize,
     max_work: usize,
 ) -> Result<Option<WeightedPath>> {
-    let (distances, parents) = shortest_weighted_path(
+    weighted_dijkstra_exact(graph, source, target, work, max_work)?
+        .map(|(nodes, cost)| {
+            Ok(WeightedPath {
+                nodes,
+                cost: cost.finite_value()?,
+            })
+        })
+        .transpose()
+}
+
+pub(crate) fn weighted_dijkstra_exact(
+    graph: &GraphWorkspace,
+    source: NodeId,
+    target: NodeId,
+    work: &mut usize,
+    max_work: usize,
+) -> Result<Option<(Vec<NodeId>, PathCost)>> {
+    let (mut distances, parents) = shortest_weighted_path(
         graph,
         source,
         Some(target),
@@ -756,15 +773,9 @@ pub(crate) fn weighted_dijkstra_with_work(
         work,
         max_work,
     )?;
-    distances
-        .get(&target)
-        .map(|cost| {
-            Ok(WeightedPath {
-                nodes: weighted_path_to(&parents, target),
-                cost: cost.finite_value()?,
-            })
-        })
-        .transpose()
+    Ok(distances
+        .remove(&target)
+        .map(|cost| (weighted_path_to(&parents, target), cost)))
 }
 
 pub fn harmonic_centrality(

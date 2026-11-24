@@ -67,6 +67,57 @@ fn 扩散执行中取消归还工作区并允许新请求完整重试() {
     assert_eq!(runtime.stats().reserved_workspace_bytes, 0);
 }
 
+#[test]
+fn 认知计算中取消会归还请求额度且同一实例可以重试() {
+    let dir = super::support::TestDir::new("cognitive-cancellation");
+    let runtime = triviumdb::ResourceRuntime::new(Default::default()).unwrap();
+    let mut db = Database::<f32>::open_with_runtime(
+        &dir.file("data.tdb"),
+        triviumdb::database::Config {
+            dim: 2,
+            ..Default::default()
+        },
+        runtime.clone(),
+    )
+    .unwrap();
+    db.insert_with_id(1, &[1., 0.], json!({})).unwrap();
+    db.insert_with_id(2, &[0., 1.], json!({})).unwrap();
+    for (name, stage) in [
+        (
+            "residual",
+            "RESIDUAL s BY VECTOR [0,1] TOP 1 LAMBDA 0.1 THRESHOLD 0 ITERATIONS 2",
+        ),
+        ("diversify", "DIVERSIFY s TOP 1 QUALITY_WEIGHT 1"),
+        ("topics", "TOPICS s K 1 ITERATIONS 2"),
+    ] {
+        let query =
+            format!("SEARCH VECTOR [1,0] TOP 1 AS s WITH s {stage} AS r WITH r RETURN r.id AS id");
+        let request = triviumdb::sdk::RequestContext::new(name, Default::default(), false).unwrap();
+        let gate = triviumdb::test_hooks::pause_at_request(
+            ConcurrencyPoint::CognitiveStep,
+            request.request_id(),
+        );
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| request.run(|| db.tql(&query)));
+            gate.wait_until_arrived();
+            assert!(runtime.stats().reserved_workspace_bytes > 0);
+            request.cancel();
+            gate.release();
+            assert_eq!(
+                worker.join().unwrap().unwrap_err().code(),
+                "TDB_QUERY_CANCELLED"
+            );
+        });
+        assert_eq!(runtime.stats().reserved_workspace_bytes, 0);
+        let rows = db.tql(&query).unwrap();
+        assert_eq!(rows.len(), 1);
+        let expected = if name == "residual" { 2 } else { 1 };
+        assert!(
+            matches!(rows[0]["id"],triviumdb::query::tql_executor::TqlValue::Int(id) if id==expected)
+        );
+    }
+}
+
 fn test_serial_guard() -> MutexGuard<'static, ()> {
     static SERIAL: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
     SERIAL

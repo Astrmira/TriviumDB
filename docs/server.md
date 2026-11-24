@@ -224,7 +224,7 @@ curl -X DELETE http://127.0.0.1:8080/v1/indexes/delete \
   -d '{"kind":"hash","fields":["type"]}'
 ```
 
-可用 kind 为 `hash`、`ordered`、`bitmap` 和 `composite`。单字段索引必须恰好提供一个字段；复合索引至少两个字段。修改操作统一进入 Writer Actor，并推进 Server generation。
+`hash`、`ordered`、`bitmap`、`ngram` 和 `unique` 接受一个字段。`composite` 和 `unique_composite` 至少需要两个字段。修改操作统一进入 Writer Actor，并推进 Server generation。
 
 ### 二进制向量搜索
 

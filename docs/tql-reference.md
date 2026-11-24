@@ -266,7 +266,9 @@ Rust 直接构造 `TqlQuery` 时需提供 `graph_scope`，直接构造 `EdgeView
 
 `FIND` 入口对全库节点的 JSON Payload 进行条件过滤，功能完全覆盖旧的 `db.filter()` 和 `db.filter_where()` API。无可用属性索引时，Planner 在 `EXPLAIN` 中标记 `cold_payload_scan`；执行器按 Payload 目录顺序访问冷数据，并受 lookup/parse 工作预算约束。高频字段应建立 Hash、Ordered ART、Composite ART、Bitmap 或 N-gram 索引，先缩小 NodeId 候选再执行必要的 residual predicate。
 
-管线的 Payload lookup 和实际解析字节按本次查询执行计量，工作线程继承所属查询的账本。每次读取已有 Payload 均按原始 JSON 长度扣除解析字节预算，冷读与缓存命中使用相同额度。PROFILE 仅在实际解码时记录解析字节。PROFILE 中的 Payload 用量记录当前查询的累计值，实例统计维护独立的累计口径。复用执行上下文时重新建立本次账本和阶段统计。
+浮点认知阶段 `RESIDUAL`、`DIVERSIFY`、`TOPICS` 支持 f16 和 f32。u64 指纹使用汉明检索，请求浮点认知阶段返回 `TDB_INVALID_INPUT`。DPP 使用归一化向量的 Gram 核和对角正则项，零向量的质量核对角贡献为零。
+
+管线的 Payload lookup 和实际解析字节按本次查询执行计量，工作线程继承所属查询的账本。每次读取已有 Payload 均按原始 JSON 长度扣除解析字节预算，冷读与缓存命中使用相同额度。PROFILE 仅在实际解码时记录解析字节。PROFILE 中的 Payload 用量记录当前查询的累计值，实例统计维护独立的累计口径。复用执行上下文时重新建立本次账本和阶段统计。最终投影与排序沿用本次查询的 Payload 额度。`EXPLAIN ANALYZE` 在 `pipeline_stage_actuals` 的 `return` 阶段显示对应的读取次数和解析字节。
 
 ### 基础语法
 
@@ -917,6 +919,8 @@ Path 是一等 NodeId 序列，`path_length` 返回边数。`WEIGHTED_PATHS` 使
 集合阶段支持 `UNION/INTERSECT/EXCEPT`。在 `UNION … IDS` 中，左右共有的节点沿用左侧绑定与分数，仅在右侧出现的节点各补入一次。普通 NodeSet 按 NodeId 稳定归一化。路径与集合算法均受节点数、字节和遍历预算约束。
 
 `ALL_PATHS` 的 `DEPTH` 限定查询范围，重复的 `TO` 节点只处理一次。`AVOID` 排除经过指定节点的所有路径，包含起点和终点。`LABELS` 要求边标签依次匹配整个序列。执行预算阻止继续扩展时，TQL 返回 `TDB_TRAVERSAL_BUDGET_EXCEEDED`，Core `bounded_all_paths` 的 Partial 策略通过 `truncated` 标记部分结果。
+
+`path_truncated(r)` 在 `ALL_PATHS` 的任一起终点对还有超出 `PATHS` 上限的路径时返回 true，枚举完整时返回 false。计数、最大值、总和和平均值均基于已枚举路径。批量最短路径和全路径查询的访问节点及扫描边额度由所有起终点对共享。
 
 最短路径、加权最短路径和 Yen 路径查询也按唯一目标执行。全路径强度与计数按同一目标的全部来源计算。平均边权和跨路径聚合精确累加后舍入为 `f32`。乘积聚合返回乘积最大的代表路径，平均边权聚合返回平均边权最大的代表路径。同分按节点序列决胜。TQL 路径聚合分数超出有限表示范围时返回查询错误。
 

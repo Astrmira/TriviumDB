@@ -75,6 +75,7 @@ pub enum ConcurrencyPoint {
     DirectWriteWalLockAcquired,
     ExactScanStep,
     GraphAlgorithmStep,
+    CognitiveStep,
     GraphAlgorithmIteration,
     BeforeDocumentIndexAccountingReset,
     DocumentPositionStep,

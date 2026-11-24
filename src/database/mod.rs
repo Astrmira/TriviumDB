@@ -2161,13 +2161,19 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         label: Option<&str>,
     ) -> Result<Option<Vec<NodeId>>> {
         self.read_operation(|| {
+            let mt = read_or_recover(&self.memtable);
+            mt.ensure_readable()?;
+            let mut workspace = mt.reserve_instance_workspace(0)?;
             crate::graph::pathfinding::shortest_path_checked(
-                &*read_or_recover(&self.memtable),
+                &*mt,
                 source,
                 target,
                 max_depth,
                 label,
-                |_, _| crate::request::check_current(),
+                |nodes, _| {
+                    crate::request::check_current()?;
+                    crate::graph::pathfinding::admit_path_nodes(&mt, &mut workspace, nodes)
+                },
             )
         })?
     }
@@ -2179,14 +2185,15 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         label: Option<&str>,
         budget: &crate::graph::budget::TraversalBudget,
     ) -> Result<crate::graph::pathfinding::ShortestPathOutput> {
-        let _operation = self.enter_operation()?;
-        crate::graph::pathfinding::shortest_path_bidirectional(
-            &read_or_recover(&self.memtable),
-            source,
-            target,
-            label,
-            budget,
-        )
+        self.read_operation(|| {
+            crate::graph::pathfinding::shortest_path_bidirectional(
+                &read_or_recover(&self.memtable),
+                source,
+                target,
+                label,
+                budget,
+            )
+        })?
     }
 
     pub fn graph_stats(&self) -> Result<crate::storage::memtable::GraphStats> {

@@ -1419,6 +1419,8 @@ mod guard_tests {
             let mut db = Database::<f32>::open(path.to_str().unwrap(), 2).unwrap();
             db.insert_with_id(1, &[1., 0.], serde_json::json!({"state":"old"}))
                 .unwrap();
+            let path_admission = db.enter_operation().unwrap();
+            let facts = std::sync::Arc::clone(&db.memtable);
             let handle = db.search_handle();
             let barrier = pause_at(ConcurrencyPoint::BeforeSearchReadLock);
             let query = std::thread::spawn(move || {
@@ -1440,6 +1442,18 @@ mod guard_tests {
             let result = db.commit_tx(tx);
             drop(failure);
             barrier.release();
+            // 已取得生命周期准入的路径读取，在写锁释放后必须看到同一个恢复边界。
+            let path_error = crate::graph::pathfinding::shortest_path_bidirectional(
+                &super::super::read_or_recover(&facts),
+                1,
+                1,
+                None,
+                &Default::default(),
+            )
+            .unwrap_err();
+            assert!(matches!(path_error, TriviumError::WalClosed));
+            drop(path_admission);
+            drop(facts);
             let result_query = query.join().unwrap();
             assert!(matches!(
                 result.unwrap_err().underlying(),

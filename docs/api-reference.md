@@ -945,7 +945,7 @@ db.batchInsert(matrix, [{ name: 'a' }, { name: 'b' }])
 const hits = await db.searchBatch(matrix, 1, 0, 0, true)
 ```
 
-> **精度提醒**　`BigUint64Array` 输入保留全部 64 位。`get().vector` 沿用 JavaScript `number[]` 表示，超过安全整数范围的分量可能舍入。
+> **精度提醒**　`BigUint64Array` 输入保留全部 64 位。`get().vector` 沿用 JavaScript `number[]` 表示，每个分量须能精确表示为 JavaScript `number`，否则返回 `TDB_INVALID_INPUT`。例如，`2^53` 可精确读出，`2^53 + 1` 会触发该错误。
 
 Node.js 接口返回 Promise，检索工作在后台线程执行。参数依次为 `queryVectors`、`topK`、`parallelism`、`minScore`、`exact`。
 
@@ -1454,6 +1454,8 @@ SEARCH 向量的字面量与数值参数按数据库 dtype 转换，u64 分量�
 | List | list | array |
 | Object | dict，嵌套整数保持精度 | object，嵌套超安全整数转十进制字符串 |
 | Null | None | null |
+
+Node 的普通查询与 Prepared 查询均返回 `QueryRow[]`。节点投影中的 Payload 和边投影中的 Metadata 沿用原始文档的整数表示，超出安全整数范围的整数可读为 `bigint`。直接投影同一整数属性时，标量列按上表返回十进制字符串。
 
 Rust 使用 `TqlValue::Object(serde_json::Map<String, serde_json::Value>)` 承载对象。数组和对象作为完整 JSON 值参与空值判断、COALESCE、去重与分组；节点和边按实体身份参与表达式求值。
 

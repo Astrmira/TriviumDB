@@ -179,15 +179,12 @@ export interface JsNodeView<T = any> {
   numEdges: number;
 }
 
-/**
- * Cypher 查询的一行结果
- * 键名为 MATCH 语句中你定义的绑定变量（如 a, b），值为匹配到的节点视图摘要
- */
-export type QueryRow = Record<string, {
-  id: number;
-  payload: any;
-  numEdges: number;
-}>;
+/** TQL 中节点、边的端点和路径节点均使用十进制字符串 ID。 */
+type QueryData<Wide extends bigint = never> = null | boolean | number | string | Wide | QueryData<Wide>[] | { [key: string]: QueryData<Wide> };
+export type QueryNode = { id: string; payload: QueryData<bigint>; numEdges: number };
+export type QueryEdge = { type: 'edge'; source: string; target: string; label: string; weight: number; metadata: QueryData<bigint>; graph_id?: string };
+export type QueryValue = QueryData | QueryNode | QueryEdge | string[];
+export type QueryRow = Record<string, QueryValue>;
 
 // ==========================================
 // MongoDB 风格的 Filter 定义
@@ -966,7 +963,7 @@ export class TriviumDB {
    * ```
    * DOCUMENTS来源支持文档读取配置，GRAPH前缀选择图作用域，命名边结果携带graph_id。
    */
-  tql(query: string): any[];
+  tql(query: string): QueryRow[];
 
   /** 同步执行 Console v1 JSON 请求；节点 ID 与 u64 向量分量使用十进制字符串。 */
   consoleRequest(session: ConsoleSession, requestJson: string): string;
@@ -990,7 +987,7 @@ export class TriviumDB {
   /** 命名图、共享成员、独立边及显式联合查询的Core JSON入口。 */
   graphRequest(requestJson: string): string;
   prepareTql(query: string): PreparedTql;
-  executePreparedTql(prepared: PreparedTql, parameters: Record<string, string | number | bigint | boolean | null>): any[];
+  executePreparedTql(prepared: PreparedTql, parameters: Record<string, string | number | bigint | boolean | null>): QueryRow[];
 
   /**
    * 执行 TQL 写操作（CREATE / SET / DELETE / DETACH DELETE）
