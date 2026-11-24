@@ -14,6 +14,11 @@ function verifyHybridWeights(root, TriviumDB) {
     db.indexText(2, 'rareword')
     db.buildTextIndex()
     const hybrid = alpha => db.searchHybrid([1, 0], 'rareword', 2, 0, 0, alpha, undefined, true)
+    assert.deepEqual(db.searchHybrid([1, 0], 'rareword', 2, 0, 0, 0.2, undefined, false, 2).map(hit => hit.id), [2, 1])
+    for (const width of [0, -1, 1.5, '8']) {
+      assert.throws(() => db.searchHybrid([1, 0], 'rareword', 2, 0, 0, 0.2, undefined, false, width),
+        error => error.code === 'TDB_INVALID_INPUT')
+    }
     assert.deepEqual(hybrid(1), db.searchExact([1, 0], 2))
     assert.deepEqual(hybrid(0).map(hit => hit.id), [2])
     assert.deepEqual(hybrid(0.2).map(hit => hit.id), [2, 1])

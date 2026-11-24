@@ -56,6 +56,14 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> DatabaseRea
         Database::open_read_only(path, dim).map(|inner| Self { inner })
     }
 
+    pub(crate) fn open_declared_generation(
+        path: &str,
+        dim: usize,
+        manifest: GenerationManifest,
+    ) -> Result<Self> {
+        Database::open_declared_generation(path, dim, manifest).map(|inner| Self { inner })
+    }
+
     pub fn open_immutable(path: &str, dim: usize) -> Result<Self> {
         Database::open_immutable(path, dim).map(|inner| Self { inner })
     }

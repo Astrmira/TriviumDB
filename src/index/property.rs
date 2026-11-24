@@ -1616,6 +1616,62 @@ impl PropertyIndexRegistry {
             .collect()
     }
 
+    // 对有界复合键目录计算列对统计，直接借用索引编码。超出规划工作量时沿用常规选择率。
+    pub(crate) fn column_pair_stats<W>(
+        &self,
+        left: &str,
+        right: &str,
+        reserve: impl FnOnce(usize) -> Result<W>,
+    ) -> Option<ColumnPairStats> {
+        let (fields, index) = self
+            .composite_indexes
+            .iter()
+            .filter(|(definition, index)| {
+                index.incomplete_count == 0
+                    && index.entries.len() <= 1024
+                    && definition.0.iter().any(|f| f == left)
+                    && definition.0.iter().any(|f| f == right)
+            })
+            .min_by_key(|(definition, index)| (index.entries.len(), *definition))?;
+        let _lease = reserve(index.entries.len().saturating_mul(256)).ok()?;
+        let left_pos = fields.0.iter().position(|field| field == left)?;
+        let right_pos = fields.0.iter().position(|field| field == right)?;
+        let (mut l, mut r, mut joint) = (HashSet::new(), HashSet::new(), HashSet::new());
+        let mut examined_bytes = 0usize;
+        for (mut bytes, _) in index.entries.entries(false) {
+            crate::request::check_current().ok()?;
+            examined_bytes = examined_bytes.checked_add(bytes.len())?;
+            if examined_bytes > 1024 * 1024 {
+                return None;
+            }
+            let (mut a, mut b) = (None, None);
+            for pos in 0..=left_pos.max(right_pos) {
+                let (length, rest) = bytes.split_at_checked(4)?;
+                let length = u32::from_be_bytes(length.try_into().ok()?) as usize;
+                let (value, rest) = rest.split_at_checked(length)?;
+                if pos == left_pos {
+                    a = Some(value);
+                }
+                if pos == right_pos {
+                    b = Some(value);
+                }
+                bytes = rest;
+            }
+            let (a, b) = (a?, b?);
+            l.insert(a);
+            r.insert(b);
+            joint.insert((a, b));
+        }
+        Some(ColumnPairStats {
+            left_field: left.into(),
+            right_field: right.into(),
+            left_distinct: l.len(),
+            right_distinct: r.len(),
+            joint_distinct: joint.len(),
+            sampled_rows: index.summary.entries,
+        })
+    }
+
     pub fn stats(&self) -> Vec<PropertyIndexStats> {
         let mut stats: Vec<_> =
             self.indexes

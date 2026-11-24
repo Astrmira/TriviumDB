@@ -779,7 +779,7 @@ ORDER BY score DESC
 | `AC` | 使用 Aho-Corasick 关键词命中召回 |
 | `HYBRID` | 将 BM25 与 AC 分数相加，`AC_WEIGHT` 控制 AC 权重 |
 
-可选参数为 `K1`、`B` 和 `AC_WEIGHT`。结果按 `score DESC, NodeId ASC` 确定性排序。查询文本最多 4096 字节、按空白拆分最多 256 个 token；`TOP` 和文本索引规模受管线节点预算约束，越界时 fail-closed。
+可选参数为 `K1`、`B` 和 `AC_WEIGHT`。结果按 `score DESC, NodeId ASC` 确定性排序。查询文本最多 4096 字节、按空白拆分最多 256 个 token；`TOP`、所选正文或关键词索引的节点数，以及混合召回的去重候选数受管线节点预算约束。扫描 posting 期间响应取消和截止期限。
 
 ### DPP 多样化
 
@@ -1045,7 +1045,7 @@ TQL 文本
   → TqlValueResult（Node、Edge、标量、Path、List、Object、Null）
 ```
 
-`FIND` 可选择主键、Hash/Ordered/Composite/Bitmap、索引交集或 Fast Tags + 精确校验；`SEARCH` 可选择可用的向量访问路径与 exact fallback；`MATCH`、图算法和路径阶段复用 `.idx` 中的图目录组件或内存图目录。Cascades 在有界计划空间内依据统计信息和成本模型确定执行方案。
+`FIND` 可选择主键、Hash/Ordered/Composite/Bitmap、索引交集或 Fast Tags + 精确校验；`SEARCH` 可选择可用的向量访问路径与 exact fallback；`MATCH`、图算法和路径阶段复用 `.idx` 中的图目录组件或内存图目录。Cascades 在有界计划空间内依据统计信息和成本模型确定执行方案。对于双字段过滤，规划器可以从组合索引键计算联合统计。索引键数量或总字节数超过统计上限时，规划器使用其他可用统计估算成本，查询结果保持一致。
 
 ---
 

@@ -23,7 +23,7 @@ impl<'a> WorkBudget<'a> {
         }
     }
 
-    fn step(&mut self) -> Result<(), TriviumError> {
+    pub(super) fn step(&mut self) -> Result<(), TriviumError> {
         if let Some(control) = self.control {
             control.check()?;
         }

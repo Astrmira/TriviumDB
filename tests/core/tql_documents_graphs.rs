@@ -480,6 +480,14 @@ fn 组合查询在文档图读取与导航处取消均归还额度且允许完�
     use triviumdb::test_hooks::{ConcurrencyPoint, pause_at_request};
     for (point, query) in [
         (
+            ConcurrencyPoint::TextPosting,
+            "TEXT BM25 'alpha' TOP 2 AS n WITH n RETURN n.id AS id ORDER BY id",
+        ),
+        (
+            ConcurrencyPoint::TextPosting,
+            "TEXT AC 'alpha' TOP 2 AS n WITH n RETURN n.id AS id ORDER BY id",
+        ),
+        (
             ConcurrencyPoint::NamedGraphRead,
             "GRAPH {graph_ids:['events']} MATCH (n) RETURN n.id AS id ORDER BY id",
         ),
@@ -497,8 +505,15 @@ fn 组合查询在文档图读取与导航处取消均归还额度且允许完�
         ),
     ] {
         let root = TestDir::new("tql-document-cancel");
-        let db = database::<f32>(&root.file("data.tdb"), "f32");
+        let mut db = database::<f32>(&root.file("data.tdb"), "f32");
+        if point == ConcurrencyPoint::TextPosting {
+            for id in [11, 21] {
+                db.index_text(id, "alpha").unwrap();
+                db.index_keyword(id, "alpha").unwrap();
+            }
+        }
         let expected = json_rows(db.tql(query).unwrap());
+        let resident = db.estimated_memory();
         let baseline = db.resource_stats().reserved_workspace_bytes;
         let context =
             triviumdb::sdk::RequestContext::new("tql-document-cancel", Default::default(), false)
@@ -510,6 +525,7 @@ fn 组合查询在文档图读取与导航处取消均归还额度且允许完�
         let worker = std::thread::spawn(move || worker_context.run(|| worker_db.tql(query)));
         gate.wait_until_arrived();
         let held = db.resource_stats().reserved_workspace_bytes;
+        let instance = db.estimated_memory();
         context.cancel();
         drop(gate);
         assert_eq!(
@@ -519,6 +535,10 @@ fn 组合查询在文档图读取与导航处取消均归还额度且允许完�
         assert!(
             held > baseline,
             "{point:?} 的持有额度 {held}，基线 {baseline}"
+        );
+        assert!(
+            instance >= resident.saturating_add(held - baseline),
+            "{point:?} 实例增量与工作区不符"
         );
         assert_eq!(db.resource_stats().reserved_workspace_bytes, baseline);
         assert_eq!(json_rows(db.tql(query).unwrap()), expected);

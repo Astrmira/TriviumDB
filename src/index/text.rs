@@ -567,18 +567,35 @@ impl TextIndex {
     pub fn search_ac(&self, query: &str) -> HashMap<NodeId, f32> {
         let mut results = HashMap::new();
         let _ = self.prepare_keywords(|_| Ok(()));
+        let _: std::result::Result<(), std::convert::Infallible> = self.visit_ac(query, |id| {
+            *results.entry(id).or_insert(0.0) += 1.0;
+            Ok(())
+        });
+        results
+    }
+
+    pub(crate) fn keyword_node_count(&self) -> usize {
+        self.keyword_nodes.len()
+    }
+
+    // 调用方先完成自动机准入，再按 posting 检查请求状态与候选预算。
+    pub(crate) fn visit_ac<E>(
+        &self,
+        query: &str,
+        mut emit: impl FnMut(NodeId) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
         if let Some(compiled) = self.ac_matcher.get() {
             let query_lower = query.to_lowercase();
             for mat in compiled.matcher.find_iter(&query_lower) {
                 let kw = &compiled.keywords[mat.pattern()];
                 if let Some(nodes) = self.keyword_to_nodes.get(kw) {
                     for &id in nodes {
-                        *results.entry(id).or_insert(0.0) += 1.0;
+                        emit(id)?;
                     }
                 }
             }
         }
-        results
+        Ok(())
     }
 }
 

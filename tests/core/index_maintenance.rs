@@ -470,7 +470,7 @@ fn 关键词预热拒绝后仍可编译并返回原始命中() {
 }
 
 #[test]
-fn 宽复合索引仅为过滤所用字段对读取一次事实() {
+fn 宽复合索引规划在统计失效后仍无需读取端点属性() {
     let dir = super::support::TestDir::new("pair-scan");
     let mut db = Database::<f32>::open(&dir.file("pairs.tdb"), 1).unwrap();
     for id in 1..=20 {
@@ -480,9 +480,11 @@ fn 宽复合索引仅为过滤所用字段对读取一次事实() {
     db.create_composite_index(&["a", "b", "c", "d", "e"].map(String::from))
         .unwrap();
     let sql = "EXPLAIN SEARCH VECTOR [1] TOP 1 AS n WITH n WHERE n.a == 1 AND n.b == 1 RETURN n";
-    for reads in [20, 0] {
+    for id in [21, 22] {
+        db.insert_with_id(id, &[1.], json!({"a":id,"b":id,"c":id,"d":id,"e":id}))
+            .unwrap();
         let before = db.payload_memory_stats().payload_lookups;
         assert_eq!(db.tql(sql).unwrap().len(), 1);
-        assert_eq!(db.payload_memory_stats().payload_lookups - before, reads);
+        assert_eq!(db.payload_memory_stats().payload_lookups, before);
     }
 }

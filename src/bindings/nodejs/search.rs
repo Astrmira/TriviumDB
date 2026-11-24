@@ -360,6 +360,7 @@ impl TriviumDB {
         hybrid_alpha: Option<JsUnknown>,
         payload_filter: Option<JsUnknown>,
         exact: Option<JsUnknown>,
+        ann_rerank_limit: Option<Either<f64, JsUnknown>>,
     ) -> napi::Result<Vec<JsSearchHit>> {
         let query_vector = read_vector(env, query_vector, "queryVector", &self.dtype)?;
         let payload_filter = payload_filter
@@ -373,6 +374,9 @@ impl TriviumDB {
         let alpha = optional_number(env, hybrid_alpha, 0.7, "hybridAlpha")?;
         let payload_filter = parse_payload_filter(env, payload_filter)?;
         let core_config = crate::database::SearchConfig {
+            ann_rerank_limit: ann_rerank_limit
+                .map(|value| parse_search_usize(env, Some(value), 0., "annRerankLimit", true))
+                .transpose()?,
             top_k,
             expand_depth,
             min_score,

@@ -530,6 +530,7 @@ fn 文档压缩取消归还组合额度并保持原文与重试结果() {
             .unwrap();
         let baseline = db.quiver_stats().unwrap().unwrap().reserved_bytes;
         let global = db.resource_stats().reserved_workspace_bytes;
+        let instance = db.estimated_memory();
         let context = triviumdb::sdk::RequestContext::new(
             "document-compressed-cancel",
             Default::default(),
@@ -554,9 +555,12 @@ fn 文档压缩取消归还组合额度并保持原文与重试结果() {
         });
         gate.wait_until_arrived();
         // 外层文档工作区在Reader局部账本组合计量，在共享Runtime中取得一次额度。
+        let active_workspace = db.resource_stats().reserved_workspace_bytes - global;
+        assert!(active_workspace > 0);
+        assert_eq!(db.estimated_memory() - instance, active_workspace);
         assert_eq!(
             db.quiver_stats().unwrap().unwrap().reserved_bytes - baseline,
-            db.resource_stats().reserved_workspace_bytes - global
+            active_workspace
         );
         context.cancel();
         drop(gate);

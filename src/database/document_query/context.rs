@@ -18,7 +18,7 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
             let mt = read_or_recover(&self.memtable);
             let request_bytes =
                 crate::storage::payload_store::serialized_json_len(query)?.saturating_mul(32);
-            let mut workspace = self.resource_runtime.reserve_workspace(0)?;
+            let mut workspace = mt.reserve_instance_workspace(0)?;
             reserve(&mt, self.memory_limit, &mut workspace, request_bytes)?;
             let mut sources = BTreeMap::<NodeId, Vec<&DocumentContextSeed>>::new();
             for seed in &query.seeds {
@@ -155,6 +155,11 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
                     )?;
                     windows.push(evidence_at(&snapshot, start, end, Some(&locations))?);
                 }
+                snapshot.locate_source_spans(
+                    windows
+                        .iter_mut()
+                        .flat_map(|window| window.source_spans.iter_mut()),
+                )?;
                 result.push(DocumentContext {
                     document_id: id,
                     revision: snapshot.revision,

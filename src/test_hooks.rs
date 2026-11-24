@@ -28,6 +28,7 @@ pub enum ConcurrencyPoint {
     DocumentAnnStep,
     /// 文档成员posting访问中断点，用于受控取消交错。
     DocumentMemberStep,
+    TextPosting,
     BeforeDatabasePathMetadata,
     BeforeDatabasePathIdentity,
     DatabasePathResolutionFailed,

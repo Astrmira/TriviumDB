@@ -2844,86 +2844,32 @@ impl<T: VectorType> MemTable<T> {
         &self,
         requested: &std::collections::BTreeSet<(String, String)>,
     ) -> Vec<crate::index::property::ColumnPairStats> {
-        #[derive(Default)]
-        struct Sample {
-            left: HashMap<Vec<u8>, usize>,
-            right: HashMap<Vec<u8>, usize>,
-            joint: HashSet<(usize, usize)>,
-            rows: usize,
-        }
-
-        {
-            let cached = self
+        let mut output = Vec::new();
+        for pair in requested {
+            if let Some(stats) = self
                 .column_pair_stats_cache
                 .read()
-                .unwrap_or_else(|p| p.into_inner());
-            if let Some(stats) = requested
-                .iter()
-                .map(|pair| cached.get(pair).cloned())
-                .collect::<Option<Vec<_>>>()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(pair)
+                .cloned()
             {
-                return stats;
+                output.push(stats);
+                continue;
             }
-        }
-        let mut cached = self
-            .column_pair_stats_cache
-            .write()
-            .unwrap_or_else(|p| p.into_inner());
-        let definitions = self.property_indexes.composite_definitions();
-        let mut missing: BTreeMap<_, Sample> = requested
-            .iter()
-            .filter(|pair| {
-                !cached.contains_key(*pair)
-                    && definitions.iter().any(|fields| {
-                        fields.contains(&pair.0) && fields.contains(&pair.1) && pair.0 != pair.1
+            if let Some(stats) =
+                self.property_indexes
+                    .column_pair_stats(&pair.0, &pair.1, |bytes| {
+                        self.reserve_instance_workspace(bytes)
                     })
-            })
-            .cloned()
-            .map(|pair| (pair, Sample::default()))
-            .collect();
-        if !missing.is_empty() {
-            for id in self.payloads.ids() {
-                // 统计属于可选的优化信息。中断时丢弃整批样本，执行入口会传播请求错误。
-                if crate::request::check_current().is_err() {
-                    return Vec::new();
-                }
-                let Ok(Some(payload)) = self.try_get_payload(id) else {
-                    return Vec::new();
-                };
-                for ((a, b), sample) in &mut missing {
-                    let (Some(left), Some(right)) = (payload.get(a), payload.get(b)) else {
-                        continue;
-                    };
-                    let (Ok(left), Ok(right)) =
-                        (serde_json::to_vec(left), serde_json::to_vec(right))
-                    else {
-                        return Vec::new();
-                    };
-                    let (l, r) = (sample.left.len(), sample.right.len());
-                    let l = *sample.left.entry(left).or_insert(l);
-                    let r = *sample.right.entry(right).or_insert(r);
-                    sample.joint.insert((l, r));
-                    sample.rows += 1;
-                }
-            }
-            for ((left_field, right_field), sample) in missing {
-                cached.insert(
-                    (left_field.clone(), right_field.clone()),
-                    crate::index::property::ColumnPairStats {
-                        left_field,
-                        right_field,
-                        left_distinct: sample.left.len(),
-                        right_distinct: sample.right.len(),
-                        joint_distinct: sample.joint.len(),
-                        sampled_rows: sample.rows,
-                    },
-                );
+            {
+                self.column_pair_stats_cache
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(pair.clone(), stats.clone());
+                output.push(stats);
             }
         }
-        requested
-            .iter()
-            .filter_map(|pair| cached.get(pair).cloned())
-            .collect()
+        output
     }
 
     pub fn cross_modal_stats(
@@ -3655,7 +3601,19 @@ impl<T: VectorType> MemTable<T> {
         workspace: &mut crate::resources::RequestWorkspace,
         bytes: usize,
     ) -> Result<()> {
-        let limit = self.instance_memory_limit;
+        self.resize_request_workspace(workspace, bytes, self.instance_memory_limit)
+    }
+
+    pub(crate) fn resize_request_workspace(
+        &self,
+        workspace: &mut crate::resources::RequestWorkspace,
+        bytes: usize,
+        limit: usize,
+    ) -> Result<()> {
+        let limit = match (limit, self.instance_memory_limit) {
+            (0, other) | (other, 0) => other,
+            (a, b) => a.min(b),
+        };
         let resident = if limit == 0 {
             0
         } else {
@@ -3669,7 +3627,7 @@ impl<T: VectorType> MemTable<T> {
             .saturating_add(
                 self.quiver_ssd
                     .as_ref()
-                    .map_or(0, |active| active.reader.reserved_bytes()),
+                    .map_or(0, |active| active.reader.owned_reservation_bytes()),
             )
             .saturating_add(
                 self.pelorus
@@ -3902,7 +3860,7 @@ impl<T: VectorType> MemTable<T> {
         Ok(self.text_index.search_ac(query))
     }
 
-    fn ensure_keyword_matcher(&self) -> Result<()> {
+    pub(crate) fn ensure_keyword_matcher(&self) -> Result<()> {
         self.text_index
             .prepare_keywords(|bytes| self.reserve_instance_workspace(bytes))
     }

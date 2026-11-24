@@ -867,7 +867,7 @@ const detailed = db.searchAdvanced(queryVector, {
 })
 ```
 
-Python `search`、`search_batch`、`search_grouped`、`search_with_context`、`search_advanced` 与 `search_hybrid` 均接受关键字参数 `exact`。Node 的 `search`、`searchBatch`、`searchGrouped`、`searchHybrid` 在既有位置参数之后追加可选 `exact`，`searchAdvanced` 和 `searchWithContext` 使用配置字段 `exact`。高级入口保留 `force_brute_force`／`forceBruteForce`，两个开关任一为真时选择精确召回。Rust `with_exact(bool)` 设置同一 `force_brute_force` 字段。
+Python `search`、`search_batch`、`search_grouped`、`search_with_context`、`search_advanced` 与 `search_hybrid` 均接受关键字参数 `exact`。Node 的 `search`、`searchBatch`、`searchGrouped`、`searchHybrid` 在既有位置参数之后追加可选 `exact`，`searchAdvanced` 和 `searchWithContext` 使用配置字段 `exact`。高级入口保留 `force_brute_force`／`forceBruteForce`，两个开关任一为真时选择精确召回。Rust `with_exact(bool)` 设置同一 `force_brute_force` 字段。Node 的 `searchHybrid` 在 `exact` 之后接受可选的正整数 `annRerankLimit`，对应 Python 的 `ann_rerank_limit`。
 
 > **资源提醒**　精确召回扫描全部符合条件的存储向量，查询成本随数据量和维度增长。取消、只读和资源预算继续由内核执行。
 
@@ -1520,7 +1520,7 @@ ReturnList := Ident (',' Ident)* | '*'
 
 ## 持久化索引管理与观测
 
-四类属性索引均持久化到 `.pidx` 并由 Planner 透明选择：
+属性索引随检查点发布到统一的 `.idx` 容器 并由 Planner 透明选择：
 
 | 类型 | Python | Node | Rust |
 | --- | --- | --- | --- |

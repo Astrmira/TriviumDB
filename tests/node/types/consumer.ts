@@ -417,6 +417,9 @@ export function rejectedInputs(db: TriviumDB): void {
   db.searchWithContext([1, 0], { recallK: '1' });
   // @ts-expect-error 高级配置中的边数量必须为数值。
   db.searchAdvanced([1, 0], { maxEdgesPerNode: '1' });
+  db.searchHybrid([1, 0], 'term', 2, 0, 0, 0.5, null, false, 32);
+  // @ts-expect-error 精排候选上限必须为数值。
+  db.searchHybrid([1, 0], 'term', 2, 0, 0, 0.5, null, false, '32');
   // @ts-expect-error 混合检索文本必须为字符串。
   db.searchHybrid([1, 0], 1);
   // @ts-expect-error 查询文本必须为字符串。

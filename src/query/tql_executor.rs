@@ -361,6 +361,9 @@ struct SourcedOperator<T: VectorType> {
 }
 
 impl<T: VectorType> crate::query::pipeline::PipelineOperator<T> for SourcedOperator<T> {
+    fn workspace_rows(&self, mt: &MemTable<T>, input: usize) -> usize {
+        self.inner.workspace_rows(mt, input)
+    }
     fn uses_graph(&self) -> bool {
         self.inner.uses_graph()
     }
@@ -1996,6 +1999,27 @@ fn scoped_match_plan<T: VectorType>(
     }
 }
 
+fn expr_reads_payload(expr: &TqlExpr, binding: &str) -> bool {
+    match expr {
+        TqlExpr::Property { var, field } => var == binding && field != "id",
+        TqlExpr::Binary { left, right, .. } => {
+            expr_reads_payload(left, binding) || expr_reads_payload(right, binding)
+        }
+        TqlExpr::Coalesce(values) => values.iter().any(|expr| expr_reads_payload(expr, binding)),
+        TqlExpr::IsNull { expr, .. } => expr_reads_payload(expr, binding),
+        _ => false,
+    }
+}
+
+fn return_reads_payload(kind: &ReturnExprKind, binding: &str) -> bool {
+    match kind {
+        ReturnExprKind::Property(var, field) => var == binding && field != "id",
+        ReturnExprKind::Aggregate(_, inner) => return_reads_payload(inner, binding),
+        ReturnExprKind::Scalar(expr) => expr_reads_payload(expr, binding),
+        ReturnExprKind::Var(_) => false,
+    }
+}
+
 fn collect_single_edge_rows<T: VectorType>(
     query: &TqlQuery,
     pattern: &TqlPattern,
@@ -2022,6 +2046,21 @@ fn collect_single_edge_rows_inner<T: VectorType>(
             "具名边要求单跳模式 (Named edges require a single-hop pattern)".into(),
         ));
     }
+    let ranking = query
+        .rank
+        .as_ref()
+        .map(|rank| {
+            rank_vector(rank, mt)
+                .map(|vector| (rank, vector))
+                .map_err(|error| limits.error(error, QueryErrorStage::Plan, SourceSelector::Rank))
+        })
+        .transpose()?;
+    let (row_limit, user_limited) =
+        requested_row_limit(query, requires_full_input(query, false), limits, mt)?;
+    let scan_limit = row_limit.saturating_add(usize::from(!user_limited));
+    if scan_limit == 0 || query.limit == Some(0) {
+        return Ok(Vec::new());
+    }
     let optional = matches!(query.entry, QueryEntry::OptionalMatch { .. });
     let graph = limits.graph(mt);
     let plan = scoped_match_plan(query, pattern, mt, optional, limits);
@@ -2040,12 +2079,6 @@ fn collect_single_edge_rows_inner<T: VectorType>(
     } else {
         Box::new(plan.candidates.iter().copied())
     };
-    let (row_limit, user_limited) =
-        requested_row_limit(query, requires_full_input(query, false), limits, mt)?;
-    let scan_limit = row_limit.saturating_add(usize::from(!user_limited));
-    if scan_limit == 0 || query.limit == Some(0) {
-        return Ok(Vec::new());
-    }
     let scope = returning::Scope {
         memory,
         query,
@@ -2055,26 +2088,25 @@ fn collect_single_edge_rows_inner<T: VectorType>(
     };
     let count_only = counts_match_rows(query);
     let snapshot_endpoint = |id, var: &str| {
-        // 只返回边或标量时保留端点身份，整节点返回和排名继续使用完整快照。
+        // 标量投影按绑定读取所需字段，排名从存储向量单独评分。
         let full_node = match &query.returns {
             ReturnClause::All => true,
             ReturnClause::Variables(names) => names.iter().any(|name| name == var),
             ReturnClause::Expressions(items) => items.iter().any(|item| match &item.kind {
                 ReturnExprKind::Var(name) => name == var,
-                ReturnExprKind::Scalar(_) => true,
+                ReturnExprKind::Scalar(TqlExpr::Variable(name)) => name == var,
                 _ => false,
             }),
         };
-        if !values_only || query.rank.is_some() || full_node {
+        if !values_only || full_node {
             return memory.snapshot(id, mt);
         }
-        let needs_payload = !query.order_by.is_empty()
-            || matches!(&query.returns,
-            ReturnClause::Expressions(items) if items.iter().any(|item| match &item.kind {
-                ReturnExprKind::Property(name, field) => name == var && field != "id",
-                ReturnExprKind::Aggregate(..) => true,
-                _ => false,
-            }));
+        let needs_payload = query
+            .order_by
+            .iter()
+            .any(|order| expr_reads_payload(&order.expr, var))
+            || matches!(&query.returns, ReturnClause::Expressions(items)
+                if items.iter().any(|item| return_reads_payload(&item.kind, var)));
         memory.retain(256)?;
         let payload = if needs_payload {
             let _decode = memory.temporary(mt.payload_query_peak(id)?)?;
@@ -2101,7 +2133,7 @@ fn collect_single_edge_rows_inner<T: VectorType>(
     let mut expanded = Vec::new();
     let mut budget = matching::WorkBudget::new(MAX_BUDGET, limits.query_control.as_ref());
     'anchors: for start in candidates {
-        limits.check_cancelled()?;
+        budget.step()?;
         if let Some(filter) = &left.filter
             && !matches_filter_with_id(filter, start, mt, memory)?
         {
@@ -2214,8 +2246,8 @@ fn collect_single_edge_rows_inner<T: VectorType>(
         }
     }
     expanded.truncate(admit_input_rows(query, mt, limits, expanded.len())?);
-    if let Some(rank) = &query.rank {
-        expanded = rank_rows_by_node(expanded, rank, mt, |row| &row.nodes)
+    if let Some((rank, vector)) = ranking {
+        expanded = rank_rows_by_node(expanded, rank, &vector, mt, |row| &row.nodes)
             .map_err(|error| limits.error(error, QueryErrorStage::Plan, SourceSelector::Rank))?;
     }
     Ok(expanded)
@@ -2586,6 +2618,9 @@ impl<T: VectorType> crate::query::pipeline::PipelineOperator<T> for TqlMatchSour
 }
 
 impl<T: VectorType> crate::query::pipeline::PipelineOperator<T> for TqlScopeProjection {
+    fn workspace_rows(&self, _mt: &MemTable<T>, input: usize) -> usize {
+        input
+    }
     fn name(&self) -> &'static str {
         "scope_projection"
     }
@@ -2649,6 +2684,9 @@ struct TqlOutputBinding<T: VectorType> {
     name: String,
 }
 impl<T: VectorType> crate::query::pipeline::PipelineOperator<T> for TqlOutputBinding<T> {
+    fn workspace_rows(&self, mt: &MemTable<T>, input: usize) -> usize {
+        self.inner.workspace_rows(mt, input).max(input)
+    }
     fn uses_graph(&self) -> bool {
         self.inner.uses_graph()
     }
@@ -2858,6 +2896,9 @@ struct TqlNumericIndexFilter {
 }
 
 impl<T: VectorType> crate::query::pipeline::PipelineOperator<T> for TqlNumericIndexFilter {
+    fn workspace_rows(&self, _mt: &MemTable<T>, input: usize) -> usize {
+        input
+    }
     fn name(&self) -> &'static str {
         "tql_numeric_index_filter"
     }
@@ -2882,6 +2923,9 @@ impl<T: VectorType> crate::query::pipeline::PipelineOperator<T> for TqlNumericIn
 }
 
 impl<T: VectorType> crate::query::pipeline::PipelineOperator<T> for PipelinePredicateFilter {
+    fn workspace_rows(&self, _mt: &MemTable<T>, input: usize) -> usize {
+        input
+    }
     fn name(&self) -> &'static str {
         "tql_pipeline_filter"
     }
@@ -3038,27 +3082,32 @@ fn apply_graph_first_rank<T: VectorType>(
     rank: &RankClause,
     mt: &MemTable<T>,
 ) -> Result<TqlResult<T>, TriviumError> {
-    rank_rows_by_node(rows, rank, mt, |row| row)
+    rank_rows_by_node(rows, rank, &rank_vector(rank, mt)?, mt, |row| row)
 }
 
-fn rank_rows_by_node<T: VectorType, R, F: Fn(&R) -> &HashMap<String, Node<T>>>(
-    rows: Vec<R>,
-    rank: &RankClause,
-    mt: &MemTable<T>,
-    bindings: F,
-) -> Result<Vec<R>, TriviumError> {
+fn rank_vector<T: VectorType>(rank: &RankClause, mt: &MemTable<T>) -> Result<Vec<T>, TriviumError> {
+    if rank.vector.len() != mt.dim() {
+        return Err(TriviumError::DimensionMismatch {
+            expected: mt.dim(),
+            got: rank.vector.len(),
+        });
+    }
     let query_vector: Vec<T> = rank
         .vector
         .iter()
         .map(T::from_json_number)
         .collect::<Result<Vec<_>, _>>()?;
-    if query_vector.len() != mt.dim() {
-        return Err(TriviumError::DimensionMismatch {
-            expected: mt.dim(),
-            got: query_vector.len(),
-        });
-    }
     crate::vector::validate_query_vector(&query_vector, mt.dim())?;
+    Ok(query_vector)
+}
+
+fn rank_rows_by_node<T: VectorType, R, F: Fn(&R) -> &HashMap<String, Node<T>>>(
+    rows: Vec<R>,
+    rank: &RankClause,
+    query_vector: &[T],
+    mt: &MemTable<T>,
+    bindings: F,
+) -> Result<Vec<R>, TriviumError> {
     let mut canonical = BTreeMap::<NodeId, (Vec<NodeId>, R)>::new();
     for row in rows {
         let nodes = bindings(&row);
@@ -3092,7 +3141,7 @@ fn rank_rows_by_node<T: VectorType, R, F: Fn(&R) -> &HashMap<String, Node<T>>>(
         let vector = mt.get_vector(anchor_id).ok_or_else(|| {
             TriviumError::QueryExecution(format!("RANK anchor {anchor_id} 缺少向量"))
         })?;
-        let score = T::similarity(&query_vector, vector);
+        let score = T::similarity(query_vector, vector);
         if score.is_finite() {
             ranked.push((score, anchor_id, row));
         }

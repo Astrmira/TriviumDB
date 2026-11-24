@@ -291,6 +291,7 @@ pub(super) fn migrate<T: VectorType + serde::Serialize + serde::de::DeserializeO
         source.resource_runtime.clone(),
         reservation,
         destination.lease.take(),
+        None,
     )?;
     Ok((database, ids))
 }

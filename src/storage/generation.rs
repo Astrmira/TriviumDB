@@ -250,17 +250,19 @@ impl GenerationStore {
         FileExt::try_lock_shared(&lease)
             .map_err(|error| lease_error(&current.generation_id, error))?;
         let path = directory.join(&current.database_file);
-        let manifest = crate::storage::snapshot::validate_manifest_for_generation(
+        let manifest = crate::storage::snapshot::read_generation_manifest(
             &path.to_string_lossy(),
             &current.generation_id,
         )?;
-        let reader = DatabaseReader::open_immutable(&path.to_string_lossy(), dim)?;
+        let expected_count = manifest.node_count;
+        let reader =
+            DatabaseReader::open_declared_generation(&path.to_string_lossy(), dim, manifest)?;
         let node_count = reader.node_count()?;
-        if node_count != manifest.node_count {
+        if node_count != expected_count {
             return Err(TriviumError::ImmutableArtifactInvalid {
                 reason: format!(
                     "manifest node_count {} 与数据库 {} 不一致",
-                    manifest.node_count, node_count
+                    expected_count, node_count
                 ),
             });
         }
@@ -510,22 +512,26 @@ fn validate_generation_database(path: &Path, generation_id: &str) -> Result<()> 
             "代际数据库路径须为 UTF-8 (Generation database path must be UTF-8)".into(),
         )
     })?;
-    let manifest = crate::storage::snapshot::validate_manifest_for_generation(path, generation_id)?;
+    let manifest = crate::storage::snapshot::read_generation_manifest(path, generation_id)?;
+    let expected_count = manifest.node_count;
     let count = match manifest.dtype.as_str() {
-        "f32" => DatabaseReader::<f32>::open_immutable(path, manifest.dim)?.node_count(),
+        "f32" => DatabaseReader::<f32>::open_declared_generation(path, manifest.dim, manifest)?
+            .node_count(),
         "half::binary16::f16" => {
-            DatabaseReader::<half::f16>::open_immutable(path, manifest.dim)?.node_count()
+            DatabaseReader::<half::f16>::open_declared_generation(path, manifest.dim, manifest)?
+                .node_count()
         }
-        "u64" => DatabaseReader::<u64>::open_immutable(path, manifest.dim)?.node_count(),
+        "u64" => DatabaseReader::<u64>::open_declared_generation(path, manifest.dim, manifest)?
+            .node_count(),
         dtype => Err(TriviumError::ImmutableArtifactInvalid {
             reason: format!("代际类型不受支持 (Unsupported generation dtype): {dtype}"),
         }),
     }?;
-    if count != manifest.node_count {
+    if count != expected_count {
         return Err(TriviumError::ImmutableArtifactInvalid {
             reason: format!(
                 "代际节点数与清单不匹配 (Generation node count does not match manifest): {count} != {}",
-                manifest.node_count
+                expected_count
             ),
         });
     }

@@ -545,15 +545,9 @@ impl<'a, T: VectorType> PipelineContext<'a, T> {
 
     pub(crate) fn reserve_row_workspace(&mut self, bytes: usize) -> Result<()> {
         if self.database_memory_limit > 0 {
-            let graph_bytes = self
-                .graph_scope
-                .as_ref()
-                .map_or(0, |graph| graph.reserved_bytes());
             self.memtable.ensure_additional_memory(
                 self.database_memory_limit,
-                bytes
-                    .saturating_sub(self.workspace_bytes)
-                    .saturating_add(graph_bytes),
+                bytes.saturating_sub(self.workspace_bytes),
             )?;
         }
         if bytes > self.workspace_bytes {
@@ -694,6 +688,11 @@ impl<'a, T: VectorType> PipelineContext<'a, T> {
 }
 
 pub trait PipelineOperator<T: VectorType> {
+    /// 已知基数的阶段按实际来源或输入预留行空间。
+    fn workspace_rows(&self, mt: &MemTable<T>, _input: usize) -> usize {
+        mt.node_count()
+    }
+
     fn uses_graph(&self) -> bool {
         false
     }
@@ -747,24 +746,27 @@ pub(crate) fn execute_pipeline_with_workspace<T: VectorType>(
     let request = workspace.graph_request()?;
     let _scope = request.enter()?;
     let context = &mut *workspace;
-    let rows = context.memtable.node_count().min(context.budget.max_nodes);
-    let estimate = rows
-        .checked_mul(std::mem::size_of::<NodeRow>() + 64)
-        .and_then(|bytes| bytes.checked_mul(4))
-        .ok_or_else(|| TriviumError::CapacityAllocationFailed {
-            reason: "管线工作区估算溢出".into(),
-        })?;
-    if context.workspace_limit > 0 && estimate > context.workspace_limit {
-        return Err(TriviumError::QueryRowBudgetExceeded {
-            budget: context.workspace_limit
-                / (std::mem::size_of::<NodeRow>() + 64).saturating_mul(4),
-        });
-    }
-    context.reserve_row_workspace(estimate)?;
     let mut current = NodeSet::empty();
     for operator in operators {
         let locate = |error| operator.map_error(error);
         context.begin_stage().map_err(locate)?;
+        let rows = operator
+            .workspace_rows(context.memtable, current.len())
+            .min(context.budget.max_nodes);
+        let estimate = rows
+            .checked_mul(std::mem::size_of::<NodeRow>() + 64)
+            .and_then(|bytes| bytes.checked_mul(4))
+            .ok_or_else(|| TriviumError::CapacityAllocationFailed {
+                reason: "管线工作区估算溢出".into(),
+            })?;
+        if context.workspace_limit > 0 && estimate > context.workspace_limit {
+            return Err(TriviumError::QueryRowBudgetExceeded {
+                budget: context.workspace_limit
+                    / (std::mem::size_of::<NodeRow>() + 64).saturating_mul(4),
+            });
+        }
+        context.reserve_row_workspace(estimate)?;
+
         context.graph_work = (0, 0);
         if operator.uses_graph() && context.graph_scope.is_some() {
             let graph = context.graph();
@@ -1053,6 +1055,21 @@ pub struct TextSearchSource {
 }
 
 impl<T: VectorType> PipelineOperator<T> for TextSearchSource {
+    fn workspace_rows(&self, mt: &MemTable<T>, _input: usize) -> usize {
+        let index = mt.text_engine();
+        self.top_k.min(
+            (if self.include_bm25 {
+                index.document_count()
+            } else {
+                0usize
+            })
+            .saturating_add(if self.include_ac {
+                index.keyword_node_count()
+            } else {
+                0
+            }),
+        )
+    }
     fn name(&self) -> &'static str {
         "text_search_source"
     }
@@ -1060,7 +1077,6 @@ impl<T: VectorType> PipelineOperator<T> for TextSearchSource {
     fn apply(&self, _input: NodeSet, context: &mut PipelineContext<'_, T>) -> Result<NodeSet> {
         if self.query.len() > 4096
             || self.query.split_whitespace().count() > 256
-            || context.memtable.node_count() > context.budget.max_nodes
             || self.top_k == 0
             || self.top_k > context.budget.max_nodes
         {
@@ -1075,28 +1091,69 @@ impl<T: VectorType> PipelineOperator<T> for TextSearchSource {
             ));
         }
         let index = context.memtable.text_engine();
-        let mut scores = HashMap::<NodeId, f64>::new();
-        if self.include_bm25 {
-            for (id, score) in index.search_bm25(&self.query, self.k1, self.b) {
-                *scores.entry(id).or_default() += f64::from(score);
+        let bm25_nodes = if self.include_bm25 {
+            index.document_count()
+        } else {
+            0
+        };
+        let keyword_nodes = if self.include_ac {
+            index.keyword_node_count()
+        } else {
+            0
+        };
+        let limit = context.budget.max_nodes;
+        if bm25_nodes.max(keyword_nodes) > limit {
+            return Err(TriviumError::QueryRowBudgetExceeded { budget: limit });
+        }
+        let request = context.graph_request()?;
+        let control = request.control();
+        let mut workspace = context.memtable.reserve_instance_workspace(0)?;
+        let mut scores = HashMap::<NodeId, (f32, f32)>::new();
+        let mut accumulate = |id, bm25, ac| -> Result<()> {
+            #[cfg(feature = "test-hooks")]
+            crate::test_hooks::hit(crate::test_hooks::ConcurrencyPoint::TextPosting);
+            control.check()?;
+            if !scores.contains_key(&id) {
+                let count = scores.len() + 1;
+                if count > limit {
+                    return Err(TriviumError::QueryRowBudgetExceeded { budget: limit });
+                }
+                if scores.len() == scores.capacity() {
+                    let bytes = count.saturating_mul(2).max(4).saturating_mul(96);
+                    context.validate_output_size(count, bytes)?;
+                    context
+                        .memtable
+                        .resize_instance_workspace(&mut workspace, bytes)?;
+                }
             }
+            let entry = scores.entry(id).or_default();
+            entry.0 += bm25;
+            entry.1 += ac;
+            Ok(())
+        };
+        if self.include_bm25 {
+            index.visit_bm25(&self.query, self.k1, self.b, |id, score| {
+                accumulate(id, score, 0.)
+            })?;
         }
         if self.include_ac {
-            for (id, score) in context.memtable.search_keywords(&self.query)? {
-                *scores.entry(id).or_default() += f64::from(score) * f64::from(self.ac_weight);
+            context.memtable.ensure_keyword_matcher()?;
+            index.visit_ac(&self.query, |id| accumulate(id, 0., 1.))?;
+        }
+        control.check()?;
+        // 两路分数和权重均非负，IEEE 位序即数值序；同分按 NodeId 升序。
+        let mut best = BTreeSet::new();
+        for (id, (bm25, ac)) in scores {
+            control.check()?;
+            let score = f64::from(bm25) + f64::from(ac) * f64::from(self.ac_weight);
+            best.insert((std::cmp::Reverse(score.to_bits()), id));
+            if best.len() > self.top_k {
+                best.pop_last();
             }
         }
-        let mut scored = scores.into_iter().collect::<Vec<_>>();
-        scored.sort_by(|left, right| {
-            right
-                .1
-                .total_cmp(&left.1)
-                .then_with(|| left.0.cmp(&right.0))
-        });
-        scored.truncate(self.top_k);
         Ok(NodeSet::from_rows(
-            scored
-                .into_iter()
+            best.into_iter()
+                .map(|(score, id)| (id, f64::from_bits(score.0)))
                 .filter(|(id, _)| context.memtable.contains(*id))
                 .map(|(id, score)| {
                     let mut row = NodeRow::new(id);

@@ -83,20 +83,18 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
             let _operation = self.enter_operation()?;
             self.check_transaction_admission()?;
             write.phase = crate::error::WritePhase::Validation;
-            let limits = NamedGraphLimits::default();
-            let mut snapshot = self.get_named_graph(graph_id, &limits)?.ok_or_else(|| {
-                TriviumError::GraphNotFound {
-                    graph_id: graph_id.into(),
-                }
-            })?;
-            if snapshot.revision != expected_revision {
-                return Err(TriviumError::GraphRevisionMismatch {
-                    graph_id: graph_id.into(),
-                    expected: expected_revision.into(),
-                    actual: snapshot.revision,
-                }
-                .at_field("expected_revision"));
-            }
+            validate_id(graph_id)?;
+            let snapshot = {
+                let mt = read_or_recover(&self.memtable);
+                mt.ensure_readable()?;
+                let record = mt.named_graphs.graphs.get(graph_id).ok_or_else(|| {
+                    TriviumError::GraphNotFound {
+                        graph_id: graph_id.into(),
+                    }
+                })?;
+                mt.named_graphs.check(graph_id, Some(expected_revision))?;
+                std::sync::Arc::clone(record)
+            };
             bound("named_graph_edits", edits.len(), 1_000_000)?;
             for edit in &edits {
                 match edit {
@@ -116,6 +114,7 @@ impl<T: VectorType + Serialize + DeserializeOwned> Database<T> {
                 .saturating_add(snapshot.graph.memory_bytes().saturating_mul(4));
             let _workspace = self.reserve_request_workspace(bytes)?;
             // 有序映射让批量编辑的边键合并保持确定性，删除成员同时清理该图关联边。
+            let mut snapshot = (*snapshot).clone();
             let mut members = snapshot.graph.members.into_iter().collect::<BTreeSet<_>>();
             let mut edges = snapshot
                 .graph

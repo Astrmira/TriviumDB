@@ -8,6 +8,8 @@
 
 本页记录下一批变更。最近的预发布版本见 [0.9.4-beta.1 双语说明](0.9.4-beta.1.md)，最近的正式版本见 [0.9.3 双语说明](0.9.3.md)。
 
+- 图作用域、文档检索与上下文的工作区同时计入实例和共享运行时。文本召回按所选倒排索引准入，并在扫描命中时检查取消。具名边 MATCH 对孤立起点计步，按投影读取端点属性，零行分页也校验排名向量。规划器从有界复合索引键统计字段相关性。
+- 同一文档修订的证据窗口批量定位原文行列。命名图编辑直接读取预期修订，不受读接口默认返回大小的限制。不可变代际打开与发布每次验证只计算一遍文件摘要。Node `searchHybrid` 新增可选的 `annRerankLimit`。
 - 多起点加权最短路按精确成本选路。批量路径查询共享遍历额度，`path_truncated()` 标明全路径聚合是否受枚举上限影响。最短路工作区按实例及共享额度准入。管线最终投影计入 Payload 预算与 PROFILE。
 - 浮点认知阶段检查 dtype、取消和工作区，残差召回只保留 Top-K。DPP 按实际向量计算对角质量。Rust 的 `nmf_multiplicative_update` 返回 `Result<(Vec<f32>, Vec<f32>)>`，调用方可用 `?` 传播矩阵形状错误。
 - Node 的普通与 Prepared TQL 均声明返回 `QueryRow[]`，节点投影的 ID 为字符串。Python 传播行构造错误，成功提交后的回执转换错误标记为已提交。代际租约保留 I/O 错误，CLI 按检查点状态标记 WAL。
@@ -39,6 +41,8 @@
 
 This page tracks upcoming changes. See the [0.9.4-beta.1 prerelease notes](0.9.4-beta.1.md) and the [0.9.3 stable release notes](0.9.3.md).
 
+- Scoped graph, document retrieval and context workspaces count against both the instance and shared runtime. Text retrieval admits the selected posting indexes and checks cancellation while scanning hits. Named-edge MATCH charges isolated anchors, reads endpoint properties on demand and validates ranking vectors for empty pages. Planning derives field correlations from bounded composite index keys.
+- Evidence windows resolve original source coordinates together within each document revision. Named graph edits read the expected revision directly. Opening and publishing immutable generations hash each manifest file once per verification. Node `searchHybrid` accepts an optional trailing `annRerankLimit`.
 - Multi-source weighted paths retain exact costs through route selection. Batched paths share traversal limits, and `path_truncated()` reports when the enumeration cap affects an aggregate. Shortest paths reserve instance and shared workspace. Final pipeline projection charges the query payload budget and appears in PROFILE.
 - Floating-point cognitive stages check dtype, cancellation and workspace. Residual recall retains the top K candidates. DPP computes its quality diagonal from the actual vectors. Rust `nmf_multiplicative_update` returns `Result<(Vec<f32>, Vec<f32>)>`. Callers can propagate invalid matrix shapes with `?`.
 - Node declares `QueryRow[]` for ordinary and prepared TQL, with string IDs in projected nodes. Python propagates row conversion errors and marks post-commit receipt conversion failures as committed. Generation leases preserve I/O errors. CLI WAL status follows checkpoint state.

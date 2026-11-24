@@ -886,7 +886,7 @@ export class TriviumDB {
    * @param minScore    最小分数
    * @param hybridAlpha 向量排名权重 [0, 1]，文本排名权重为 1 - hybridAlpha。默认 0.7
    */
-  searchHybrid(queryVector: Vector, queryText: string, topK?: number | null, expandDepth?: number | null, minScore?: number | null, hybridAlpha?: number | null, payloadFilter?: Record<string, unknown> | null, exact?: boolean | null): JsSearchHit[];
+  searchHybrid(queryVector: Vector, queryText: string, topK?: number | null, expandDepth?: number | null, minScore?: number | null, hybridAlpha?: number | null, payloadFilter?: Record<string, unknown> | null, exact?: boolean | null, annRerankLimit?: number | null): JsSearchHit[];
 
   /**
    * 替换节点的 BM25 正文；空文本清除正文，关键词保持不变

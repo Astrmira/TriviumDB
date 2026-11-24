@@ -998,7 +998,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         runtime: crate::resources::ResourceRuntime,
         reservation: crate::resources::DatabaseReservation,
     ) -> Result<Self> {
-        Self::open_reserved_with_lock(path, config, runtime, reservation, None)
+        Self::open_reserved_with_lock(path, config, runtime, reservation, None, None)
     }
 
     fn open_reserved_with_lock(
@@ -1007,6 +1007,7 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         runtime: crate::resources::ResourceRuntime,
         reservation: crate::resources::DatabaseReservation,
         reserved_lock: Option<std::fs::File>,
+        declared: Option<crate::storage::snapshot::GenerationManifest>,
     ) -> Result<Self> {
         let dim = config.dim;
 
@@ -1079,7 +1080,19 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
         crate::storage::format::admit(path)?;
 
         if config.access_mode == AccessMode::Immutable {
-            crate::storage::snapshot::validate_manifest(path, std::any::type_name::<T>(), dim)?;
+            match declared {
+                Some(manifest) => crate::storage::snapshot::validate_declared_manifest(
+                    path,
+                    std::any::type_name::<T>(),
+                    dim,
+                    manifest,
+                )?,
+                None => crate::storage::snapshot::validate_manifest(
+                    path,
+                    std::any::type_name::<T>(),
+                    dim,
+                )?,
+            };
         }
         let mut memtable = if std::path::Path::new(path).exists() {
             file_format::load_with_memory_limit(
@@ -1297,6 +1310,30 @@ impl<T: VectorType + serde::Serialize + serde::de::DeserializeOwned> Database<T>
                 auto_build_quiver: false,
                 ..Default::default()
             },
+        )
+    }
+
+    pub(crate) fn open_declared_generation(
+        path: &str,
+        dim: usize,
+        declared: crate::storage::snapshot::GenerationManifest,
+    ) -> Result<Self> {
+        let config = Config {
+            dim,
+            access_mode: AccessMode::Immutable,
+            auto_build_quiver: false,
+            ..Default::default()
+        };
+        let runtime = crate::resources::ResourceRuntime::shared_default();
+        let _task = runtime.enter_task()?;
+        let reservation = runtime.reserve_database(config.memory_limit)?;
+        Self::open_reserved_with_lock(
+            path,
+            config,
+            runtime.clone(),
+            reservation,
+            None,
+            Some(declared),
         )
     }
 
