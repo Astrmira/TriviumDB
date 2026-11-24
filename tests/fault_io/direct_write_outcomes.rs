@@ -10,40 +10,7 @@ fn vector<T: VectorType>(a: f32, b: f32) -> Vec<T> {
     vec![T::from_f32(a), T::from_f32(b)]
 }
 
-fn facts<T: VectorType + serde::Serialize + serde::de::DeserializeOwned>(
-    database: &Database<T>,
-) -> Value {
-    let mut ids = database.all_node_ids().unwrap();
-    ids.sort_unstable();
-    let nodes: Vec<Value> = ids
-        .into_iter()
-        .map(|id| {
-            let node = database.get(id).unwrap().unwrap();
-            let mut edges = node.edges;
-            edges.sort_by(|left, right| {
-                (left.target_id, &left.label).cmp(&(right.target_id, &right.label))
-            });
-            let edges: Vec<Value> = edges
-                .iter()
-                .map(|edge| {
-                    json!({
-                        "target": edge.target_id,
-                        "label": edge.label,
-                        "weight": edge.weight,
-                        "metadata": edge.metadata,
-                    })
-                })
-                .collect();
-            json!({
-                "id": id,
-                "vector": node.vector.iter().map(|value| value.to_f32()).collect::<Vec<_>>(),
-                "payload": node.payload,
-                "edges": edges,
-            })
-        })
-        .collect();
-    json!(nodes)
-}
+use crate::node_facts::{fixture_nodes, nodes as facts};
 
 fn execute<T: VectorType + serde::Serialize + serde::de::DeserializeOwned>(
     database: &mut Database<T>,
@@ -100,7 +67,10 @@ fn matrix<T: VectorType + serde::Serialize + serde::de::DeserializeOwned>(dtype:
                     .unwrap();
                 database.link(1, 2, "related", 1.).unwrap();
                 database.flush().unwrap();
-                assert_eq!(facts(&database), contract["before"]);
+                assert_eq!(
+                    facts(&database),
+                    fixture_nodes::<T>(contract["before"].clone())
+                );
                 let failure = fail_io_at(point);
                 let error = execute(&mut database, operation).unwrap_err();
                 drop(failure);
@@ -119,7 +89,10 @@ fn matrix<T: VectorType + serde::Serialize + serde::de::DeserializeOwned>(dtype:
                     *expected
                 );
                 if point == IoPoint::WalSync {
-                    assert_eq!(facts(&database), contract["before"]);
+                    assert_eq!(
+                        facts(&database),
+                        fixture_nodes::<T>(contract["before"].clone())
+                    );
                 } else {
                     assert_eq!(database.node_count().unwrap_err().code(), "TDB_WAL_CLOSED");
                 }
@@ -145,7 +118,7 @@ fn matrix<T: VectorType + serde::Serialize + serde::de::DeserializeOwned>(dtype:
                 // sync 故障在完整 flush 后注入，应用故障也已有完整 WAL，当前进程内重开必须恢复整条事实。
                 assert_eq!(
                     facts(&reopened),
-                    case["after"],
+                    fixture_nodes::<T>(case["after"].clone()),
                     "{dtype}/{mode:?}/{point:?}/{operation}"
                 );
                 reopened
@@ -156,7 +129,7 @@ fn matrix<T: VectorType + serde::Serialize + serde::de::DeserializeOwned>(dtype:
                     Database::<T>::open_with_config(path.to_str().unwrap(), config).unwrap();
                 let mut expected = case["after"].as_array().unwrap().clone();
                 expected.push(json!({"id":4,"vector":[1.0,1.0],"payload":{"state":"after-reopen"},"edges":[]}));
-                assert_eq!(facts(&reopened), json!(expected));
+                assert_eq!(facts(&reopened), fixture_nodes::<T>(json!(expected)));
                 reopened.close().unwrap();
             }
         }
@@ -174,4 +147,29 @@ fn direct_write_faults_f16() {
 #[test]
 fn direct_write_faults_u64() {
     matrix::<u64>("direct-u64");
+}
+
+#[test]
+fn 恢复事实保留二十四位以上的每个整数位() {
+    let root = super::support::TestDir::new("recovery-u64");
+    let path = root.file("bits.tdb");
+    let mut db = Database::<u64>::open(&path, 1).unwrap();
+    db.insert_with_id(1, &[16_777_216], json!({})).unwrap();
+    let expected = |value: u64| json!([{"id":1, "vector":[value], "payload":{}, "edges":[]}]);
+    assert_eq!(facts(&db), expected(16_777_216));
+    db.flush().unwrap();
+    let failure = fail_io_at(IoPoint::DirectWriteApply);
+    let error = db.update_vector(1, &[16_777_217]).unwrap_err();
+    drop(failure);
+    assert_eq!(error.code(), "TDB_IO");
+    assert_eq!(
+        serde_json::to_value(error.info()).unwrap()["write"],
+        json!({"phase":"apply", "outcome":"unknown"})
+    );
+    drop(db);
+    for _ in 0..2 {
+        let mut db = Database::<u64>::open(&path, 1).unwrap();
+        assert_eq!(facts(&db), expected(16_777_217));
+        db.close().unwrap();
+    }
 }

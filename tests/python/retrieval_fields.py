@@ -7,7 +7,8 @@ from types import MappingProxyType
 from collections.abc import Mapping
 
 import triviumdb
-from query_arguments import check_hits, check_input_error
+from input_errors import check_input_error
+from query_arguments import check_hits
 from read_arguments import node
 
 CONTRACTS = Path(__file__).parents[1] / "contracts"

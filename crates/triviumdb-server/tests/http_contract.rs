@@ -416,6 +416,51 @@ async fn text(response: axum::response::Response) -> String {
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
+/// 按请求的传输格式逐行核对独立预期，同时返回同一查询的 profile。
+async fn assert_query_response(
+    response: axum::response::Response,
+    media_type: &str,
+    columns: &Value,
+    expected_rows: &[Value],
+) -> Value {
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next(),
+        Some(media_type)
+    );
+    if media_type == "application/json" {
+        let body = json(response).await;
+        assert_eq!(&body["columns"], columns);
+        assert_eq!(body["rows"].as_array().unwrap(), expected_rows);
+        return body["profile"].clone();
+    }
+    assert_eq!(media_type, "application/x-ndjson");
+    let body = text(response).await;
+    let mut frames = body
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap());
+    let meta = frames.next().expect("缺少 meta");
+    assert_eq!(meta["type"], "meta");
+    assert_eq!(&meta["columns"], columns);
+    for row in expected_rows {
+        let frame = frames.next().expect("缺少数据行");
+        assert_eq!(frame["type"], "row");
+        assert_eq!(frame.get("row"), Some(row));
+    }
+    let summary = frames.next().expect("缺少 summary");
+    assert_eq!(summary["type"], "summary");
+    assert_eq!(
+        summary["rowCount"].as_u64(),
+        Some(expected_rows.len() as u64)
+    );
+    assert!(frames.next().is_none(), "summary 后有多余帧");
+    summary["profile"].clone()
+}
+
 async fn request(
     app: axum::Router,
     method: &str,
@@ -1570,14 +1615,15 @@ async fn ndjson分块协议包含meta_rows_summary与profile() {
             assert_eq!(json(response).await["code"], "TDB_HTTP_NOT_ACCEPTABLE");
         }
     }
-    request(
+    let inserted = raw_request(
         app.clone(),
         "POST",
-        "/v1/tql",
-        Some(serde_json::json!({"query": "CREATE ({kind: \"stream\"})", "mutation": true})),
+        "/v1/import/nodes",
+        br#"{"id":1,"vector":[1,0],"payload":{"kind":"stream"}}"#.to_vec(),
         &[],
     )
     .await;
+    assert_eq!(inserted.status(), StatusCode::OK);
     let response = request(
         app,
         "POST",
@@ -1589,23 +1635,10 @@ async fn ndjson分块协议包含meta_rows_summary与profile() {
         )],
     )
     .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert!(
-        response.headers()[header::CONTENT_TYPE]
-            .to_str()
-            .unwrap()
-            .starts_with("application/x-ndjson")
-    );
-    let lines = text(response).await;
-    let frames = lines
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(frames[0]["type"], "meta");
-    assert_eq!(frames[0]["columns"][0]["kind"], "node");
-    assert_eq!(frames[1]["type"], "row");
-    assert_eq!(frames[2]["type"], "summary");
-    assert_eq!(frames[2]["profile"]["preparedCacheHit"], false);
+    let profile = assert_query_response(response, "application/x-ndjson",
+        &serde_json::json!([{"name":"_","kind":"node"}]),
+        &[serde_json::json!({"_":{"type":"node","id":"1","vector":[1.0,0.0],"payload":{"kind":"stream"},"edges":[]}})]).await;
+    assert_eq!(profile["preparedCacheHit"], false);
 }
 
 #[tokio::test]
@@ -1705,24 +1738,45 @@ async fn 投影列类型与行顺序和传输编码无关() {
             .status(),
         StatusCode::OK
     );
-    for direction in ["ASC", "DESC"] {
-        let query = format!("FIND {{k:1}} RETURN _.v AS v ORDER BY _.id {direction}");
-        for accept in ["application/json", "application/x-ndjson"] {
-            let response = request(
-                app.clone(),
-                "POST",
-                "/v1/tql",
-                Some(serde_json::json!({"query":query})),
-                &[("accept", accept)],
-            )
-            .await;
-            assert_eq!(response.status(), StatusCode::OK);
-            let body = text(response).await;
-            let meta: Value = serde_json::from_str(body.lines().next().unwrap()).unwrap();
-            assert_eq!(
-                meta["columns"],
-                serde_json::json!([{"name":"v","kind":"mixed"}])
-            );
+    let number = serde_json::json!({"v":{"type":"int","value":42}});
+    let word = serde_json::json!({"v":{"type":"string","value":"word"}});
+    for (direction, expected) in [
+        ("ASC", [number.clone(), word.clone()]),
+        ("DESC", [word, number]),
+    ] {
+        let input = serde_json::json!({"query": format!("FIND {{k:1}} RETURN _.v AS v ORDER BY _.id {direction}")});
+        let prepared = request(
+            app.clone(),
+            "POST",
+            "/v1/prepared",
+            Some(input.clone()),
+            &[],
+        )
+        .await;
+        assert_eq!(prepared.status(), StatusCode::OK);
+        let prepared = json(prepared).await;
+        let route = format!(
+            "/v1/prepared/{}/execute",
+            prepared["preparedId"].as_str().unwrap()
+        );
+        for (route, input) in [("/v1/tql", input), (route.as_str(), serde_json::json!({}))] {
+            for accept in ["application/json", "application/x-ndjson"] {
+                let response = request(
+                    app.clone(),
+                    "POST",
+                    route,
+                    Some(input.clone()),
+                    &[("accept", accept)],
+                )
+                .await;
+                assert_query_response(
+                    response,
+                    accept,
+                    &serde_json::json!([{"name":"v","kind":"mixed"}]),
+                    &expected,
+                )
+                .await;
+            }
         }
     }
 }
@@ -2398,21 +2452,23 @@ async fn http_preserves_large_node_ids_across_writes_reads_and_projections() {
     });
     let query =
         Some(serde_json::json!({"query":"MATCH (n) RETURN n.id AS ident, n.signed AS signed"}));
-    let normal = request(app.clone(), "POST", "/v1/tql", query.clone(), &[]).await;
-    assert_eq!(normal.status(), StatusCode::OK);
-    assert_eq!(json(normal).await["rows"], serde_json::json!([expected]));
-    let streamed = request(
-        app,
-        "POST",
-        "/v1/tql",
-        query,
-        &[("accept", "application/x-ndjson")],
-    )
-    .await;
-    assert_eq!(streamed.status(), StatusCode::OK);
-    let line = text(streamed).await;
-    let row: Value = serde_json::from_str(line.lines().nth(1).unwrap()).unwrap();
-    assert_eq!(row["row"], expected);
+    for accept in ["application/json", "application/x-ndjson"] {
+        let response = request(
+            app.clone(),
+            "POST",
+            "/v1/tql",
+            query.clone(),
+            &[("accept", accept)],
+        )
+        .await;
+        assert_query_response(
+            response,
+            accept,
+            &serde_json::json!([{"name":"ident","kind":"int"},{"name":"signed","kind":"int"}]),
+            std::slice::from_ref(&expected),
+        )
+        .await;
+    }
 }
 
 #[tokio::test]
@@ -2435,34 +2491,23 @@ async fn empty_projection_and_crlf_diagnostics_preserve_source() {
         ("/v1/tql".to_owned(), query),
         (format!("/v1/prepared/{id}/execute"), serde_json::json!({})),
     ] {
-        let normal = request(app.clone(), "POST", &route, Some(input.clone()), &[]).await;
-        assert_eq!(normal.status(), StatusCode::OK);
-        let body = json(normal).await;
-        assert_eq!(
-            body["columns"],
-            serde_json::json!([{"name":"field","kind":"null"}])
-        );
-        assert_eq!(body["rows"], serde_json::json!([]));
-        let streamed = request(
-            app.clone(),
-            "POST",
-            &route,
-            Some(input),
-            &[("accept", "application/x-ndjson")],
-        )
-        .await;
-        assert_eq!(streamed.status(), StatusCode::OK);
-        let body = text(streamed).await;
-        let frames: Vec<Value> = body
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(frames.len(), 2);
-        assert_eq!(
-            frames[0]["columns"],
-            serde_json::json!([{"name":"field","kind":"null"}])
-        );
-        assert_eq!(frames[1]["rowCount"], 0);
+        for accept in ["application/json", "application/x-ndjson"] {
+            let response = request(
+                app.clone(),
+                "POST",
+                &route,
+                Some(input.clone()),
+                &[("accept", accept)],
+            )
+            .await;
+            assert_query_response(
+                response,
+                accept,
+                &serde_json::json!([{"name":"field","kind":"null"}]),
+                &[],
+            )
+            .await;
+        }
     }
     for route in ["/v1/tql", "/v1/prepared"] {
         let response = request(

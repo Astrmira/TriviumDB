@@ -48,21 +48,25 @@ fn tdb_vec_marker所有跨代际组合均不得拼出混合快照() {
             )
             .unwrap();
         }
-        if mask == 0 || mask == 7 {
-            let mut db = Database::<f32>::open_read_only(&candidate, DIM).unwrap();
-            let count = if mask == 0 { 4 } else { 7 };
-            assert_eq!(db.all_node_ids().unwrap(), (1..=count).collect::<Vec<_>>());
-            for id in 1..=count {
-                assert_eq!(db.get(id).unwrap().unwrap().vector, [id as f32, 1., 0., 0.]);
+        with_read_only(&candidate, |result| {
+            if mask == 0 || mask == 7 {
+                let mut db = result.unwrap();
+                let count = if mask == 0 { 4 } else { 7 };
+                let name = if mask == 0 {
+                    "generation_old"
+                } else {
+                    "generation_new"
+                };
+                let expected: Vec<_> = (1..=count).map(|id| {
+                    let edges = if id == 1 { serde_json::json!([{"target":2,"label":"next","weight":1.0,"metadata":null}]) } else { serde_json::json!([]) };
+                    serde_json::json!({"id":id, "vector":[id as f32,1.,0.,0.],"payload":{"generation":name,"id":id}, "edges":edges})
+                }).collect();
+                assert_eq!(crate::node_facts::nodes(&db), serde_json::json!(expected));
+                db.close().unwrap();
+            } else {
+                assert_corrupt(result);
             }
-            db.close().unwrap();
-        } else {
-            assert!(
-                Database::<f32>::open_read_only(&candidate, DIM).is_err(),
-                "混代 mask={mask} 被错误接受"
-            );
-        }
-        assert_read_only_zero_write(&candidate);
+        });
         cleanup(&candidate);
     }
     cleanup(&old);
@@ -90,11 +94,7 @@ fn sidecar跨代际不能产生幽灵节点或错误索引结果() {
             format!("{candidate}{}", role.suffix()),
         )
         .unwrap();
-        let error = Database::<f32>::open_read_only(&candidate, DIM)
-            .err()
-            .expect("错配的索引定义或图目录必须拒绝");
-        assert_eq!(error.code(), "TDB_CORRUPTED_FILE", "{role:?}");
-        assert_read_only_zero_write(&candidate);
+        with_read_only(&candidate, assert_corrupt);
         cleanup(&candidate);
     }
     cleanup(&old);
@@ -122,8 +122,7 @@ fn 修复marker_crc不能掩盖tdb和vec内容损坏() {
         let marker_path = format!("{candidate}.flush_ok");
         let marker = std::fs::read(&marker_path).unwrap();
         std::fs::write(&marker_path, Mutation::RepairFlushMarkerCrc.apply(&marker)).unwrap();
-        assert!(Database::<f32>::open_read_only(&candidate, DIM).is_err());
-        assert_read_only_zero_write(&candidate);
+        with_read_only(&candidate, assert_corrupt);
         cleanup(&candidate);
     }
     cleanup(&source);

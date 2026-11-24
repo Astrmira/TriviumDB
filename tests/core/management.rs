@@ -58,7 +58,7 @@ fn 配额拒绝保留配置并允许只读实例调整运行时额度() {
         );
         assert_eq!(
             maintenance::facts(&db),
-            maintenance::expected(false, json!([]))
+            maintenance::expected::<f32>(false, json!([]))
         );
         blocker.close().unwrap();
         db.set_memory_limit(4 * MB).unwrap();
@@ -94,7 +94,7 @@ fn 配额拒绝保留配置并允许只读实例调整运行时额度() {
             assert_eq!(runtime.stats().reserved_database_bytes, MB);
             assert_eq!(
                 maintenance::facts(&reader),
-                maintenance::expected(false, json!([]))
+                maintenance::expected::<f32>(false, json!([]))
             );
             reader.close().unwrap();
             assert_eq!(files(), before);

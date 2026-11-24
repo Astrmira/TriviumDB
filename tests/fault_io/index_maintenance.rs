@@ -42,7 +42,7 @@ fn 图修复发布失败隔离实例并按真实提交点恢复完整事实() {
                 let mut recovered = Database::<f32>::open_with_config(&path, config).unwrap();
                 assert_eq!(
                     maintenance::facts(&recovered),
-                    maintenance::expected(false, json!([]))
+                    maintenance::expected::<f32>(false, json!([]))
                 );
                 let report = recovered.repair_graph_indexes().unwrap();
                 assert_eq!(report.removed_dangling_edges, 0);
@@ -212,7 +212,7 @@ fn closed_writer<T: VectorType + serde::Serialize + serde::de::DeserializeOwned>
         assert_eq!(files(), before);
         assert_eq!(
             maintenance::facts(&db),
-            maintenance::expected(false, json!([]))
+            maintenance::expected::<T>(false, json!([]))
         );
         drop(db);
         let moved = directory.with_extension("moved");
@@ -221,13 +221,13 @@ fn closed_writer<T: VectorType + serde::Serialize + serde::de::DeserializeOwned>
         let mut db = Database::<T>::open_with_config(path.to_str().unwrap(), config).unwrap();
         assert_eq!(
             maintenance::facts(&db),
-            maintenance::expected(false, json!([]))
+            maintenance::expected::<T>(false, json!([]))
         );
         db.close().unwrap();
         let mut db = Database::<T>::open_with_config(path.to_str().unwrap(), config).unwrap();
         assert_eq!(
             maintenance::facts(&db),
-            maintenance::expected(false, json!([]))
+            maintenance::expected::<T>(false, json!([]))
         );
         db.close().unwrap();
     }
@@ -318,7 +318,7 @@ fn schema_publication<T: VectorType + serde::Serialize + serde::de::DeserializeO
                     };
                     assert_eq!(
                         maintenance::facts(&db),
-                        maintenance::expected(false, indexes.clone())
+                        maintenance::expected::<T>(false, indexes.clone())
                     );
                     let duplicate = db.insert_with_id(
                         3,
@@ -341,10 +341,14 @@ fn schema_publication<T: VectorType + serde::Serialize + serde::de::DeserializeO
                     db.close().unwrap();
                     let mut db =
                         Database::<T>::open_with_config(path.to_str().unwrap(), config).unwrap();
-                    let mut expected = maintenance::expected(false, indexes);
-                    expected["nodes"].as_array_mut().unwrap().push(json!({
+                    let mut expected = maintenance::expected::<T>(false, indexes);
+                    let created = crate::node_facts::fixture_nodes::<T>(json!([{
                         "id":3,"vector":[1.0,1.0],"payload":{"tag":tag,"tenant":"t","category":"same"},"edges":[]
-                    }));
+                    }]));
+                    expected["nodes"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(created[0].clone());
                     assert_eq!(maintenance::facts(&db), expected);
                     db.close().unwrap();
                 }
@@ -413,13 +417,13 @@ fn text_checkpoint_outcomes_follow_the_publication_point() {
                 let mut db = Database::<f32>::open_with_config(&path, config).unwrap();
                 assert_eq!(
                     maintenance::facts(&db),
-                    maintenance::expected(committed, json!([]))
+                    maintenance::expected::<f32>(committed, json!([]))
                 );
                 db.close().unwrap();
                 let mut db = Database::<f32>::open_with_config(&path, config).unwrap();
                 assert_eq!(
                     maintenance::facts(&db),
-                    maintenance::expected(committed, json!([]))
+                    maintenance::expected::<f32>(committed, json!([]))
                 );
                 db.close().unwrap();
             }

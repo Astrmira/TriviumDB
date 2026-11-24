@@ -119,7 +119,7 @@ fn matrix<T: VectorType + serde::Serialize + serde::de::DeserializeOwned>(dtype:
             assert_eq!(std::fs::read(format!("{path}.wal")).unwrap(), before_wal);
             assert_eq!(
                 maintenance::facts(&db),
-                maintenance::expected(false, json!([]))
+                maintenance::expected::<T>(false, json!([]))
             );
         }
         // 1 KiB 余量足以保留当前事实，长正文和关键词的构建峰值需要额外准入。
@@ -136,7 +136,7 @@ fn matrix<T: VectorType + serde::Serialize + serde::de::DeserializeOwned>(dtype:
         db.set_memory_limit(0).unwrap();
         assert_eq!(
             maintenance::facts(&db),
-            maintenance::expected(false, json!([]))
+            maintenance::expected::<T>(false, json!([]))
         );
         db.close().unwrap();
         for case in contract["operations"].as_array().unwrap() {
@@ -177,7 +177,7 @@ fn matrix<T: VectorType + serde::Serialize + serde::de::DeserializeOwned>(dtype:
             }
             assert_eq!(
                 maintenance::facts(&reader),
-                maintenance::expected(false, json!([]))
+                maintenance::expected::<T>(false, json!([]))
             );
             reader.close().unwrap();
             assert_eq!(file_group(), before_files);
@@ -188,13 +188,13 @@ fn matrix<T: VectorType + serde::Serialize + serde::de::DeserializeOwned>(dtype:
         let indexes = json!([{"kind":"Hash","fields":["tag"],"unique":true}]);
         assert_eq!(
             maintenance::facts(&db),
-            maintenance::expected(true, indexes.clone())
+            maintenance::expected::<T>(true, indexes.clone())
         );
         db.close().unwrap();
         let mut reopened = Database::<T>::open_with_config(&path, config).unwrap();
         assert_eq!(
             maintenance::facts(&reopened),
-            maintenance::expected(true, indexes)
+            maintenance::expected::<T>(true, indexes)
         );
         reopened.close().unwrap();
     }
@@ -247,14 +247,14 @@ fn generation_id拒绝先于源检查点且保留完整事实() {
         assert!(!std::path::Path::new(&destination).exists());
         assert_eq!(
             maintenance::facts(&db),
-            maintenance::expected(false, json!([]))
+            maintenance::expected::<f32>(false, json!([]))
         );
     }
     db.close().unwrap();
     let mut reopened = Database::<f32>::open_with_config(&path, config).unwrap();
     assert_eq!(
         maintenance::facts(&reopened),
-        maintenance::expected(false, json!([]))
+        maintenance::expected::<f32>(false, json!([]))
     );
     reopened.close().unwrap();
 }
@@ -319,7 +319,7 @@ fn text_workspace_rejection_preserves_facts_and_retries_after_quota_release() {
     assert_eq!(runtime.stats().reserved_workspace_bytes, 0);
     assert_eq!(
         maintenance::facts(&db),
-        maintenance::expected(false, json!([]))
+        maintenance::expected::<f32>(false, json!([]))
     );
     blocker.close().unwrap();
     db.index_text(1, &text).unwrap();
@@ -337,7 +337,7 @@ fn text_workspace_rejection_preserves_facts_and_retries_after_quota_release() {
     let mut reopened = Database::<f32>::open_with_config(&path, config).unwrap();
     assert_eq!(
         maintenance::facts(&reopened),
-        maintenance::expected(false, json!([]))
+        maintenance::expected::<f32>(false, json!([]))
     );
     reopened.close().unwrap();
 }

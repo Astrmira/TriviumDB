@@ -19,15 +19,9 @@ fn options(source: PathBuf, destination: PathBuf, mmap: bool) -> Options {
     }
 }
 
-fn files(path: &Path) -> std::collections::BTreeMap<std::ffi::OsString, Vec<u8>> {
-    std::fs::read_dir(path)
-        .unwrap()
-        .map(|entry| {
-            let entry = entry.unwrap();
-            (entry.file_name(), std::fs::read(entry.path()).unwrap())
-        })
-        .collect()
-}
+#[path = "../../../tests/support/files.rs"]
+mod physical_files;
+use physical_files::files;
 
 fn checkpoint<T: VectorType>(version: u16, vectors: &[Vec<T>]) -> Vec<u8> {
     let mut payloads = Vec::new();

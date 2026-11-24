@@ -3,10 +3,13 @@
 //! 使用固定随机种子和小型内置数据生成可重复的延迟、吞吐与召回指标，并写入
 //! `target/bench-reports`。它用于趋势和 Gate，不代替外部百万向量质量评测。
 
+#[path = "support/recall.rs"]
+mod recall;
+
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 use std::fs;
 use std::time::Instant;
 use triviumdb::Database;
@@ -31,12 +34,6 @@ struct BenchMetric {
     rss_peak_bytes: u64,
     disk_bytes: u64,
     correctness: String,
-}
-
-fn cleanup(path: &str) {
-    for ext in &["", ".wal", ".vec", ".lock", ".flush_ok", ".tmp", ".vec.tmp"] {
-        fs::remove_file(format!("{}{}", path, ext)).ok();
-    }
 }
 
 fn disk_bytes(path: &str) -> u64 {
@@ -91,24 +88,27 @@ fn gen_vec(rng: &mut StdRng, dim: usize, center: Option<&[f32]>) -> Vec<f32> {
     v.into_iter().map(|x| x / norm).collect()
 }
 
-fn recall_at_k(expected: &[u64], actual: &[u64]) -> f64 {
-    if expected.is_empty() {
-        return 1.0;
-    }
-    let expected: HashSet<u64> = expected.iter().copied().collect();
-    let hits = actual.iter().filter(|id| expected.contains(id)).count();
-    hits as f64 / expected.len() as f64
-}
-
 fn brute_force_top_k(vectors: &[(u64, Vec<f32>)], query: &[f32], top_k: usize) -> Vec<u64> {
-    let mut scored: Vec<(u64, f32)> = vectors
+    let norm = |vector: &[f32]| {
+        vector
+            .iter()
+            .map(|&x| f64::from(x).powi(2))
+            .sum::<f64>()
+            .sqrt()
+    };
+    let query_norm = norm(query);
+    let mut scored: Vec<_> = vectors
         .iter()
         .map(|(id, vector)| {
-            let score = vector.iter().zip(query).map(|(a, b)| a * b).sum::<f32>();
-            (*id, score)
+            let dot: f64 = vector
+                .iter()
+                .zip(query)
+                .map(|(&a, &b)| f64::from(a) * f64::from(b))
+                .sum();
+            (*id, dot / (query_norm * norm(vector)))
         })
         .collect();
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     scored.into_iter().take(top_k).map(|(id, _)| id).collect()
 }
 
@@ -117,26 +117,59 @@ struct BenchState {
     peak_rss: u64,
 }
 
-fn measure<F>(
+fn measure(
     state: &mut BenchState,
     category: &str,
     name: &str,
     iterations: usize,
     path: &str,
     memory_bytes: usize,
-    mut op: F,
-) -> String
-where
-    F: FnMut() -> String,
-{
+    op: impl FnMut() -> String,
+) {
+    measure_results(
+        state,
+        (category, name),
+        iterations,
+        path,
+        memory_bytes,
+        op,
+        |samples| {
+            let mut counts = BTreeMap::new();
+            for value in samples {
+                *counts.entry(value).or_insert(0usize) += 1;
+            }
+            if counts.len() == 1 {
+                counts.into_keys().next().unwrap()
+            } else {
+                counts
+                    .into_iter()
+                    .map(|(value, count)| format!("{value} × {count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        },
+    )
+}
+
+fn measure_results<R>(
+    state: &mut BenchState,
+    (category, name): (&str, &str),
+    iterations: usize,
+    path: &str,
+    memory_bytes: usize,
+    mut op: impl FnMut() -> R,
+    summarize: impl FnOnce(Vec<R>) -> String,
+) {
+    assert!(iterations > 0);
     update_peak_rss(&mut state.peak_rss);
+    let mut samples = Vec::with_capacity(iterations);
     let start = Instant::now();
-    let mut correctness = String::new();
     for _ in 0..iterations {
-        correctness = op();
+        samples.push(op());
         update_peak_rss(&mut state.peak_rss);
     }
     let elapsed = start.elapsed();
+    let correctness = summarize(samples);
     let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
     let ops_per_sec = if elapsed.as_secs_f64() > 0.0 {
         iterations as f64 / elapsed.as_secs_f64()
@@ -154,13 +187,11 @@ where
         rss_bytes: current_rss,
         rss_peak_bytes: state.peak_rss,
         disk_bytes: disk_bytes(path),
-        correctness: correctness.clone(),
+        correctness,
     });
-    correctness
 }
 
 fn build_report_db(path: &str) -> (Database<f32>, VectorCorpus, QueryVectors) {
-    cleanup(path);
     let mut rng = StdRng::seed_from_u64(20260430);
     let centers: Vec<Vec<f32>> = (0..12).map(|_| gen_vec(&mut rng, DIM, None)).collect();
     let mut db = Database::<f32>::open_with_config(
@@ -288,8 +319,10 @@ fn write_reports(metrics: &[BenchMetric], path: &str) {
 }
 
 fn main() {
-    let path = "target/bench-reports/ci_entry_coverage.tdb";
-    cleanup(path);
+    fs::create_dir_all("target/bench-reports").unwrap();
+    let directory = tempfile::tempdir_in("target/bench-reports").unwrap();
+    let file = directory.path().join("source.tdb");
+    let path = file.to_str().unwrap();
     let (mut db, vectors, queries) = build_report_db(path);
     let mut state = BenchState {
         metrics: Vec::new(),
@@ -297,6 +330,44 @@ fn main() {
     };
     let ids = db.all_node_ids().unwrap();
     let anchor = ids[ids.len() / 2];
+
+    // 先在生成真值的同一批向量上测量，再开始写入、更新和事务基准。
+    let truth: Vec<_> = queries
+        .iter()
+        .map(|query| brute_force_top_k(&vectors, query, 10))
+        .collect();
+    let hybrid_config = SearchConfig {
+        top_k: 10,
+        min_score: -1.0,
+        ..Default::default()
+    };
+    for (name, hybrid) in [
+        ("search_bruteforce_top10", false),
+        ("search_hybrid_bq_recall", true),
+    ] {
+        let mut inputs = queries.iter();
+        measure_results(
+            &mut state,
+            ("向量", name),
+            queries.len(),
+            path,
+            db.estimated_memory(),
+            || {
+                let query = inputs.next().unwrap();
+                if hybrid {
+                    db.search_hybrid(None, Some(query), &hybrid_config).unwrap()
+                } else {
+                    db.search_exact(query, 10).unwrap()
+                }
+            },
+            |answers| {
+                let recall = recall::at_k(&answers, &truth, 10, 1..=vectors.len() as u64, |hit| {
+                    (hit.id, hit.score)
+                });
+                format!("recall@10={recall:.3}")
+            },
+        );
+    }
 
     measure(
         &mut state,
@@ -348,6 +419,7 @@ fn main() {
         },
     );
 
+    let mut last_tx_id = None;
     measure(
         &mut state,
         "写入",
@@ -360,6 +432,7 @@ fn main() {
             let mut tx = db.begin_tx();
             tx.insert_with_id(id, &vec![0.03f32; DIM], json!({"type": "tx"}));
             tx.commit().unwrap();
+            last_tx_id = Some(id);
             if db.contains(id).unwrap() {
                 "ok".to_string()
             } else {
@@ -379,7 +452,13 @@ fn main() {
             db.flush().unwrap();
             db.compact().unwrap();
             let count = db.node_count().unwrap();
-            drop(Database::<f32>::open(path, DIM).err());
+            db.close().unwrap();
+            db = Database::<f32>::open(path, DIM).unwrap();
+            db.disable_auto_compaction();
+            assert_eq!(db.node_count().unwrap(), count);
+            let committed = db.get(last_tx_id.unwrap()).unwrap().unwrap();
+            assert_eq!(committed.vector, vec![0.03f32; DIM]);
+            assert_eq!(committed.payload, json!({"type":"tx"}));
             format!("nodes={count}")
         },
     );
@@ -405,54 +484,6 @@ fn main() {
             } else {
                 "bad_read".to_string()
             }
-        },
-    );
-
-    let mut query_pos = 0usize;
-    measure(
-        &mut state,
-        "向量",
-        "search_bruteforce_top10",
-        QUERY_COUNT,
-        path,
-        db.estimated_memory(),
-        || {
-            let query = &queries[query_pos % queries.len()];
-            query_pos += 1;
-            let expected = brute_force_top_k(&vectors, query, 10);
-            let actual = db
-                .search(query, 10, 0, -1.0)
-                .unwrap()
-                .into_iter()
-                .map(|hit| hit.id)
-                .collect::<Vec<_>>();
-            format!("recall@10={:.3}", recall_at_k(&expected, &actual))
-        },
-    );
-
-    let bq_config = SearchConfig {
-        top_k: 10,
-        ..Default::default()
-    };
-    let mut bq_pos = 0usize;
-    measure(
-        &mut state,
-        "向量",
-        "search_hybrid_bq_recall",
-        QUERY_COUNT,
-        path,
-        db.estimated_memory(),
-        || {
-            let query = &queries[bq_pos % queries.len()];
-            bq_pos += 1;
-            let expected = brute_force_top_k(&vectors, query, 10);
-            let actual = db
-                .search_hybrid(None, Some(query.as_slice()), &bq_config)
-                .unwrap()
-                .into_iter()
-                .map(|hit| hit.id)
-                .collect::<Vec<_>>();
-            format!("recall@10={:.3}", recall_at_k(&expected, &actual))
         },
     );
 
@@ -509,6 +540,7 @@ fn main() {
         },
     );
 
+    let search_tql = format!("SEARCH VECTOR {} TOP 5 RETURN *", json!(vec![0.01; DIM]));
     measure(
         &mut state,
         "TQL",
@@ -526,13 +558,14 @@ fn main() {
             let optional = db
                 .tql(r#"OPTIONAL MATCH (a {type: "missing"})-[]->(b) RETURN b LIMIT 5"#)
                 .unwrap();
-            let search = db.tql("SEARCH VECTOR [0.01, 0.01, 0.01, 0.01] TOP 5 RETURN * LIMIT 5");
+            let search = db.tql(&search_tql).unwrap();
+            assert_eq!(search.len(), 5);
             format!(
-                "find={},match={},optional={},search_ok={}",
+                "find={},match={},optional={},search={}",
                 find.len(),
                 matched.len(),
                 optional.len(),
-                search.is_ok()
+                search.len()
             )
         },
     );
@@ -606,12 +639,10 @@ fn main() {
         path,
         db.estimated_memory(),
         || {
-            let migrate_path = "target/bench-reports/ci_entry_coverage_migrated.tdb";
-            cleanup(migrate_path);
-            let (migrated, migrated_ids) = db.migrate_to(migrate_path, 64).unwrap();
+            let target = directory.path().join("migrated.tdb");
+            let (mut migrated, migrated_ids) = db.migrate_to(target.to_str().unwrap(), 64).unwrap();
             let count = migrated.node_count().unwrap();
-            drop(migrated);
-            cleanup(migrate_path);
+            migrated.close().unwrap();
             format!("nodes={count},ids={}", migrated_ids.len())
         },
     );
@@ -635,5 +666,5 @@ fn main() {
     );
 
     write_reports(&state.metrics, path);
-    cleanup(path);
+    db.close().unwrap();
 }

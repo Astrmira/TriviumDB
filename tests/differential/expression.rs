@@ -6,7 +6,7 @@ pub enum RefValue {
     Missing,
     Null,
     Bool(bool),
-    Integer(i64),
+    Integer(i128),
     Float(f64),
     String(String),
     List(Vec<RefValue>),
@@ -19,10 +19,11 @@ impl RefValue {
             None => Self::Missing,
             Some(Value::Null) => Self::Null,
             Some(Value::Bool(value)) => Self::Bool(*value),
-            Some(Value::Number(value)) => value.as_i64().map_or_else(
-                || Self::Float(value.as_f64().unwrap_or(f64::NAN)),
-                Self::Integer,
-            ),
+            Some(Value::Number(_)) => match super::model::RefScalar::from_json(value) {
+                super::model::RefScalar::Integer(i) => Self::Integer(i),
+                super::model::RefScalar::Float(f) => Self::Float(f64::from_bits(f)),
+                _ => unreachable!(),
+            },
             Some(Value::String(value)) => Self::String(value.clone()),
             Some(Value::Array(values)) => Self::List(
                 values
@@ -39,13 +40,13 @@ impl RefValue {
             (Self::Bool(left), Self::Bool(right)) => Some(left.cmp(right)),
             (Self::Integer(left), Self::Integer(right)) => Some(left.cmp(right)),
             (Self::Float(left), Self::Float(right)) if left.is_finite() && right.is_finite() => {
-                Some(left.total_cmp(right))
+                left.partial_cmp(right)
             }
             (Self::Integer(left), Self::Float(right)) if right.is_finite() => {
-                Some((*left as f64).total_cmp(right))
+                Some(super::model::compare_integer_float(*left, *right))
             }
             (Self::Float(left), Self::Integer(right)) if left.is_finite() => {
-                Some(left.total_cmp(&(*right as f64)))
+                Some(super::model::compare_integer_float(*right, *left).reverse())
             }
             (Self::String(left), Self::String(right)) => Some(left.cmp(right)),
             (Self::Null, Self::Null) | (Self::Missing, Self::Missing) => Some(Ordering::Equal),
@@ -79,13 +80,13 @@ pub fn evaluate_expr(payload: &Value, expression: &Expr) -> RefValue {
         Expr::Literal(value) => value.clone(),
         Expr::Field(field) => RefValue::from_json(payload.get(field)),
         Expr::Add(left, right) => {
-            integer_arithmetic(payload, left, right, i64::checked_add, |a, b| a + b)
+            integer_arithmetic(payload, left, right, i128::checked_add, |a, b| a + b)
         }
         Expr::Subtract(left, right) => {
-            integer_arithmetic(payload, left, right, i64::checked_sub, |a, b| a - b)
+            integer_arithmetic(payload, left, right, i128::checked_sub, |a, b| a - b)
         }
         Expr::Multiply(left, right) => {
-            integer_arithmetic(payload, left, right, i64::checked_mul, |a, b| a * b)
+            integer_arithmetic(payload, left, right, i128::checked_mul, |a, b| a * b)
         }
         Expr::Divide(left, right) => {
             let right_value = number(evaluate_expr(payload, right));
@@ -107,18 +108,18 @@ pub fn evaluate_expr(payload: &Value, expression: &Expr) -> RefValue {
     }
 }
 
-// 生成器的整数域限制在小 i64；原生整数运算提供独立的有界参考，完整 u64 另由固定边界样例验收。
+// JSON 的整数结果须能由有符号或无符号 64 位整数表示。
 fn integer_arithmetic(
     payload: &Value,
     left: &Expr,
     right: &Expr,
-    integer: impl Fn(i64, i64) -> Option<i64>,
+    integer: impl Fn(i128, i128) -> Option<i128>,
     float: impl Fn(f64, f64) -> f64,
 ) -> RefValue {
     match (evaluate_expr(payload, left), evaluate_expr(payload, right)) {
-        (RefValue::Integer(left), RefValue::Integer(right)) => {
-            integer(left, right).map_or(RefValue::Null, RefValue::Integer)
-        }
+        (RefValue::Integer(left), RefValue::Integer(right)) => integer(left, right)
+            .filter(|n| (i128::from(i64::MIN)..=i128::from(u64::MAX)).contains(n))
+            .map_or(RefValue::Null, RefValue::Integer),
         _ => arithmetic(payload, left, right, float),
     }
 }

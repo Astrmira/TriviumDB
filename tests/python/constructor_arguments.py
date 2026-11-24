@@ -7,6 +7,7 @@ import struct
 
 import triviumdb
 from call_arguments import reject
+from input_errors import check_input_error
 from read_arguments import node
 
 
@@ -14,9 +15,7 @@ def invalid(action, field, exception=Exception, write=None):
     try:
         action()
     except exception as error:
-        assert error.code == "TDB_INVALID_INPUT" and error.schema_version == 1
-        assert error.target == {"field": field} and error.stage is None and error.write == write
-        assert set(error.details) == {"reason"} and error.details["reason"]
+        check_input_error(error, field, write)
     else:
         raise AssertionError(f"构造参数必须拒绝 {field}")
 

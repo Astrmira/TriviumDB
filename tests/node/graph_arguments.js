@@ -6,19 +6,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const fixture = require('../contracts/graph_arguments.json')
 
-function invalid(field) {
-  return error => {
-    assert.equal(error.schema_version, 1)
-    assert.equal(error.code, 'TDB_INVALID_INPUT')
-    assert.deepEqual(error.target, { field })
-    assert.equal(error.stage, undefined)
-    assert.equal(error.write, undefined)
-    assert.deepEqual(Object.keys(error.details), ['reason'])
-    assert.equal(typeof error.details.reason, 'string')
-    assert.ok(error.details.reason.length > 0)
-    return true
-  }
-}
+const { invalid } = require('./input_errors')
 
 function runGraphArguments(root, { TriviumDB }) {
   const paths = fixture.paths.map(row => ({
@@ -202,4 +190,4 @@ function runGraphArguments(root, { TriviumDB }) {
   }
 }
 
-module.exports = { runGraphArguments, invalid }
+module.exports = { runGraphArguments }

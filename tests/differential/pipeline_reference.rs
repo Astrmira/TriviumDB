@@ -4,15 +4,6 @@ use super::model::RefDatabase;
 use std::collections::{BTreeMap, BTreeSet};
 use triviumdb::database::Database;
 
-fn node_ids(rows: Vec<BTreeMap<String, CanonicalValue>>, column: &str) -> Vec<u64> {
-    rows.into_iter()
-        .filter_map(|row| match row.get(column) {
-            Some(CanonicalValue::Node(id)) => Some(*id),
-            _ => None,
-        })
-        .collect()
-}
-
 #[test]
 fn shortest_path生产结果与独立BFS_reference一致() {
     let root = std::env::temp_dir().join("triviumdb_test");
@@ -26,7 +17,12 @@ fn shortest_path生产结果与独立BFS_reference一致() {
     let mut database = Database::<f32>::open(&path, 3).unwrap();
     super::matrix::seed(&mut database, &reference);
 
-    for (source, target, label) in [(1, 2, Some("related")), (2, 3, Some("next")), (1, 5, None)] {
+    for (source, target, label) in [
+        (1, 2, Some("related")),
+        (2, 3, Some("next")),
+        (1, 5, None),
+        (9, 1, None),
+    ] {
         let expected = shortest_path(
             &reference,
             source,
@@ -41,11 +37,11 @@ fn shortest_path生产结果与独立BFS_reference一致() {
             source - 1
         );
         let rows = canonicalize_rows(database.tql_values(&query).unwrap(), true);
-        let actual = rows.first().and_then(|row| match row.get("path") {
-            Some(CanonicalValue::Path(path)) => Some(path.clone()),
-            _ => None,
-        });
-        assert_eq!(actual, expected, "shortest path 差分: {query}");
+        let expected = expected
+            .into_iter()
+            .map(|path| BTreeMap::from([("path".into(), CanonicalValue::Path(path))]))
+            .collect::<Vec<_>>();
+        assert_eq!(rows, expected, "最短路径差分：{query}");
     }
     super::matrix::cleanup(&path);
 }
@@ -72,13 +68,18 @@ fn 集合代数生产Pipeline与独立BTreeSet_reference一致() {
         let query = format!(
             "FIND {{rank: {{$lt: 4}}}} AS seed WITH seed {operation} seed IDS [3, 4, 5] AS combined WITH combined RETURN combined"
         );
-        let actual = node_ids(
-            canonicalize_rows(database.tql_values(&query).unwrap(), true),
-            "combined",
-        )
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-        assert_eq!(actual, expected, "集合差分: {query}");
+        let actual = canonicalize_rows(database.tql_values(&query).unwrap(), false);
+        let mut expected = expected
+            .into_iter()
+            .map(|id| {
+                BTreeMap::from([(
+                    "combined".into(),
+                    super::canonical::expected_node(&reference, id),
+                )])
+            })
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(actual, expected, "集合差分：{query}");
     }
     super::matrix::cleanup(&path);
 }

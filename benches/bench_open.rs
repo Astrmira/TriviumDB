@@ -1,6 +1,9 @@
 //! 独立记录数据库重开、首查与稳定查询，输出完整结果供版本间核对。
 //! 合成数据覆盖不同维度与分布，计时只用于基准报告。
 
+#[path = "support/recall.rs"]
+mod recall;
+
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -150,30 +153,28 @@ fn main() {
                     .map(|query| db.search_advanced(query, &search).unwrap())
                     .collect::<Vec<_>>();
                 let elapsed = started.elapsed().as_secs_f64();
-                let mut matched = 0;
+                let recall = recall::at_k(&answers, &truth, 10, 1..=nodes as u64, |hit| {
+                    (hit.id, hit.score)
+                });
                 let mut serialized = Vec::new();
                 for (query_index, hits) in answers.iter().enumerate() {
-                    assert_eq!(hits.len(), 10);
                     assert!(hits.windows(2).all(|pair| pair[0].score > pair[1].score
                         || (pair[0].score == pair[1].score && pair[0].id < pair[1].id)));
-                    let mut seen = std::collections::BTreeSet::new();
                     let mut rows = Vec::new();
                     for hit in hits {
-                        assert!(seen.insert(hit.id), "查询结果包含重复身份");
                         let row = usize::try_from(hit.id - 1).expect("查询身份超出范围");
                         assert!(row < nodes);
                         assert_eq!(hit.payload, json!({"dataset": name, "row": row}));
                         let expected =
                             cosine(&queries[query_index], &base[row * dim..(row + 1) * dim]);
                         assert!((f64::from(hit.score) - expected).abs() < 1e-4);
-                        matched += usize::from(truth[query_index].contains(&hit.id));
                         rows.push(json!({"id": hit.id, "score_bits": hit.score.to_bits()}));
                     }
                     serialized.push(rows);
                 }
                 points.push(json!({
                     "recall_k": recall_k,
-                    "recall_at_10": matched as f64 / 160.,
+                    "recall_at_10": recall,
                     "qps": 16. / elapsed,
                     "mean_latency_ms": elapsed * 1000. / 16.,
                     "answers": serialized,

@@ -1,7 +1,6 @@
 use super::fixture::*;
 use super::mutation::{BoundaryValue, Mutation, field_boundary_mutations, truncation_mutations};
 use super::spec::{FileRole, GRAPH_HEADER, PROPERTY_HEADER};
-use triviumdb::database::Database;
 
 fn mutate_sidecar(
     source: &str,
@@ -37,9 +36,20 @@ fn mutate_sidecar(
         if repair_crc && !matches!(mutation, Mutation::TruncateAt(_)) {
             changed = Mutation::RepairTrailingCrc.apply(&changed);
         }
-        crate::artifact::write(format!("{candidate}{}", role.suffix()), changed).unwrap();
-        let _ = Database::<f32>::open_read_only(&candidate, DIM);
-        assert_read_only_zero_write(&candidate);
+        crate::artifact::write(format!("{candidate}{}", role.suffix()), &changed).unwrap();
+        with_read_only(&candidate, |result| match result {
+            Ok(db) => assert_seed(&db),
+            Err(err) => assert!(
+                changed != original
+                    && matches!(
+                        err.code(),
+                        "TDB_CORRUPTED_FILE"
+                            | "TDB_UNSUPPORTED_SIDECAR_VERSION"
+                            | "TDB_MIGRATION_REQUIRED"
+                    ),
+                "{mutation:?}: {err}"
+            ),
+        });
         cleanup(&candidate);
     }
 }
@@ -124,9 +134,16 @@ fn sidecar未知版本与恶意计数不得触发危险分配() {
                 }
                 .apply(&original),
             );
-            crate::artifact::write(format!("{candidate}{}", role.suffix()), changed).unwrap();
-            let _ = Database::<f32>::open_read_only(&candidate, DIM);
-            assert_read_only_zero_write(&candidate);
+            crate::artifact::write(format!("{candidate}{}", role.suffix()), &changed).unwrap();
+            with_read_only(&candidate, |result| {
+                let err = result.err().expect("未知版本或非法计数必须拒绝");
+                let expected = if matches!(field_name, "version" | "format_version") {
+                    "TDB_UNSUPPORTED_SIDECAR_VERSION"
+                } else {
+                    "TDB_CORRUPTED_FILE"
+                };
+                assert_eq!(err.code(), expected, "{field_name}: {err}");
+            });
             cleanup(&candidate);
         }
     }
